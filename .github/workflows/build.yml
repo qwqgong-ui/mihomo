@@ -32,11 +32,7 @@ jobs:
         jobs:
           - { goos: linux, goarch: '386', go386: sse2, output: '386', debian: i386, rpm: i386}
           - { goos: linux, goarch: '386', go386: softfloat, output: '386-softfloat' }
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-compatible} # old style file name will be removed in next released
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64, debian: amd64, rpm: x86_64, pacman: x86_64, tarball: tarball}
-          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-v1, debian: amd64, rpm: x86_64, pacman: x86_64, test: test }
-          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2, debian: amd64, rpm: x86_64, pacman: x86_64}
-          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64-v3, debian: amd64, rpm: x86_64, pacman: x86_64}
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64, debian: amd64, rpm: x86_64, pacman: x86_64, tarball: tarball, test: test }
           - { goos: linux, goarch: arm64, output: arm64, debian: arm64, rpm: aarch64, pacman: aarch64}  
           - { goos: linux, goarch: arm, goarm: '5', output: armv5 }
           - { goos: linux, goarch: arm, goarm: '6', output: armv6, debian: armel, rpm: armv6hl} 
@@ -54,33 +50,21 @@ jobs:
 
           # MetaCubeX Go 1.27 toolchain
           # https://github.com/MetaCubeX/go/commits/release-branch.go1.27/
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
           - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64 }
-          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1 }
-          - { goos: darwin, goarch: amd64, goamd64: v2, output: amd64-v2 }
-          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3 }
           - { goos: darwin, goarch: arm64, output: arm64 }
 
           # MetaCubeX Go 1.27 toolchain
           # https://github.com/MetaCubeX/go/commits/release-branch.go1.27/
           - { goos: windows, goarch: '386', output: '386' }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
           - { goos: windows, goarch: amd64, goamd64: v3, output: amd64 }
-          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1 }
-          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2 }
-          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3 }
           - { goos: windows, goarch: arm64, output: arm64 }
 
           - { goos: freebsd, goarch: '386', output: '386' }
-          - { goos: freebsd, goarch: amd64, goamd64: v1, output: amd64-compatible } # old style file name will be removed in next released
           - { goos: freebsd, goarch: amd64, goamd64: v3, output: amd64 }
-          - { goos: freebsd, goarch: amd64, goamd64: v1, output: amd64-v1 }
-          - { goos: freebsd, goarch: amd64, goamd64: v2, output: amd64-v2 }
-          - { goos: freebsd, goarch: amd64, goamd64: v3, output: amd64-v3 }
           - { goos: freebsd, goarch: arm64, output: arm64 }
 
           - { goos: android, goarch: '386', ndk: i686-linux-android34, output: '386' }
-          - { goos: android, goarch: amd64, ndk: x86_64-linux-android34, output: amd64 }
+          - { goos: android, goarch: amd64, goamd64: v3, ndk: x86_64-linux-android34, output: amd64 }
           - { goos: android, goarch: arm, ndk: armv7a-linux-androideabi34, output: armv7 }
           - { goos: android, goarch: arm64, ndk: aarch64-linux-android34, output: arm64-v8 }
 

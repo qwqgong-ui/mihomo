@@ -4,6 +4,8 @@
 
 The Alpha branch is built and tested only with the MetaCubeX Go 1.27 toolchain. Both CI and release builds set `GOEXPERIMENT=simd`; older Go toolchains are not supported by this branch.
 
+AMD64 artifacts are built only with `GOAMD64=v3`. In addition to the v2 baseline, v3 requires AVX, AVX2, BMI1, BMI2, FMA, LZCNT, MOVBE, and OSXSAVE support; v1/v2-compatible AMD64 packages are not published.
+
 Go 1.27 is currently a release candidate and its release notes are still marked as a draft. Alpha artifacts should therefore be treated as experimental until the final Go 1.27 release. See the [official Go 1.27 release notes](https://go.dev/doc/go1.27).
 
 Go 1.27 also enables the `stdversion` vet analyzer during `go test`, changes `go mod tidy` to consolidate duplicate `require` blocks, and raises the official macOS minimum to macOS 13.
