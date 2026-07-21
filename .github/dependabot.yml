@@ -4,38 +4,35 @@ updates:
     directory: "/"
     target-branch: Alpha
     schedule:
-      interval: weekly
-      day: monday
+      interval: daily
       time: "04:30"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 20
     rebase-strategy: auto
+    allow:
+      - dependency-type: all
     groups:
-      metacubex-components:
-        patterns:
-          - "github.com/metacubex/*"
-        update-types:
-          - minor
-          - patch
-      go-components:
-        patterns:
-          - "golang.org/x/*"
-          - "go.uber.org/*"
-          - "go4.org/*"
-        update-types:
-          - minor
-          - patch
-      other-components:
+      all-go-modules:
         patterns:
           - "*"
-        exclude-patterns:
-          - "github.com/metacubex/*"
-          - "golang.org/x/*"
-          - "go.uber.org/*"
-          - "go4.org/*"
-        update-types:
-          - minor
-          - patch
+    ignore:
+      # sing-mux v0.3.10 is incompatible with the HTTP/2 wrapper in x/net v0.54.0+.
+      # Keep the related module graph at the newest compatible versions.
+      - dependency-name: "golang.org/x/net"
+        versions: [">0.53.0"]
+      - dependency-name: "golang.org/x/crypto"
+        versions: [">0.51.0"]
+      - dependency-name: "golang.org/x/exp"
+      - dependency-name: "golang.org/x/mod"
+        versions: [">0.36.0"]
+      - dependency-name: "golang.org/x/text"
+        versions: [">0.37.0"]
+      - dependency-name: "golang.org/x/tools"
+        versions: [">0.44.0"]
+      - dependency-name: "github.com/mdlayher/socket"
+        versions: [">0.6.0"]
+      - dependency-name: "github.com/pires/go-proxyproto"
+        versions: [">0.8.0"]
 
   - package-ecosystem: github-actions
     directory: "/"

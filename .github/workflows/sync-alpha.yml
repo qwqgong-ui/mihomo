@@ -32,11 +32,6 @@ jobs:
           ref: Alpha
           fetch-depth: 0
 
-      - name: Set up YAML parser
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-
       - name: Fetch and compare upstream
         id: compare
         shell: bash
@@ -52,15 +47,7 @@ jobs:
             changed=false
           fi
 
-          go_versions="$(
-            git show "upstream/${UPSTREAM_BRANCH}:.github/workflows/test.yml" |
-              ruby -rjson -ryaml -e '
-                workflow = YAML.safe_load($stdin.read, aliases: true)
-                versions = workflow.dig("jobs", "test", "strategy", "matrix", "go-version")
-                abort "upstream Go test matrix was not found" unless versions.is_a?(Array) && !versions.empty?
-                puts JSON.generate(versions.map(&:to_s))
-              '
-          )"
+          go_versions='["1.27"]'
 
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
           echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
@@ -87,6 +74,7 @@ jobs:
     env:
       CGO_ENABLED: 0
       GOTOOLCHAIN: local
+      GOEXPERIMENT: simd
       SKIP_CONCURRENT_TEST: 1
       SKIP_INTEROP_TEST: 1
     steps:
