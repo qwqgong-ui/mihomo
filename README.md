@@ -45,14 +45,16 @@ Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 ## For development
 
 Requirements:
-[Go 1.20 or newer](https://go.dev/dl/)
+[MetaCubeX Go 1.27](https://github.com/MetaCubeX/go/releases/tag/build)
+
+Alpha builds use the experimental Go SIMD API. See [Go 1.27 and module notes](docs/go1.27.md) before building or updating dependencies.
 
 Build mihomo:
 
 ```shell
 git clone https://github.com/MetaCubeX/mihomo.git
 cd mihomo && go mod download
-go build
+GOEXPERIMENT=simd go build
 ```
 
 Set go proxy if a connection to GitHub is not possible:
@@ -64,7 +66,7 @@ go env -w GOPROXY=https://goproxy.io,direct
 Build with gvisor tun stack:
 
 ```shell
-go build -tags with_gvisor
+GOEXPERIMENT=simd go build -tags with_gvisor
 ```
 
 ### IPTABLES configuration
