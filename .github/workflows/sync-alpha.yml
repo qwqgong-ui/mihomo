@@ -1,0 +1,139 @@
+name: Sync upstream Alpha
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-alpha
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: MetaCubeX/mihomo
+  UPSTREAM_BRANCH: Alpha
+
+jobs:
+  inspect:
+    name: Inspect upstream
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      fork-sha: ${{ steps.compare.outputs.fork_sha }}
+      upstream-sha: ${{ steps.compare.outputs.upstream_sha }}
+    steps:
+      - name: Check out fork Alpha
+        uses: actions/checkout@v6
+        with:
+          ref: Alpha
+          fetch-depth: 0
+
+      - name: Fetch and compare upstream
+        id: compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          fork_sha="$(git rev-parse HEAD)"
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          changed=true
+          if git merge-base --is-ancestor "$upstream_sha" "$fork_sha"; then
+            changed=false
+          fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "fork_sha=$fork_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Upstream comparison"
+            echo "- Fork Alpha: \`$fork_sha\`"
+            echo "- Upstream Alpha: \`$upstream_sha\`"
+            echo "- Update required: \`$changed\`"
+            echo "- Go test version: \`1.27\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Test upstream candidate with Go 1.27
+    if: needs.inspect.outputs.changed == 'true'
+    needs: inspect
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CGO_ENABLED: 0
+      GOTOOLCHAIN: local
+      GOEXPERIMENT: simd
+      SKIP_CONCURRENT_TEST: 1
+      SKIP_INTEROP_TEST: 1
+    steps:
+      - name: Check out the current fork revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.inspect.outputs.fork-sha }}
+          fetch-depth: 0
+
+      - name: Merge the upstream candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          test "$(git rev-parse "upstream/${UPSTREAM_BRANCH}")" = "${{ needs.inspect.outputs.upstream-sha }}"
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+
+      - name: Set up Go 1.27
+        uses: actions/setup-go@v6
+        with:
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          go-version: "1.27"
+          cache: true
+
+      - name: Verify modules
+        run: |
+          go mod download
+          go mod verify
+
+      - name: Run tests
+        run: go test ./... -count=1
+
+      - name: Run tests with gVisor
+        run: go test ./... -count=1 -tags with_gvisor
+
+  sync:
+    name: Update fork Alpha
+    if: needs.inspect.outputs.changed == 'true' && needs.test.result == 'success'
+    needs:
+      - inspect
+      - test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tested fork revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.inspect.outputs.fork-sha }}
+          fetch-depth: 0
+
+      - name: Merge and push upstream Alpha
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          test "$(git rev-parse "upstream/${UPSTREAM_BRANCH}")" = "${{ needs.inspect.outputs.upstream-sha }}"
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+          git push origin "HEAD:refs/heads/Alpha"
+
+          {
+            echo "### Alpha synchronized"
+            echo "Updated \`Alpha\` to include upstream commit \`${{ needs.inspect.outputs.upstream-sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
