@@ -1,0 +1,66 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    target-branch: Alpha
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:30"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    groups:
+      metacubex-components:
+        patterns:
+          - "github.com/metacubex/*"
+        update-types:
+          - minor
+          - patch
+      go-components:
+        patterns:
+          - "golang.org/x/*"
+          - "go.uber.org/*"
+          - "go4.org/*"
+        update-types:
+          - minor
+          - patch
+      other-components:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github.com/metacubex/*"
+          - "golang.org/x/*"
+          - "go.uber.org/*"
+          - "go4.org/*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: Alpha
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      alpha-actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: main
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:15"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      automation-actions:
+        patterns:
+          - "*"
