@@ -25,13 +25,7 @@ jobs:
           - 'windows-11-arm' # arm64 windows
           - 'macos-26-intel' # amd64 macos
         go-version:
-          - '1.26'
-          - '1.25'
-          - '1.24'
-          - '1.23'
-          - '1.22'
-          - '1.21'
-          - '1.20'
+          - '1.27'
       fail-fast: false
     runs-on: ${{ matrix.os }}
     defaults:
@@ -40,6 +34,7 @@ jobs:
     env:
       CGO_ENABLED: 0
       GOTOOLCHAIN: local
+      GOEXPERIMENT: simd
       # Fix mingw trying to be smart and converting paths https://github.com/moby/moby/issues/24029#issuecomment-250412919
       MSYS_NO_PATHCONV: true
       # Skip mihomo inbound interop test
