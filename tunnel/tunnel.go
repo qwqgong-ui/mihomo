@@ -314,6 +314,37 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
+func processLookupEndpoints(metadata *C.Metadata) (src, dst netip.AddrPort) {
+	src = metadata.SourceAddrPort()
+	if rawSrc, ok := addrPortFromNetAddr(metadata.RawSrcAddr); ok {
+		src = rawSrc
+	}
+	dst, _ = addrPortFromNetAddr(metadata.RawDstAddr)
+	return
+}
+
+func addrPortFromNetAddr(addr net.Addr) (netip.AddrPort, bool) {
+	if addr == nil {
+		return netip.AddrPort{}, false
+	}
+	if rawAddr, ok := addr.(interface{ RawAddr() net.Addr }); ok {
+		if raw := rawAddr.RawAddr(); raw != nil {
+			if _, ok := raw.(interface{ AddrPort() netip.AddrPort }); ok {
+				addr = raw
+			}
+		}
+	}
+	addrPorter, ok := addr.(interface{ AddrPort() netip.AddrPort })
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	addrPort := addrPorter.AddrPort()
+	if !addrPort.IsValid() || addrPort.Port() == 0 {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
+}
+
 func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
 	if metadata.SpecialProxy != "" {
 		var exist bool
@@ -353,7 +384,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 				attemptProcessLookup = false
 				if !features.CMFA {
 					// normal check for process
-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+					src, dst := processLookupEndpoints(metadata)
+					uid, path, err := process.FindProcessNameByAddr(metadata.NetWork.String(), src, dst)
 					if err != nil {
 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
 					} else {

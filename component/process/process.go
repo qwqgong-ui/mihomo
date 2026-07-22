@@ -22,6 +22,13 @@ func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, str
 	return findProcessName(network, srcIP, srcPort)
 }
 
+// FindProcessNameByAddr finds the process owning a socket identified by its
+// local and remote endpoints. Platforms without an endpoint-aware lookup fall
+// back to the source-only implementation.
+func FindProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, string, error) {
+	return findProcessNameByAddr(network, src, dst)
+}
+
 // PackageNameResolver
 // never change type traits because it's used in CMFA
 type PackageNameResolver func(metadata *C.Metadata) (string, error)
