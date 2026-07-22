@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode"
 	"unsafe"
@@ -25,7 +26,16 @@ const (
 	SOCK_DIAG_BY_FAMILY  = 20
 	inetDiagRequestSize  = int(unsafe.Sizeof(inetDiagRequest{}))
 	inetDiagResponseSize = int(unsafe.Sizeof(inetDiagResponse{}))
+	recentPIDLimit       = 8
 )
+
+type recentPIDs struct {
+	mu   sync.RWMutex
+	pids [recentPIDLimit]string
+	len  int
+}
+
+var recentProcessPIDs sync.Map // map[uint32]*recentPIDs
 
 type inetDiagRequest struct {
 	Family   byte
@@ -175,16 +185,40 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
 }
 
 func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+	buffer := make([]byte, unix.PathMax)
+	socket := fmt.Appendf(nil, "socket:[%d]", inode)
+
+	// Most applications create many connections from the same process. Try the
+	// recently successful PIDs for this UID before scanning every /proc entry.
+	// Each candidate is still verified against the current socket inode, so PID
+	// reuse and stale cache entries cannot produce a false match.
+	recentPIDs := loadRecentProcessPIDs(uid)
+	for _, pid := range recentPIDs {
+		processPath := filepath.Join("/proc", pid)
+		info, err := os.Stat(processPath)
+		if err != nil || info.Sys().(*syscall.Stat_t).Uid != uid {
+			continue
+		}
+		name, matched, err := findProcessNameInPath(processPath, socket, buffer)
+		if err != nil {
+			return "", err
+		}
+		if matched {
+			rememberProcessPID(uid, pid)
+			return name, nil
+		}
+	}
+
 	files, err := os.ReadDir("/proc")
 	if err != nil {
 		return "", err
 	}
 
-	buffer := make([]byte, unix.PathMax)
-	socket := fmt.Appendf(nil, "socket:[%d]", inode)
-
 	for _, f := range files {
 		if !f.IsDir() || !isPid(f.Name()) {
+			continue
+		}
+		if containsPID(recentPIDs, f.Name()) {
 			continue
 		}
 
@@ -197,37 +231,93 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
 		}
 
 		processPath := filepath.Join("/proc", f.Name())
-		fdPath := filepath.Join(processPath, "fd")
-
-		fds, err := os.ReadDir(fdPath)
+		name, matched, err := findProcessNameInPath(processPath, socket, buffer)
 		if err != nil {
-			continue
+			return "", err
 		}
-
-		for _, fd := range fds {
-			n, err := unix.Readlink(filepath.Join(fdPath, fd.Name()), buffer)
-			if err != nil {
-				continue
-			}
-
-			if runtime.GOOS == "android" {
-				if bytes.Equal(buffer[:n], socket) {
-					cmdline, err := os.ReadFile(path.Join(processPath, "cmdline"))
-					if err != nil {
-						return "", err
-					}
-
-					return splitCmdline(cmdline), nil
-				}
-			} else {
-				if bytes.Equal(buffer[:n], socket) {
-					return os.Readlink(filepath.Join(processPath, "exe"))
-				}
-			}
+		if matched {
+			rememberProcessPID(uid, f.Name())
+			return name, nil
 		}
 	}
 
 	return "", fmt.Errorf("process of uid(%d),inode(%d) not found", uid, inode)
+}
+
+func containsPID(pids []string, pid string) bool {
+	for _, candidate := range pids {
+		if candidate == pid {
+			return true
+		}
+	}
+	return false
+}
+
+func findProcessNameInPath(processPath string, socket, buffer []byte) (string, bool, error) {
+	fdPath := filepath.Join(processPath, "fd")
+	fds, err := os.ReadDir(fdPath)
+	if err != nil {
+		return "", false, nil
+	}
+
+	for _, fd := range fds {
+		n, err := unix.Readlink(filepath.Join(fdPath, fd.Name()), buffer)
+		if err != nil || !bytes.Equal(buffer[:n], socket) {
+			continue
+		}
+
+		if runtime.GOOS == "android" {
+			cmdline, err := os.ReadFile(path.Join(processPath, "cmdline"))
+			if err != nil {
+				return "", false, err
+			}
+			return splitCmdline(cmdline), true, nil
+		}
+
+		name, err := os.Readlink(filepath.Join(processPath, "exe"))
+		return name, err == nil, err
+	}
+
+	return "", false, nil
+}
+
+func loadRecentProcessPIDs(uid uint32) []string {
+	value, ok := recentProcessPIDs.Load(uid)
+	if !ok {
+		return nil
+	}
+	recent := value.(*recentPIDs)
+	recent.mu.RLock()
+	defer recent.mu.RUnlock()
+	pids := make([]string, recent.len)
+	copy(pids, recent.pids[:recent.len])
+	return pids
+}
+
+func rememberProcessPID(uid uint32, pid string) {
+	value, _ := recentProcessPIDs.LoadOrStore(uid, &recentPIDs{})
+	recent := value.(*recentPIDs)
+	recent.mu.Lock()
+	defer recent.mu.Unlock()
+
+	index := recent.len
+	for i := 0; i < recent.len; i++ {
+		if recent.pids[i] == pid {
+			index = i
+			break
+		}
+	}
+	if index == 0 && recent.len > 0 {
+		return
+	}
+	if index == recent.len && recent.len < recentPIDLimit {
+		recent.len++
+	}
+	if index >= recentPIDLimit {
+		index = recentPIDLimit - 1
+	}
+	copy(recent.pids[1:index+1], recent.pids[:index])
+	recent.pids[0] = pid
 }
 
 // resolveProcessNameByUID returns a process name for any process with uid.
