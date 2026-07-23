@@ -3,6 +3,7 @@ name: Sync latest compatible sing-tun
 on:
   push:
     branches:
+      - Alpha
       - agent/sync-latest-sing-tun
     paths:
       - .github/workflows/sync-sing-tun.yml
