@@ -16,14 +16,14 @@ func TestApplyRuntimeOverridesDisablesIPv6(t *testing.T) {
 			IPv6:            true,
 			FindProcessMode: process.FindProcessAlways,
 			Inbound: config.Inbound{Tun: LC.Tun{
-				Enable:                      true,
-				Inet4Address:                []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
-				Inet6Address:                []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")},
-				RouteAddress:                []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
-				RouteExcludeAddress:         []netip.Prefix{netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("fe80::/10")},
-				Inet6RouteAddress:           []netip.Prefix{netip.MustParsePrefix("::/0")},
-				Inet6RouteExcludeAddress:    []netip.Prefix{netip.MustParsePrefix("fe80::/10")},
-				LoopbackAddress:             []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
+				Enable:                   true,
+				Inet4Address:             []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+				Inet6Address:             []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")},
+				RouteAddress:             []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0"), netip.MustParsePrefix("::/0")},
+				RouteExcludeAddress:      []netip.Prefix{netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("fe80::/10")},
+				Inet6RouteAddress:        []netip.Prefix{netip.MustParsePrefix("::/0")},
+				Inet6RouteExcludeAddress: []netip.Prefix{netip.MustParsePrefix("fe80::/10")},
+				LoopbackAddress:          []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("::1")},
 			}},
 		},
 		DNS: &config.DNS{IPv6: true},
@@ -56,7 +56,7 @@ func TestApplyRuntimeOverridesDisablesIPv6(t *testing.T) {
 	}
 }
 
-func TestApplyRuntimeOverridesEnablesStrictProcessMatching(t *testing.T) {
+func TestApplyRuntimeOverridesEnablesAlwaysProcessMatching(t *testing.T) {
 	cfg := &config.Config{
 		General: &config.General{
 			FindProcessMode: process.FindProcessOff,
@@ -72,8 +72,8 @@ func TestApplyRuntimeOverridesEnablesStrictProcessMatching(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("applyRuntimeOverridesForOptions: %v", err)
 	}
-	if cfg.General.FindProcessMode != process.FindProcessStrict {
-		t.Fatalf("find process mode = %v, want strict", cfg.General.FindProcessMode)
+	if cfg.General.FindProcessMode != process.FindProcessAlways {
+		t.Fatalf("find process mode = %v, want always", cfg.General.FindProcessMode)
 	}
 	if cfg.General.Tun.Stack != C.TunGvisor {
 		t.Fatalf("TUN stack = %v, want gVisor", cfg.General.Tun.Stack)
