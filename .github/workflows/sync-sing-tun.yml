@@ -1,4 +1,4 @@
-name: Sync latest compatible sing-tun
+name: Port upstream sing-tun onto Meta
 
 on:
   push:
@@ -6,28 +6,27 @@ on:
       - Alpha
     paths:
       - .github/workflows/sync-sing-tun.yml
+      - .github/scripts/port-sing-tun.sh
+      - .github/scripts/update-mihomo-sing-tun.sh
   schedule:
     - cron: "53 */6 * * *"
   workflow_dispatch:
 
 concurrency:
-  group: sync-latest-sing-tun-alpha
+  group: port-upstream-sing-tun-alpha
   cancel-in-progress: false
 
 permissions:
   contents: write
 
-# Mihomo currently uses the MetaCubeX sing type graph. SagerNet/sing-tun:dev
-# has moved to github.com/sagernet/sing v0.8.x, so replacing only sing-tun
-# would mix incompatible Go types. Track the original head for visibility, but
-# update from the newest source-compatible branch and pin the exact commit.
 env:
   TARGET_BRANCH: Alpha
-  SING_TUN_MODULE: github.com/metacubex/sing-tun
-  SING_TUN_REPOSITORY: MetaCubeX/sing-tun
-  SING_TUN_BRANCH: meta
-  ORIGINAL_REPOSITORY: SagerNet/sing-tun
-  ORIGINAL_BRANCH: dev
+  INTEGRATION_BRANCH: sing-tun-meta-upstream
+  META_REPOSITORY: MetaCubeX/sing-tun
+  META_BRANCH: meta
+  UPSTREAM_REPOSITORY: SagerNet/sing-tun
+  UPSTREAM_BRANCH: dev
+  INITIAL_UPSTREAM_CUTOFF: "2026-06-22T06:51:36Z"
   GOTOOLCHAIN: local
   GOEXPERIMENT: simd
   CGO_ENABLED: 0
@@ -35,96 +34,62 @@ env:
   SKIP_INTEROP_TEST: 1
 
 jobs:
-  sync:
-    name: Update and test sing-tun
+  port:
+    name: Port compatible commits onto Meta
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 180
     steps:
-      - name: Check out target branch
+      - name: Check out Mihomo Alpha
         uses: actions/checkout@v6
         with:
           ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
+          path: mihomo
 
       - name: Set up MetaCubeX Go 1.26
         uses: actions/setup-go@v6
         with:
           go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
           go-version: "1.26"
-          cache: true
+          cache: false
 
-      - name: Resolve upstream heads
-        id: refs
+      - name: Build and publish Meta-compatible sing-tun
+        id: port
         shell: bash
-        run: |
-          set -euo pipefail
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REPOSITORY: ${{ github.repository }}
+        run: bash mihomo/.github/scripts/port-sing-tun.sh
 
-          compatible_sha="$(git ls-remote "https://github.com/${SING_TUN_REPOSITORY}.git" "refs/heads/${SING_TUN_BRANCH}" | awk 'NR == 1 { print $1 }')"
-          original_sha="$(git ls-remote "https://github.com/${ORIGINAL_REPOSITORY}.git" "refs/heads/${ORIGINAL_BRANCH}" | awk 'NR == 1 { print $1 }')"
-          test -n "$compatible_sha"
-          test -n "$original_sha"
+      - name: Upload port diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-tun-port-debug-${{ github.run_attempt }}
+          path: port-debug.log
+          if-no-files-found: warn
 
-          current_version="$(go list -m -f '{{.Version}}' "$SING_TUN_MODULE")"
-          echo "compatible_sha=$compatible_sha" >> "$GITHUB_OUTPUT"
-          echo "original_sha=$original_sha" >> "$GITHUB_OUTPUT"
-          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
-
-      - name: Pin compatible branch head
+      - name: Point Mihomo at the tested integration branch
+        id: update
         shell: bash
-        run: |
-          set -euo pipefail
-          go get "${SING_TUN_MODULE}@${{ steps.refs.outputs.compatible_sha }}"
-          go mod tidy
+        env:
+          INTEGRATION_VERSION: ${{ steps.port.outputs.integration_version }}
+          REPLACEMENT_REPOSITORY: github.com/${{ github.repository }}
+        working-directory: mihomo
+        run: bash .github/scripts/update-mihomo-sing-tun.sh
 
-      - name: Inspect module changes
-        id: changes
+      - name: Commit Mihomo dependency update
+        if: steps.update.outputs.changed == 'true'
         shell: bash
-        run: |
-          set -euo pipefail
-          new_version="$(go list -m -f '{{.Version}}' "$SING_TUN_MODULE")"
-          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
-
-          if git diff --quiet -- go.mod go.sum; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          {
-            echo "### sing-tun synchronization"
-            echo "- Target branch: \`${TARGET_BRANCH}\`"
-            echo "- Previous module: \`${{ steps.refs.outputs.current_version }}\`"
-            echo "- Compatible head (MetaCubeX/meta): \`${{ steps.refs.outputs.compatible_sha }}\`"
-            echo "- Original head (SagerNet/dev): \`${{ steps.refs.outputs.original_sha }}\`"
-            echo "- Resolved module: \`${new_version}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify modules
-        if: steps.changes.outputs.changed == 'true'
-        run: |
-          go mod download
-          go mod verify
-          go mod tidy -diff
-
-      - name: Run tests
-        if: steps.changes.outputs.changed == 'true'
-        run: go test ./... -count=1
-
-      - name: Run tests with gVisor
-        if: steps.changes.outputs.changed == 'true'
-        run: go test ./... -count=1 -tags with_gvisor
-
-      - name: Commit and push
-        if: steps.changes.outputs.changed == 'true'
-        shell: bash
+        env:
+          INTEGRATION_SHA: ${{ steps.port.outputs.integration_sha }}
+        working-directory: mihomo
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add go.mod go.sum
-          short_sha="${{ steps.refs.outputs.compatible_sha }}"
-          git commit -m "chore: sync sing-tun ${short_sha:0:12}"
+          git commit -m "chore: port upstream sing-tun ${INTEGRATION_SHA:0:12}"
 
           remote_sha="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk 'NR == 1 { print $1 }')"
           base_sha="$(git rev-parse HEAD^)"
