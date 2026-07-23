@@ -24,7 +24,7 @@ func applyRuntimeOverridesForOptions(cfg *config.Config, options RuntimeOverride
 	// the Android VpnService process model.
 	cfg.General.Tun.Stack = C.TunGvisor
 	if options.ProcessMatching {
-		cfg.General.FindProcessMode = process.FindProcessStrict
+		cfg.General.FindProcessMode = process.FindProcessAlways
 	} else {
 		cfg.General.FindProcessMode = process.FindProcessOff
 	}
