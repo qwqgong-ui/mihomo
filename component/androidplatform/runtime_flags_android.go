@@ -2,7 +2,11 @@
 
 package androidplatform
 
-import "flag"
+import (
+	"flag"
+
+	"github.com/metacubex/mihomo/config"
+)
 
 var activeRuntimeOverrides = RuntimeOverrides{
 	ProcessMatching: true,
