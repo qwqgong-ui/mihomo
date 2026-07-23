@@ -49,6 +49,9 @@ func PrepareConfig(cfg *config.Config) error {
 	if cfg == nil || cfg.General == nil {
 		return errors.New("android platform received an incomplete configuration")
 	}
+	if err := applyRuntimeOverrides(cfg); err != nil {
+		return err
+	}
 	dnsEnabled := cfg.DNS != nil && cfg.DNS.Enable
 	return PrepareTun(&cfg.General.Tun, dnsEnabled)
 }
