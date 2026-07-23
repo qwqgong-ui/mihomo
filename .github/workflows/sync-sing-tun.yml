@@ -1,0 +1,142 @@
+name: Sync latest compatible sing-tun
+
+on:
+  push:
+    branches:
+      - Alpha
+      - agent/sync-latest-sing-tun
+    paths:
+      - .github/workflows/sync-sing-tun.yml
+  pull_request:
+    branches:
+      - Alpha
+    paths:
+      - .github/workflows/sync-sing-tun.yml
+  schedule:
+    - cron: "53 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-latest-sing-tun-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+# Mihomo currently uses the MetaCubeX sing type graph. SagerNet/sing-tun:dev
+# has moved to github.com/sagernet/sing v0.8.x, so replacing only sing-tun
+# would mix incompatible Go types. Track the original head for visibility, but
+# update from the newest source-compatible branch and pin the exact commit.
+env:
+  TARGET_BRANCH: ${{ github.event_name == 'push' && github.ref_name || github.event_name == 'pull_request' && github.head_ref || 'Alpha' }}
+  SING_TUN_MODULE: github.com/metacubex/sing-tun
+  SING_TUN_REPOSITORY: MetaCubeX/sing-tun
+  SING_TUN_BRANCH: meta
+  ORIGINAL_REPOSITORY: SagerNet/sing-tun
+  ORIGINAL_BRANCH: dev
+  GOTOOLCHAIN: local
+  GOEXPERIMENT: simd
+  CGO_ENABLED: 0
+  SKIP_CONCURRENT_TEST: 1
+  SKIP_INTEROP_TEST: 1
+
+jobs:
+  sync:
+    name: Update and test sing-tun
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out target branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Set up MetaCubeX Go 1.26
+        uses: actions/setup-go@v6
+        with:
+          go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
+          go-version: "1.26"
+          cache: true
+
+      - name: Resolve upstream heads
+        id: refs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          compatible_sha="$(git ls-remote "https://github.com/${SING_TUN_REPOSITORY}.git" "refs/heads/${SING_TUN_BRANCH}" | awk 'NR == 1 { print $1 }')"
+          original_sha="$(git ls-remote "https://github.com/${ORIGINAL_REPOSITORY}.git" "refs/heads/${ORIGINAL_BRANCH}" | awk 'NR == 1 { print $1 }')"
+          test -n "$compatible_sha"
+          test -n "$original_sha"
+
+          current_version="$(go list -m -f '{{.Version}}' "$SING_TUN_MODULE")"
+          echo "compatible_sha=$compatible_sha" >> "$GITHUB_OUTPUT"
+          echo "original_sha=$original_sha" >> "$GITHUB_OUTPUT"
+          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
+
+      - name: Pin compatible branch head
+        shell: bash
+        run: |
+          set -euo pipefail
+          go get "${SING_TUN_MODULE}@${{ steps.refs.outputs.compatible_sha }}"
+          go mod tidy
+
+      - name: Inspect module changes
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          new_version="$(go list -m -f '{{.Version}}' "$SING_TUN_MODULE")"
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+          if git diff --quiet -- go.mod go.sum; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "### sing-tun synchronization"
+            echo "- Target branch: \`${TARGET_BRANCH}\`"
+            echo "- Previous module: \`${{ steps.refs.outputs.current_version }}\`"
+            echo "- Compatible head (MetaCubeX/meta): \`${{ steps.refs.outputs.compatible_sha }}\`"
+            echo "- Original head (SagerNet/dev): \`${{ steps.refs.outputs.original_sha }}\`"
+            echo "- Resolved module: \`${new_version}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify modules
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy -diff
+
+      - name: Run tests
+        if: steps.changes.outputs.changed == 'true'
+        run: go test ./... -count=1
+
+      - name: Run tests with gVisor
+        if: steps.changes.outputs.changed == 'true'
+        run: go test ./... -count=1 -tags with_gvisor
+
+      - name: Commit and push
+        if: steps.changes.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add go.mod go.sum
+          short_sha="${{ steps.refs.outputs.compatible_sha }}"
+          git commit -m "chore: sync sing-tun ${short_sha:0:12}"
+
+          remote_sha="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk 'NR == 1 { print $1 }')"
+          base_sha="$(git rev-parse HEAD^)"
+          if [[ "$remote_sha" != "$base_sha" ]]; then
+            echo "Target branch moved from ${base_sha} to ${remote_sha}; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
