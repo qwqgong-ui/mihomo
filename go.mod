@@ -1,6 +1,6 @@
 module github.com/metacubex/mihomo
 
-go 1.27
+go 1.26
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0
@@ -15,7 +15,7 @@ require (
 	github.com/mdlayher/netlink v1.11.2
 	github.com/metacubex/age v0.0.0-20260603010618-28d156b4ea78
 	github.com/metacubex/amneziawg-go v0.0.0-20260612143004-19b4f1cdd5ec
-	github.com/metacubex/bart v0.28.2
+	github.com/metacubex/bart v0.29.0
 	github.com/metacubex/bbolt v0.0.0-20260706163408-d4ec34ad7c48
 	github.com/metacubex/blake3 v0.1.0
 	github.com/metacubex/chacha v0.1.5
@@ -26,8 +26,8 @@ require (
 	github.com/metacubex/fswatch v0.1.1
 	github.com/metacubex/gopacket v1.1.20-0.20230608035415-7e2f98a3e759
 	github.com/metacubex/http v0.1.6
-	github.com/metacubex/jls-quic-go v0.0.0-20260717074316-85a8decdd355
-	github.com/metacubex/jls-tls v0.0.0-20260716145614-4bf88db633e2
+	github.com/metacubex/jls-quic-go v0.0.0-20260722070908-2d506f2b0d24
+	github.com/metacubex/jls-tls v0.0.0-20260722070430-048cc2060002
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/mhurl v0.1.0
 	github.com/metacubex/mlkem v0.1.0

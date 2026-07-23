@@ -48,13 +48,13 @@ jobs:
           - { goos: linux, goarch: s390x, output: s390x, debian: s390x, rpm: s390x }
           - { goos: linux, goarch: ppc64le, output: ppc64le, debian: ppc64el, rpm: ppc64le }
 
-          # MetaCubeX Go 1.27 toolchain
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.27/
+          # MetaCubeX Go 1.26 toolchain
+          # https://github.com/MetaCubeX/go/commits/release-branch.go1.26/
           - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64 }
           - { goos: darwin, goarch: arm64, output: arm64 }
 
-          # MetaCubeX Go 1.27 toolchain
-          # https://github.com/MetaCubeX/go/commits/release-branch.go1.27/
+          # MetaCubeX Go 1.26 toolchain
+          # https://github.com/MetaCubeX/go/commits/release-branch.go1.26/
           - { goos: windows, goarch: '386', output: '386' }
           - { goos: windows, goarch: amd64, goamd64: v3, output: amd64 }
           - { goos: windows, goarch: arm64, output: arm64 }
@@ -75,7 +75,7 @@ jobs:
       uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
       with:
         go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
-        go-version: '1.27'
+        go-version: '1.26'
 
     - name: Verify Go installation
       run: go version
