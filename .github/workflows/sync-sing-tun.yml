@@ -168,14 +168,14 @@ jobs:
             fi
 
             test_log="${RUNNER_TEMP}/sing-tun-${commit}.log"
-            if ! go test ./... -run '^$' -count=1 >"$test_log" 2>&1; then
+            if ! go test . -run '^$' -count=1 >"$test_log" 2>&1; then
               tail -n 80 "$test_log" || true
               git reset --hard "$base"
               printf '%s\tcompile\t%s\n' "$commit" "$subject" >> "$skipped_file"
               continue
             fi
 
-            if ! go test ./... -run '^$' -count=1 -tags with_gvisor >>"$test_log" 2>&1; then
+            if ! go test . -run '^$' -count=1 -tags with_gvisor >>"$test_log" 2>&1; then
               tail -n 80 "$test_log" || true
               git reset --hard "$base"
               printf '%s\tgvisor-compile\t%s\n' "$commit" "$subject" >> "$skipped_file"
@@ -229,8 +229,8 @@ jobs:
 
           go mod download
           go mod verify
-          go test ./... -run '^$' -count=1
-          go test ./... -run '^$' -count=1 -tags with_gvisor
+          go test . -run '^$' -count=1
+          go test . -run '^$' -count=1 -tags with_gvisor
 
           remote_sha="$(git ls-remote publish "refs/heads/${INTEGRATION_BRANCH}" | awk 'NR == 1 { print $1 }')"
           if [[ -n "$remote_sha" ]]; then
