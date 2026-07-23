@@ -1,9 +1,10 @@
-name: Sync latest compatible sing-tun
+name: Port upstream sing-tun onto Meta
 
 on:
   push:
     branches:
       - Alpha
+      - agent/port-upstream-sing-tun
     paths:
       - .github/workflows/sync-sing-tun.yml
   schedule:
@@ -11,23 +12,22 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sync-latest-sing-tun-alpha
+  group: port-upstream-sing-tun
   cancel-in-progress: false
 
 permissions:
   contents: write
 
-# Mihomo currently uses the MetaCubeX sing type graph. SagerNet/sing-tun:dev
-# has moved to github.com/sagernet/sing v0.8.x, so replacing only sing-tun
-# would mix incompatible Go types. Track the original head for visibility, but
-# update from the newest source-compatible branch and pin the exact commit.
 env:
-  TARGET_BRANCH: Alpha
-  SING_TUN_MODULE: github.com/metacubex/sing-tun
-  SING_TUN_REPOSITORY: MetaCubeX/sing-tun
-  SING_TUN_BRANCH: meta
-  ORIGINAL_REPOSITORY: SagerNet/sing-tun
-  ORIGINAL_BRANCH: dev
+  TARGET_BRANCH: ${{ github.event_name == 'push' && github.ref_name || 'Alpha' }}
+  INTEGRATION_BRANCH: sing-tun-meta-upstream
+  META_REPOSITORY: MetaCubeX/sing-tun
+  META_BRANCH: meta
+  UPSTREAM_REPOSITORY: SagerNet/sing-tun
+  UPSTREAM_BRANCH: dev
+  # MetaCubeX/meta was last updated at this point. The first run examines newer
+  # SagerNet commits; later runs continue from the stored watermark.
+  INITIAL_UPSTREAM_CUTOFF: "2026-06-22T06:51:36Z"
   GOTOOLCHAIN: local
   GOEXPERIMENT: simd
   CGO_ENABLED: 0
@@ -35,54 +35,245 @@ env:
   SKIP_INTEROP_TEST: 1
 
 jobs:
-  sync:
-    name: Update and test sing-tun
+  port:
+    name: Port compatible commits onto Meta
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 180
+    outputs:
+      integration-sha: ${{ steps.port.outputs.integration_sha }}
+      integration-version: ${{ steps.port.outputs.integration_version }}
+      applied-count: ${{ steps.port.outputs.applied_count }}
+      skipped-count: ${{ steps.port.outputs.skipped_count }}
     steps:
-      - name: Check out target branch
+      - name: Check out Mihomo target
         uses: actions/checkout@v6
         with:
           ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
+          path: mihomo
 
       - name: Set up MetaCubeX Go 1.26
         uses: actions/setup-go@v6
         with:
           go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
           go-version: "1.26"
-          cache: true
+          cache: false
 
-      - name: Resolve upstream heads
-        id: refs
+      - name: Build and publish Meta-compatible sing-tun
+        id: port
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -Eeuo pipefail
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          work_dir="${RUNNER_TEMP}/sing-tun-port"
+          rm -rf "$work_dir"
+          git clone --no-tags --branch "$META_BRANCH" \
+            "https://github.com/${META_REPOSITORY}.git" "$work_dir"
+          cd "$work_dir"
+
+          git remote rename origin meta
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags upstream \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          publish_url="https://x-access-token:${GH_TOKEN}@github.com/${PUBLISH_REPOSITORY}.git"
+          git remote add publish "$publish_url"
+
+          if git ls-remote --exit-code publish "refs/heads/${INTEGRATION_BRANCH}" >/dev/null 2>&1; then
+            git fetch --no-tags publish \
+              "+refs/heads/${INTEGRATION_BRANCH}:refs/remotes/publish/${INTEGRATION_BRANCH}"
+            git checkout -B "$INTEGRATION_BRANCH" \
+              "refs/remotes/publish/${INTEGRATION_BRANCH}"
+            git merge --no-edit -X ours "refs/remotes/meta/${META_BRANCH}"
+          else
+            git checkout -B "$INTEGRATION_BRANCH" \
+              "refs/remotes/meta/${META_BRANCH}"
+          fi
+
+          meta_sha="$(git rev-parse "refs/remotes/meta/${META_BRANCH}")"
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+
+          if [[ -s .sagernet-watermark ]]; then
+            watermark="$(tr -d '[:space:]' < .sagernet-watermark)"
+          else
+            watermark="$(git rev-list -1 \
+              --before="$INITIAL_UPSTREAM_CUTOFF" \
+              "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+          fi
+
+          test -n "$watermark"
+          git merge-base --is-ancestor \
+            "$watermark" "refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          mapfile -t candidates < <(git rev-list --reverse --no-merges \
+            "${watermark}..refs/remotes/upstream/${UPSTREAM_BRANCH}")
+
+          applied_file="${RUNNER_TEMP}/sing-tun-applied.txt"
+          skipped_file="${RUNNER_TEMP}/sing-tun-skipped.txt"
+          : > "$applied_file"
+          : > "$skipped_file"
+
+          normalize_imports() {
+            local file
+            while IFS= read -r -d '' file; do
+              sed -i \
+                -e 's#github.com/sagernet/sing-tun#github.com/metacubex/sing-tun#g' \
+                -e 's#github.com/sagernet/sing#github.com/metacubex/sing#g' \
+                -e 's#github.com/sagernet/fswatch#github.com/metacubex/fswatch#g' \
+                -e 's#github.com/sagernet/gvisor#github.com/metacubex/gvisor#g' \
+                -e 's#github.com/sagernet/nftables#github.com/metacubex/nftables#g' \
+                "$file"
+            done < <(git grep -Ilz 'github.com/sagernet/' -- '*.go' || true)
+          }
+
+          for commit in "${candidates[@]}"; do
+            base="$(git rev-parse HEAD)"
+            subject="$(git show -s --format=%s "$commit")"
+            echo "Examining ${commit}: ${subject}"
+
+            if ! git cherry-pick --no-commit "$commit"; then
+              git cherry-pick --abort || true
+              git reset --hard "$base"
+              printf '%s\tconflict\t%s\n' "$commit" "$subject" >> "$skipped_file"
+              continue
+            fi
+
+            # Keep the MetaCubeX module identity and dependency graph. Only the
+            # source patch is considered for automatic compatibility porting.
+            git restore --source="$base" --staged --worktree -- go.mod go.sum
+            normalize_imports
+
+            if git diff --quiet && git diff --cached --quiet; then
+              git reset --hard "$base"
+              printf '%s\talready-present\t%s\n' "$commit" "$subject" >> "$skipped_file"
+              continue
+            fi
+
+            if ! git diff --check; then
+              git reset --hard "$base"
+              printf '%s\tdiff-check\t%s\n' "$commit" "$subject" >> "$skipped_file"
+              continue
+            fi
+
+            test_log="${RUNNER_TEMP}/sing-tun-${commit}.log"
+            if ! go test ./... -run '^$' -count=1 >"$test_log" 2>&1; then
+              tail -n 80 "$test_log" || true
+              git reset --hard "$base"
+              printf '%s\tcompile\t%s\n' "$commit" "$subject" >> "$skipped_file"
+              continue
+            fi
+
+            if ! go test ./... -run '^$' -count=1 -tags with_gvisor >>"$test_log" 2>&1; then
+              tail -n 80 "$test_log" || true
+              git reset --hard "$base"
+              printf '%s\tgvisor-compile\t%s\n' "$commit" "$subject" >> "$skipped_file"
+              continue
+            fi
+
+            git add -A
+            git commit \
+              -m "port: ${subject}" \
+              -m "Upstream-SagerNet: ${commit}"
+            printf '%s\t%s\n' "$commit" "$subject" >> "$applied_file"
+          done
+
+          printf '%s\n' "$upstream_sha" > .sagernet-watermark
+          {
+            echo "# SagerNet compatibility port report"
+            echo
+            echo "- Meta base: \`${meta_sha}\`"
+            echo "- SagerNet examined through: \`${upstream_sha}\`"
+            echo "- Policy: keep the MetaCubeX module path and dependency graph; apply only patches that compile with and without gVisor."
+            echo
+            echo "## Applied"
+            if [[ -s "$applied_file" ]]; then
+              while IFS=$'\t' read -r sha subject; do
+                echo "- \`${sha}\` — ${subject}"
+              done < "$applied_file"
+            else
+              echo "- None"
+            fi
+            echo
+            echo "## Skipped"
+            if [[ -s "$skipped_file" ]]; then
+              while IFS=$'\t' read -r sha reason subject; do
+                echo "- \`${sha}\` — **${reason}** — ${subject}"
+              done < "$skipped_file"
+            else
+              echo "- None"
+            fi
+          } > .sagernet-port-report.md
+
+          git add .sagernet-watermark .sagernet-port-report.md
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record SagerNet port state"
+          fi
+
+          go mod download
+          go mod verify
+          go mod tidy -diff
+          go test ./... -count=1
+          go test ./... -count=1 -tags with_gvisor
+
+          remote_sha="$(git ls-remote publish "refs/heads/${INTEGRATION_BRANCH}" | awk 'NR == 1 { print $1 }')"
+          if [[ -n "$remote_sha" ]]; then
+            merge_base="$(git merge-base "$remote_sha" HEAD || true)"
+            if [[ "$merge_base" != "$remote_sha" ]]; then
+              echo "Integration branch moved or diverged; refusing to overwrite it." >&2
+              exit 1
+            fi
+          fi
+
+          git push publish "HEAD:refs/heads/${INTEGRATION_BRANCH}"
+
+          integration_sha="$(git rev-parse HEAD)"
+          commit_epoch="$(git show -s --format=%ct HEAD)"
+          commit_time="$(date -u -d "@${commit_epoch}" +%Y%m%d%H%M%S)"
+          integration_version="v0.0.0-${commit_time}-${integration_sha:0:12}"
+          applied_count="$(wc -l < "$applied_file" | tr -d '[:space:]')"
+          skipped_count="$(wc -l < "$skipped_file" | tr -d '[:space:]')"
+
+          echo "integration_sha=$integration_sha" >> "$GITHUB_OUTPUT"
+          echo "integration_version=$integration_version" >> "$GITHUB_OUTPUT"
+          echo "applied_count=$applied_count" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=$skipped_count" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### sing-tun Meta compatibility port"
+            echo "- Meta head: \`${meta_sha}\`"
+            echo "- SagerNet head: \`${upstream_sha}\`"
+            echo "- Integration commit: \`${integration_sha}\`"
+            echo "- Replacement version: \`${integration_version}\`"
+            echo "- Applied commits: \`${applied_count}\`"
+            echo "- Skipped commits: \`${skipped_count}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Point Mihomo at the tested integration branch
+        id: update
+        shell: bash
+        env:
+          INTEGRATION_VERSION: ${{ steps.port.outputs.integration_version }}
+          REPLACEMENT_REPOSITORY: github.com/${{ github.repository }}
+        working-directory: mihomo
         run: |
           set -euo pipefail
 
-          compatible_sha="$(git ls-remote "https://github.com/${SING_TUN_REPOSITORY}.git" "refs/heads/${SING_TUN_BRANCH}" | awk 'NR == 1 { print $1 }')"
-          original_sha="$(git ls-remote "https://github.com/${ORIGINAL_REPOSITORY}.git" "refs/heads/${ORIGINAL_BRANCH}" | awk 'NR == 1 { print $1 }')"
-          test -n "$compatible_sha"
-          test -n "$original_sha"
+          go mod edit -dropreplace=github.com/metacubex/sing-tun || true
+          go mod edit \
+            -replace="github.com/metacubex/sing-tun=${REPLACEMENT_REPOSITORY}@${INTEGRATION_VERSION}"
+          GOPROXY=direct go mod tidy
 
-          current_version="$(go list -m -f '{{.Version}}' "$SING_TUN_MODULE")"
-          echo "compatible_sha=$compatible_sha" >> "$GITHUB_OUTPUT"
-          echo "original_sha=$original_sha" >> "$GITHUB_OUTPUT"
-          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
-
-      - name: Pin compatible branch head
-        shell: bash
-        run: |
-          set -euo pipefail
-          go get "${SING_TUN_MODULE}@${{ steps.refs.outputs.compatible_sha }}"
-          go mod tidy
-
-      - name: Inspect module changes
-        id: changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          new_version="$(go list -m -f '{{.Version}}' "$SING_TUN_MODULE")"
-          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+          go mod download
+          go mod verify
+          GOPROXY=direct go mod tidy -diff
+          go test ./... -count=1
+          go test ./... -count=1 -tags with_gvisor
 
           if git diff --quiet -- go.mod go.sum; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
@@ -90,41 +281,19 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-          {
-            echo "### sing-tun synchronization"
-            echo "- Target branch: \`${TARGET_BRANCH}\`"
-            echo "- Previous module: \`${{ steps.refs.outputs.current_version }}\`"
-            echo "- Compatible head (MetaCubeX/meta): \`${{ steps.refs.outputs.compatible_sha }}\`"
-            echo "- Original head (SagerNet/dev): \`${{ steps.refs.outputs.original_sha }}\`"
-            echo "- Resolved module: \`${new_version}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify modules
-        if: steps.changes.outputs.changed == 'true'
-        run: |
-          go mod download
-          go mod verify
-          go mod tidy -diff
-
-      - name: Run tests
-        if: steps.changes.outputs.changed == 'true'
-        run: go test ./... -count=1
-
-      - name: Run tests with gVisor
-        if: steps.changes.outputs.changed == 'true'
-        run: go test ./... -count=1 -tags with_gvisor
-
-      - name: Commit and push
-        if: steps.changes.outputs.changed == 'true'
+      - name: Commit Mihomo dependency update
+        if: steps.update.outputs.changed == 'true'
         shell: bash
+        env:
+          INTEGRATION_SHA: ${{ steps.port.outputs.integration-sha }}
+        working-directory: mihomo
         run: |
           set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add go.mod go.sum
-          short_sha="${{ steps.refs.outputs.compatible_sha }}"
-          git commit -m "chore: sync sing-tun ${short_sha:0:12}"
+          git commit -m "chore: port upstream sing-tun ${INTEGRATION_SHA:0:12}"
 
           remote_sha="$(git ls-remote origin "refs/heads/${TARGET_BRANCH}" | awk 'NR == 1 { print $1 }')"
           base_sha="$(git rev-parse HEAD^)"
