@@ -17,6 +17,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/cmd"
 	"github.com/metacubex/mihomo/component/age"
+	"github.com/metacubex/mihomo/component/androidplatform"
 	"github.com/metacubex/mihomo/component/generator"
 	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/updater"
@@ -25,6 +26,7 @@ import (
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
+	"github.com/metacubex/mihomo/hub/route"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/rules/provider"
 
@@ -49,6 +51,7 @@ var (
 	secret                        string
 	postUp                        string
 	postDown                      string
+	androidPlatformSocket         string
 )
 
 func getIntEnv(key string) int {
@@ -71,6 +74,7 @@ func init() {
 	flag.StringVar(&secret, "secret", os.Getenv("CLASH_OVERRIDE_SECRET"), "override secret for RESTful API")
 	flag.StringVar(&postUp, "post-up", os.Getenv("CLASH_POST_UP"), "set post-up script")
 	flag.StringVar(&postDown, "post-down", os.Getenv("CLASH_POST_DOWN"), "set post-down script")
+	flag.StringVar(&androidPlatformSocket, "android-platform-socket", "", "use Android VpnService platform bridge at this abstract Unix socket")
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
 	flag.BoolVar(&version, "v", false, "show current version of mihomo")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
@@ -188,6 +192,13 @@ func main() {
 		}
 		fmt.Printf("configuration file %s test is successful\n", C.Path.Config())
 		return
+	}
+
+	if androidPlatformSocket != "" {
+		if err := androidplatform.Configure(androidPlatformSocket); err != nil {
+			log.Fatalln("Configure Android platform error: %s", err.Error())
+		}
+		route.SetEmbedMode(true)
 	}
 
 	var options []hub.Option

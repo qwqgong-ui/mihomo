@@ -22,10 +22,22 @@ func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, str
 	return findProcessName(network, srcIP, srcPort)
 }
 
+// ProcessNameResolver resolves a socket owner outside the mihomo process.
+// Android VpnService supplies this because ordinary Android applications cannot
+// depend on /proc/net or INET_DIAG access.
+type ProcessNameResolver func(network string, src, dst netip.AddrPort) (uint32, string, error)
+
+var DefaultProcessNameResolver ProcessNameResolver
+
 // FindProcessNameByAddr finds the process owning a socket identified by its
 // local and remote endpoints. Platforms without an endpoint-aware lookup fall
 // back to the source-only implementation.
 func FindProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, string, error) {
+	if resolver := DefaultProcessNameResolver; resolver != nil {
+		if uid, path, err := resolver(network, src, dst); err == nil {
+			return uid, path, nil
+		}
+	}
 	return findProcessNameByAddr(network, src, dst)
 }
 

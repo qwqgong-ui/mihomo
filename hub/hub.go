@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"github.com/metacubex/mihomo/component/androidplatform"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
@@ -99,6 +100,9 @@ func Parse(configBytes []byte, options ...Option) error {
 
 	for _, option := range options {
 		option(cfg)
+	}
+	if err = androidplatform.PrepareConfig(cfg); err != nil {
+		return err
 	}
 
 	ApplyConfig(cfg)
