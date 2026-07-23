@@ -285,7 +285,7 @@ jobs:
         if: steps.update.outputs.changed == 'true'
         shell: bash
         env:
-          INTEGRATION_SHA: ${{ steps.port.outputs.integration-sha }}
+          INTEGRATION_SHA: ${{ steps.port.outputs.integration_sha }}
         working-directory: mihomo
         run: |
           set -euo pipefail
