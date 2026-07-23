@@ -52,6 +52,7 @@ var (
 	postUp                        string
 	postDown                      string
 	androidPlatformSocket         string
+	androidTunStackOverride       string
 )
 
 func getIntEnv(key string) int {
@@ -75,6 +76,7 @@ func init() {
 	flag.StringVar(&postUp, "post-up", os.Getenv("CLASH_POST_UP"), "set post-up script")
 	flag.StringVar(&postDown, "post-down", os.Getenv("CLASH_POST_DOWN"), "set post-down script")
 	flag.StringVar(&androidPlatformSocket, "android-platform-socket", "", "use Android VpnService platform bridge at this abstract Unix socket")
+	flag.StringVar(&androidTunStackOverride, "android-tun-stack-override", "", "override Android TUN stack (gvisor only; system unavailable)")
 	flag.BoolVar(&geodataMode, "m", false, "set geodata mode")
 	flag.BoolVar(&version, "v", false, "show current version of mihomo")
 	flag.BoolVar(&testConfig, "t", false, "test configuration and exit")
@@ -194,9 +196,15 @@ func main() {
 		return
 	}
 
+	if androidTunStackOverride != "" && androidPlatformSocket == "" {
+		log.Fatalln("Android TUN stack override requires -android-platform-socket")
+	}
 	if androidPlatformSocket != "" {
 		if err := androidplatform.Configure(androidPlatformSocket); err != nil {
 			log.Fatalln("Configure Android platform error: %s", err.Error())
+		}
+		if err := androidplatform.SetTunStackOverride(androidTunStackOverride); err != nil {
+			log.Fatalln("Configure Android TUN stack override error: %s", err.Error())
 		}
 		route.SetEmbedMode(true)
 	}
