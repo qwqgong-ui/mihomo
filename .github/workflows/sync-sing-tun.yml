@@ -4,12 +4,6 @@ on:
   push:
     branches:
       - Alpha
-      - agent/sync-latest-sing-tun
-    paths:
-      - .github/workflows/sync-sing-tun.yml
-  pull_request:
-    branches:
-      - Alpha
     paths:
       - .github/workflows/sync-sing-tun.yml
   schedule:
@@ -17,7 +11,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: sync-latest-sing-tun-${{ github.ref }}
+  group: sync-latest-sing-tun-alpha
   cancel-in-progress: false
 
 permissions:
@@ -28,7 +22,7 @@ permissions:
 # would mix incompatible Go types. Track the original head for visibility, but
 # update from the newest source-compatible branch and pin the exact commit.
 env:
-  TARGET_BRANCH: ${{ github.event_name == 'push' && github.ref_name || github.event_name == 'pull_request' && github.head_ref || 'Alpha' }}
+  TARGET_BRANCH: Alpha
   SING_TUN_MODULE: github.com/metacubex/sing-tun
   SING_TUN_REPOSITORY: MetaCubeX/sing-tun
   SING_TUN_BRANCH: meta
