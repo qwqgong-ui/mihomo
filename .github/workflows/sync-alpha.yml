@@ -54,11 +54,11 @@ jobs:
             echo "- Fork Alpha: \`$fork_sha\`"
             echo "- Upstream Alpha: \`$upstream_sha\`"
             echo "- Update required: \`$changed\`"
-            echo "- Go test version: \`1.27\`"
+            echo "- Go test version: \`1.26\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   test:
-    name: Test upstream candidate with Go 1.27
+    name: Test upstream candidate with Go 1.26
     if: needs.inspect.outputs.changed == 'true'
     needs: inspect
     runs-on: ubuntu-latest
@@ -87,11 +87,11 @@ jobs:
           test "$(git rev-parse "upstream/${UPSTREAM_BRANCH}")" = "${{ needs.inspect.outputs.upstream-sha }}"
           git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
 
-      - name: Set up Go 1.27
+      - name: Set up Go 1.26
         uses: actions/setup-go@v6
         with:
           go-download-base-url: https://github.com/MetaCubeX/go/releases/download/build
-          go-version: "1.27"
+          go-version: "1.26"
           cache: true
 
       - name: Verify modules

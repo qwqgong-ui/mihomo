@@ -45,9 +45,9 @@ Documentation can be found in [mihomo Docs](https://wiki.metacubex.one/).
 ## For development
 
 Requirements:
-[MetaCubeX Go 1.27](https://github.com/MetaCubeX/go/releases/tag/build)
+[MetaCubeX Go 1.26](https://github.com/MetaCubeX/go/releases/tag/build)
 
-Alpha builds use the experimental Go SIMD API. See [Go 1.27 and module notes](docs/go1.27.md) before building or updating dependencies.
+Alpha builds use the experimental Go SIMD API. See [Go 1.26 and module notes](docs/go1.26.md) before building or updating dependencies.
 
 Build mihomo:
 
