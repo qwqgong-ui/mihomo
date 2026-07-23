@@ -5,12 +5,8 @@ package main
 /*
 #include <stdlib.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-extern int androidcyaml_protect_socket(int fd);
-extern char* androidcyaml_resolve_process(
+typedef int (*androidcyaml_protect_callback_t)(int fd);
+typedef char* (*androidcyaml_resolve_callback_t)(
     int protocol,
     const char* source_address,
     int source_port,
@@ -18,9 +14,32 @@ extern char* androidcyaml_resolve_process(
     int destination_port
 );
 
-#ifdef __cplusplus
+static int androidcyaml_call_protect(void* callback, int fd) {
+    if (callback == NULL) {
+        return 0;
+    }
+    return ((androidcyaml_protect_callback_t) callback)(fd);
 }
-#endif
+
+static char* androidcyaml_call_resolve(
+    void* callback,
+    int protocol,
+    const char* source_address,
+    int source_port,
+    const char* destination_address,
+    int destination_port
+) {
+    if (callback == NULL) {
+        return NULL;
+    }
+    return ((androidcyaml_resolve_callback_t) callback)(
+        protocol,
+        source_address,
+        source_port,
+        destination_address,
+        destination_port
+    );
+}
 */
 import "C"
 
@@ -58,9 +77,21 @@ type nativeResponse struct {
 var (
 	runtimeMu sync.Mutex
 	active    bool
+
+	callbackMu             sync.RWMutex
+	protectCallback        unsafe.Pointer
+	resolveProcessCallback unsafe.Pointer
 )
 
 func main() {}
+
+//export AndroidCyamlInstallCallbacks
+func AndroidCyamlInstallCallbacks(protectValue, resolveValue unsafe.Pointer) {
+	callbackMu.Lock()
+	protectCallback = protectValue
+	resolveProcessCallback = resolveValue
+	callbackMu.Unlock()
+}
 
 //export AndroidCyamlFree
 func AndroidCyamlFree(value *C.char) {
@@ -130,6 +161,9 @@ func AndroidCyamlStart(
 
 	if active {
 		stopLocked()
+	}
+	if !callbacksInstalled() {
+		return respond(nil, errors.New("Android JNI callbacks are not installed"))
 	}
 
 	home := C.GoString(homeValue)
@@ -208,9 +242,13 @@ func initializeRuntimePaths(home, configPath string) error {
 
 func installPlatformHooks() {
 	dialer.DefaultSocketHook = func(network, address string, connection syscall.RawConn) error {
+		callback := currentProtectCallback()
+		if callback == nil {
+			return errors.New("Android socket protect callback is unavailable")
+		}
 		var rejected bool
 		err := connection.Control(func(fileDescriptor uintptr) {
-			rejected = C.androidcyaml_protect_socket(C.int(fileDescriptor)) == 0
+			rejected = C.androidcyaml_call_protect(callback, C.int(fileDescriptor)) == 0
 		})
 		if err != nil {
 			return err
@@ -232,6 +270,10 @@ func resolveProcess(network string, source, destination netip.AddrPort) (uint32,
 	if !source.IsValid() || !destination.IsValid() {
 		return 0, "", process.ErrNotFound
 	}
+	callback := currentResolveProcessCallback()
+	if callback == nil {
+		return 0, "", process.ErrNotFound
+	}
 	var protocol int
 	switch {
 	case strings.HasPrefix(network, "tcp"):
@@ -247,7 +289,8 @@ func resolveProcess(network string, source, destination netip.AddrPort) (uint32,
 	defer C.free(unsafe.Pointer(sourceAddress))
 	defer C.free(unsafe.Pointer(destinationAddress))
 
-	encoded := C.androidcyaml_resolve_process(
+	encoded := C.androidcyaml_call_resolve(
+		callback,
 		C.int(protocol),
 		sourceAddress,
 		C.int(source.Port()),
@@ -267,6 +310,24 @@ func resolveProcess(network string, source, destination netip.AddrPort) (uint32,
 		return 0, "", process.ErrNotFound
 	}
 	return uint32(uid), packageName, nil
+}
+
+func callbacksInstalled() bool {
+	callbackMu.RLock()
+	defer callbackMu.RUnlock()
+	return protectCallback != nil && resolveProcessCallback != nil
+}
+
+func currentProtectCallback() unsafe.Pointer {
+	callbackMu.RLock()
+	defer callbackMu.RUnlock()
+	return protectCallback
+}
+
+func currentResolveProcessCallback() unsafe.Pointer {
+	callbackMu.RLock()
+	defer callbackMu.RUnlock()
+	return resolveProcessCallback
 }
 
 func stopLocked() {
