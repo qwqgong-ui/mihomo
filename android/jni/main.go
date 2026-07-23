@@ -5,6 +5,10 @@ package main
 /*
 #include <stdlib.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern int androidcyaml_protect_socket(int fd);
 extern char* androidcyaml_resolve_process(
     int protocol,
@@ -13,6 +17,10 @@ extern char* androidcyaml_resolve_process(
     const char* destination_address,
     int destination_port
 );
+
+#ifdef __cplusplus
+}
+#endif
 */
 import "C"
 
