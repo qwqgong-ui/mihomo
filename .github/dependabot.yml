@@ -16,8 +16,6 @@ updates:
         patterns:
           - "*"
     ignore:
-      # The branch-tip workflow owns sing-tun updates and validates them before push.
-      - dependency-name: "github.com/metacubex/sing-tun"
       # sing-mux v0.3.10 is incompatible with the HTTP/2 wrapper in x/net v0.54.0+.
       # Keep the related module graph at the newest compatible versions.
       - dependency-name: "golang.org/x/net"
