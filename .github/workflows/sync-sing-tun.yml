@@ -4,14 +4,6 @@ on:
   push:
     branches:
       - Alpha
-      - agent/port-upstream-sing-tun
-    paths:
-      - .github/workflows/sync-sing-tun.yml
-      - .github/scripts/port-sing-tun.sh
-      - .github/scripts/update-mihomo-sing-tun.sh
-  pull_request:
-    branches:
-      - Alpha
     paths:
       - .github/workflows/sync-sing-tun.yml
       - .github/scripts/port-sing-tun.sh
@@ -21,14 +13,14 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: port-upstream-sing-tun-${{ github.event_name }}-${{ github.ref }}
+  group: port-upstream-sing-tun-alpha
   cancel-in-progress: false
 
 permissions:
   contents: write
 
 env:
-  TARGET_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.event_name == 'push' && github.ref_name || 'Alpha' }}
+  TARGET_BRANCH: Alpha
   INTEGRATION_BRANCH: sing-tun-meta-upstream
   META_REPOSITORY: MetaCubeX/sing-tun
   META_BRANCH: meta
@@ -47,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - name: Check out Mihomo target
+      - name: Check out Mihomo Alpha
         uses: actions/checkout@v6
         with:
           ref: ${{ env.TARGET_BRANCH }}
