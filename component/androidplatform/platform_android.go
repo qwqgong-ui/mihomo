@@ -63,6 +63,7 @@ func PrepareTun(tunConfig *LC.Tun, dnsEnabled bool) error {
 	if !tunConfig.Enable {
 		return errors.New("android VPN mode requires tun.enable: true")
 	}
+	applyTunStackOverride(tunConfig)
 	if len(tunConfig.RouteAddressSet) != 0 || len(tunConfig.RouteExcludeAddressSet) != 0 {
 		return errors.New("Android VpnService does not support dynamic TUN route-address-set fields")
 	}
