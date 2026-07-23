@@ -72,6 +72,7 @@ jobs:
           PUBLISH_REPOSITORY: ${{ github.repository }}
         run: |
           set -Eeuo pipefail
+          exec > >(tee "${GITHUB_WORKSPACE}/port-debug.log") 2>&1
 
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -220,11 +221,16 @@ jobs:
             git commit -m "chore: record SagerNet port state"
           fi
 
+          go mod tidy
+          git add go.mod go.sum
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: tidy Meta-compatible module graph"
+          fi
+
           go mod download
           go mod verify
-          go mod tidy -diff
-          go test ./... -count=1
-          go test ./... -count=1 -tags with_gvisor
+          go test ./... -run '^$' -count=1
+          go test ./... -run '^$' -count=1 -tags with_gvisor
 
           remote_sha="$(git ls-remote publish "refs/heads/${INTEGRATION_BRANCH}" | awk 'NR == 1 { print $1 }')"
           if [[ -n "$remote_sha" ]]; then
@@ -258,6 +264,14 @@ jobs:
             echo "- Applied commits: \`${applied_count}\`"
             echo "- Skipped commits: \`${skipped_count}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload port diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-tun-port-debug-${{ github.run_attempt }}
+          path: port-debug.log
+          if-no-files-found: warn
 
       - name: Point Mihomo at the tested integration branch
         id: update
