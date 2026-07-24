@@ -14,14 +14,14 @@ typedef char* (*androidcyaml_resolve_callback_t)(
     int destination_port
 );
 
-static int androidcyaml_call_protect(void* callback, int fd) {
+static __attribute__((unused)) int androidcyaml_call_protect(void* callback, int fd) {
     if (callback == NULL) {
         return 0;
     }
     return ((androidcyaml_protect_callback_t) callback)(fd);
 }
 
-static char* androidcyaml_call_resolve(
+static __attribute__((unused)) char* androidcyaml_call_resolve(
     void* callback,
     int protocol,
     const char* source_address,
