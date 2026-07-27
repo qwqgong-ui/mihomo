@@ -11,6 +11,20 @@ import (
 	"testing"
 )
 
+type tcpAcceptResult struct {
+	conn *net.TCPConn
+	err  error
+}
+
+func acceptTCP(listener *net.TCPListener) <-chan tcpAcceptResult {
+	accepted := make(chan tcpAcceptResult, 1)
+	go func() {
+		conn, err := listener.AcceptTCP()
+		accepted <- tcpAcceptResult{conn: conn, err: err}
+	}()
+	return accepted
+}
+
 func socketInode(t testing.TB, conn syscall.Conn) uint32 {
 	t.Helper()
 	rawConn, err := conn.SyscallConn()
@@ -43,19 +57,17 @@ func testExactTCP(t *testing.T, network, address string) {
 	}
 	defer listener.Close()
 
-	accepted := make(chan *net.TCPConn, 1)
-	go func() {
-		conn, acceptErr := listener.AcceptTCP()
-		if acceptErr == nil {
-			accepted <- conn
-		}
-	}()
+	accepted := acceptTCP(listener)
 	client, err := net.DialTCP(network, nil, listener.Addr().(*net.TCPAddr))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	server := <-accepted
+	result := <-accepted
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	server := result.conn
 	defer server.Close()
 
 	src := client.LocalAddr().(*net.TCPAddr).AddrPort()
@@ -79,6 +91,23 @@ func mustResolveTCPAddr(t testing.TB, network, address string) *net.TCPAddr {
 		t.Fatal(err)
 	}
 	return addr
+}
+
+func TestCanUseExactSocketLookup(t *testing.T) {
+	v4src := netip.MustParseAddrPort("192.0.2.10:12345")
+	v4dst := netip.MustParseAddrPort("198.51.100.20:443")
+	if !canUseExactSocketLookup(v4src, v4dst) {
+		t.Fatal("valid IPv4 endpoints rejected")
+	}
+	if canUseExactSocketLookup(netip.AddrPortFrom(v4src.Addr(), 0), v4dst) {
+		t.Fatal("zero source port accepted")
+	}
+	if canUseExactSocketLookup(v4src, netip.AddrPortFrom(v4dst.Addr(), 0)) {
+		t.Fatal("zero destination port accepted")
+	}
+	if canUseExactSocketLookup(v4src, netip.MustParseAddrPort("[2001:db8::1]:443")) {
+		t.Fatal("mixed address families accepted")
+	}
 }
 
 func TestResolveSocketByNetlinkExactTCP(t *testing.T) {
@@ -141,24 +170,23 @@ func TestResolveSocketByNetlinkExactUDP(t *testing.T) {
 }
 
 func TestFindProcessNameByAddrFallsBack(t *testing.T) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			accepted <- conn
-		}
-	}()
-	client, err := net.Dial("tcp4", listener.Addr().String())
+
+	accepted := acceptTCP(listener)
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	server := <-accepted
+	result := <-accepted
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	server := result.conn
 	defer server.Close()
 
 	src := client.LocalAddr().(*net.TCPAddr).AddrPort()
@@ -208,26 +236,23 @@ func TestRecentProcessPIDs(t *testing.T) {
 }
 
 func BenchmarkFindProcessNameCachedPID(b *testing.B) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer listener.Close()
 
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			accepted <- conn
-		}
-	}()
-
-	client, err := net.Dial("tcp4", listener.Addr().String())
+	accepted := acceptTCP(listener)
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer client.Close()
-	server := <-accepted
+	result := <-accepted
+	if result.err != nil {
+		b.Fatal(result.err)
+	}
+	server := result.conn
 	defer server.Close()
 
 	local := client.LocalAddr().(*net.TCPAddr)
@@ -235,9 +260,9 @@ func BenchmarkFindProcessNameCachedPID(b *testing.B) {
 	if !ok {
 		b.Fatal("invalid local IP")
 	}
-
 	src := local.AddrPort()
 	dst := client.RemoteAddr().(*net.TCPAddr).AddrPort()
+
 	b.Run("dump", func(b *testing.B) {
 		for b.Loop() {
 			if _, _, err := FindProcessName("tcp", ip.Unmap(), local.Port); err != nil {
@@ -255,26 +280,23 @@ func BenchmarkFindProcessNameCachedPID(b *testing.B) {
 }
 
 func BenchmarkFindProcessNameStages(b *testing.B) {
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer listener.Close()
 
-	accepted := make(chan net.Conn, 1)
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			accepted <- conn
-		}
-	}()
-
-	client, err := net.Dial("tcp4", listener.Addr().String())
+	accepted := acceptTCP(listener)
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
 	if err != nil {
 		b.Fatal(err)
 	}
 	defer client.Close()
-	server := <-accepted
+	result := <-accepted
+	if result.err != nil {
+		b.Fatal(result.err)
+	}
+	server := result.conn
 	defer server.Close()
 
 	local := client.LocalAddr().(*net.TCPAddr)
