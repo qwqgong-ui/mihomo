@@ -1,0 +1,235 @@
+From 3eeb2d73993a31f7304b119a6bbbded4dc537665 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 10:59:11 +0800
+Subject: [PATCH 3/3] patch: pin proxy UDP DNS to tls://8.8.8.8
+
+---
+ adapter/outbound/base.go       | 22 ++++++--
+ adapter/outbound/base_test.go  | 98 ++++++++++++++++++++++++++++++++++
+ component/resolver/resolver.go | 10 ++++
+ hub/executor/executor.go       | 20 ++++++-
+ 4 files changed, 144 insertions(+), 6 deletions(-)
+ create mode 100644 adapter/outbound/base_test.go
+
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index 01e00798..8d318ce9 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -176,13 +176,25 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
+ }
+ 
+ func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+-	if !metadata.Resolved() {
+-		ip, err := resolveIPWithResolver(ctx, metadata.Host, b.prefer, resolver.DefaultResolver)
+-		if err != nil {
+-			return fmt.Errorf("can't resolve ip: %w", err)
++	if metadata.Host == "" {
++		if metadata.Resolved() {
++			return nil
+ 		}
+-		metadata.DstIP = ip
++		return fmt.Errorf("can't resolve ip: missing host")
+ 	}
++
++	udpResolver := resolver.ProxyUDPResolver
++	if udpResolver == nil || !udpResolver.Invalid() {
++		return fmt.Errorf("can't resolve ip: proxy UDP resolver is unavailable")
++	}
++
++	// Always discard an earlier routing-time result when the original host is
++	// still available. Proxy UDP destinations must use the pinned resolver.
++	ip, err := resolveIPWithResolver(ctx, metadata.Host, b.prefer, udpResolver)
++	if err != nil {
++		return fmt.Errorf("can't resolve ip: %w", err)
++	}
++	metadata.DstIP = ip
+ 	return nil
+ }
+ 
+diff --git a/adapter/outbound/base_test.go b/adapter/outbound/base_test.go
+new file mode 100644
+index 00000000..84d4f6f5
+--- /dev/null
++++ b/adapter/outbound/base_test.go
+@@ -0,0 +1,98 @@
++package outbound
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++
++	R "github.com/metacubex/mihomo/component/resolver"
++	C "github.com/metacubex/mihomo/constant"
++
++	D "github.com/miekg/dns"
++)
++
++type udpResolverStub struct {
++	ip      netip.Addr
++	lookups int
++}
++
++func (r *udpResolverStub) lookup() ([]netip.Addr, error) {
++	r.lookups++
++	return []netip.Addr{r.ip}, nil
++}
++
++func (r *udpResolverStub) LookupIP(context.Context, string) ([]netip.Addr, error) {
++	return r.lookup()
++}
++
++func (r *udpResolverStub) LookupIPv4(context.Context, string) ([]netip.Addr, error) {
++	return r.lookup()
++}
++
++func (r *udpResolverStub) LookupIPv6(context.Context, string) ([]netip.Addr, error) {
++	return r.lookup()
++}
++
++func (r *udpResolverStub) ResolveECH(context.Context, string) ([]byte, error) { return nil, nil }
++func (r *udpResolverStub) ExchangeContext(context.Context, *D.Msg) (*D.Msg, error) {
++	return nil, nil
++}
++func (r *udpResolverStub) Invalid() bool    { return true }
++func (r *udpResolverStub) ClearCache()      {}
++func (r *udpResolverStub) ResetConnection() {}
++
++func TestBaseResolveUDPUsesPinnedResolver(t *testing.T) {
++	oldProxyUDPResolver := R.ProxyUDPResolver
++	oldDefaultResolver := R.DefaultResolver
++	t.Cleanup(func() {
++		R.ProxyUDPResolver = oldProxyUDPResolver
++		R.DefaultResolver = oldDefaultResolver
++	})
++
++	pinned := &udpResolverStub{ip: netip.MustParseAddr("203.0.113.8")}
++	configured := &udpResolverStub{ip: netip.MustParseAddr("192.0.2.53")}
++	R.ProxyUDPResolver = pinned
++	R.DefaultResolver = configured
++
++	base := NewBase(BaseOption{Prefer: C.IPv4Only})
++	metadata := &C.Metadata{
++		Host:    "proxy-udp.example",
++		DstIP:   netip.MustParseAddr("192.0.2.1"),
++		DstPort: 443,
++	}
++
++	if err := base.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.DstIP != pinned.ip {
++		t.Fatalf("ResolveUDP() destination = %s, want %s", metadata.DstIP, pinned.ip)
++	}
++	if pinned.lookups != 1 {
++		t.Fatalf("pinned resolver lookups = %d, want 1", pinned.lookups)
++	}
++	if configured.lookups != 0 {
++		t.Fatalf("configured resolver lookups = %d, want 0", configured.lookups)
++	}
++}
++
++func TestBaseResolveUDPKeepsLiteralIP(t *testing.T) {
++	oldProxyUDPResolver := R.ProxyUDPResolver
++	t.Cleanup(func() { R.ProxyUDPResolver = oldProxyUDPResolver })
++
++	pinned := &udpResolverStub{ip: netip.MustParseAddr("203.0.113.8")}
++	R.ProxyUDPResolver = pinned
++
++	base := NewBase(BaseOption{Prefer: C.IPv4Only})
++	want := netip.MustParseAddr("192.0.2.1")
++	metadata := &C.Metadata{DstIP: want, DstPort: 443}
++
++	if err := base.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.DstIP != want {
++		t.Fatalf("ResolveUDP() destination = %s, want %s", metadata.DstIP, want)
++	}
++	if pinned.lookups != 0 {
++		t.Fatalf("pinned resolver lookups = %d, want 0", pinned.lookups)
++	}
++}
+diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
+index e87a9103..753b1877 100644
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -24,6 +24,10 @@ var (
+ 	// DirectHostResolver resolve ip for direct outbound host, only nil when DefaultResolver is nil
+ 	DirectHostResolver Resolver
+ 
++	// ProxyUDPResolver resolves domain targets for ordinary proxy UDP outbounds.
++	// It is deliberately independent from DefaultResolver and its policy table.
++	ProxyUDPResolver Resolver
++
+ 	// SystemResolver always using system dns, and was init in dns module
+ 	SystemResolver Resolver
+ 
+@@ -234,6 +238,9 @@ func ClearCache() {
+ 	if DefaultResolver != nil {
+ 		go DefaultResolver.ClearCache()
+ 	}
++	if ProxyUDPResolver != nil {
++		go ProxyUDPResolver.ClearCache()
++	}
+ 	go SystemResolver.ClearCache() // SystemResolver unneeded check nil
+ }
+ 
+@@ -241,6 +248,9 @@ func ResetConnection() {
+ 	if DefaultResolver != nil {
+ 		go DefaultResolver.ResetConnection()
+ 	}
++	if ProxyUDPResolver != nil {
++		go ProxyUDPResolver.ResetConnection()
++	}
+ 	go SystemResolver.ResetConnection() // SystemResolver unneeded check nil
+ }
+ 
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index d3b5eb81..d7891882 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -44,6 +44,8 @@ import (
+ 
+ var mux sync.Mutex
+ 
++const proxyUDPDoTAddress = "8.8.8.8:853" // tls://8.8.8.8
++
+ func readConfig(path string) ([]byte, error) {
+ 	if _, err := os.Stat(path); os.IsNotExist(err) {
+ 		return nil, err
+@@ -236,6 +238,23 @@ func updateNTP(c *config.NTP) {
+ }
+ 
+ func updateDNS(c *config.DNS, generalIPv6 bool) {
++	ipv6 := c.IPv6 && generalIPv6
++	proxyUDPResolvers := dns.NewResolver(dns.Config{
++		Main: []dns.NameServer{{
++			Net:  "tls",
++			Addr: proxyUDPDoTAddress,
++		}},
++		IPv6:           ipv6,
++		IPv6Timeout:    c.IPv6Timeout,
++		CacheAlgorithm: c.CacheAlgorithm,
++		CacheMaxSize:   c.CacheMaxSize,
++	})
++	oldProxyUDPResolver := resolver.ProxyUDPResolver
++	resolver.ProxyUDPResolver = proxyUDPResolvers.Resolver
++	if oldProxyUDPResolver != nil {
++		oldProxyUDPResolver.ResetConnection()
++	}
++
+ 	if !c.Enable {
+ 		resolver.DefaultResolver = nil
+ 		resolver.DefaultHostMapper = nil
+@@ -246,7 +265,6 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
+ 		return
+ 	}
+ 
+-	ipv6 := c.IPv6 && generalIPv6
+ 	r := dns.NewResolver(dns.Config{
+ 		Main:                 c.NameServer,
+ 		Fallback:             c.Fallback,
+-- 
+2.55.0
+
