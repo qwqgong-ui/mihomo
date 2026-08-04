@@ -1,4 +1,4 @@
-From 7c9b0a4c3d161934aeb3131e3b2b50c566552855 Mon Sep 17 00:00:00 2001
+From a3f07acdf579bd8e5ad8252a399de269ac1a8091 Mon Sep 17 00:00:00 2001
 From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
 Date: Tue, 4 Aug 2026 14:34:29 +0800
 Subject: [PATCH 3/3] patch: forward UDP domains to capable proxies
@@ -20,9 +20,9 @@ Subject: [PATCH 3/3] patch: forward UDP domains to capable proxies
  adapter/outbound/vless.go         |  9 ++++-
  adapter/outbound/vless_test.go    | 27 +++++++++++++++
  adapter/outbound/vmess.go         | 11 +++---
- tunnel/connection.go              | 12 ++++---
+ tunnel/connection.go              | 16 ++++++---
  tunnel/tunnel.go                  |  4 +++
- 18 files changed, 135 insertions(+), 40 deletions(-)
+ 18 files changed, 138 insertions(+), 41 deletions(-)
  create mode 100644 adapter/outbound/base_udp_test.go
  create mode 100644 adapter/outbound/vless_test.go
 
@@ -448,7 +448,7 @@ index aef7cce8..811ea92c 100644
  		client: client,
  		option: &option,
 diff --git a/tunnel/connection.go b/tunnel/connection.go
-index 3a66a76e..0e2aa0f1 100644
+index 3a66a76e..ca62a9a4 100644
 --- a/tunnel/connection.go
 +++ b/tunnel/connection.go
 @@ -11,6 +11,7 @@ import (
@@ -495,6 +495,17 @@ index 3a66a76e..0e2aa0f1 100644
  	if addr == nil {
  		return errors.New("udp addr invalid")
  	}
+@@ -183,7 +187,9 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+ 		fromUDPAddr, isUDPAddr := from.(*net.UDPAddr)
+ 		if !isUDPAddr {
+ 			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
+-			log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
++			if domainAddr, ok := from.(M.Socksaddr); !ok || !domainAddr.IsFqdn() {
++				log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
++			}
+ 		} else if fromUDPAddr == nil {
+ 			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
+ 			log.Warnln("server return a nil *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", oAddrPort)
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
 index 86dbc14a..813a7c7c 100644
 --- a/tunnel/tunnel.go
