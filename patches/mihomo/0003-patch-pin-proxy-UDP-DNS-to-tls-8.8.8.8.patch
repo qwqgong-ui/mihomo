@@ -7,8 +7,8 @@ Subject: [PATCH 3/3] patch: pin proxy UDP DNS to tls://8.8.8.8
  adapter/outbound/base.go       | 22 ++++++--
  adapter/outbound/base_test.go  | 98 ++++++++++++++++++++++++++++++++++
  component/resolver/resolver.go | 10 ++++
- hub/executor/executor.go       | 20 ++++++-
- 4 files changed, 144 insertions(+), 6 deletions(-)
+ hub/executor/executor.go       | 22 +++++++-
+ 4 files changed, 146 insertions(+), 6 deletions(-)
  create mode 100644 adapter/outbound/base_test.go
 
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
@@ -189,24 +189,26 @@ diff --git a/hub/executor/executor.go b/hub/executor/executor.go
 index d3b5eb81..d7891882 100644
 --- a/hub/executor/executor.go
 +++ b/hub/executor/executor.go
-@@ -44,6 +44,8 @@ import (
+@@ -44,6 +44,9 @@ import (
  
  var mux sync.Mutex
  
 +const proxyUDPDoTAddress = "8.8.8.8:853" // tls://8.8.8.8
++const proxyUDPProxyName = "🌐"
 +
  func readConfig(path string) ([]byte, error) {
  	if _, err := os.Stat(path); os.IsNotExist(err) {
  		return nil, err
-@@ -236,6 +238,23 @@ func updateNTP(c *config.NTP) {
+@@ -236,6 +239,24 @@ func updateNTP(c *config.NTP) {
  }
  
  func updateDNS(c *config.DNS, generalIPv6 bool) {
 +	ipv6 := c.IPv6 && generalIPv6
 +	proxyUDPResolvers := dns.NewResolver(dns.Config{
 +		Main: []dns.NameServer{{
-+			Net:  "tls",
-+			Addr: proxyUDPDoTAddress,
++			Net:       "tls",
++			Addr:      proxyUDPDoTAddress,
++			ProxyName: proxyUDPProxyName,
 +		}},
 +		IPv6:           ipv6,
 +		IPv6Timeout:    c.IPv6Timeout,
@@ -232,4 +234,3 @@ index d3b5eb81..d7891882 100644
  		Fallback:             c.Fallback,
 -- 
 2.55.0
-
