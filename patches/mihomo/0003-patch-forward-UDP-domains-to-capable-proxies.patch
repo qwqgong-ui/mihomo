@@ -1,0 +1,533 @@
+From a3f07acdf579bd8e5ad8252a399de269ac1a8091 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 14:34:29 +0800
+Subject: [PATCH 3/3] patch: forward UDP domains to capable proxies
+
+---
+ adapter/outbound/anytls.go        |  3 +-
+ adapter/outbound/base.go          | 56 +++++++++++++++++--------------
+ adapter/outbound/base_udp_test.go | 27 +++++++++++++++
+ adapter/outbound/hysteria.go      | 13 +++++--
+ adapter/outbound/hysteria2.go     |  1 +
+ adapter/outbound/shadowquic.go    |  1 +
+ adapter/outbound/shadowsocks.go   |  3 +-
+ adapter/outbound/shadowsocksr.go  |  1 +
+ adapter/outbound/snell.go         |  1 +
+ adapter/outbound/socks5.go        |  1 +
+ adapter/outbound/sudoku.go        |  1 +
+ adapter/outbound/trojan.go        |  1 +
+ adapter/outbound/tuic.go          |  3 +-
+ adapter/outbound/vless.go         |  9 ++++-
+ adapter/outbound/vless_test.go    | 27 +++++++++++++++
+ adapter/outbound/vmess.go         | 11 +++---
+ tunnel/connection.go              | 16 ++++++---
+ tunnel/tunnel.go                  |  4 +++
+ 18 files changed, 138 insertions(+), 41 deletions(-)
+ create mode 100644 adapter/outbound/base_udp_test.go
+ create mode 100644 adapter/outbound/vless_test.go
+
+diff --git a/adapter/outbound/anytls.go b/adapter/outbound/anytls.go
+index 2f5992ad..c85fdf82 100644
+--- a/adapter/outbound/anytls.go
++++ b/adapter/outbound/anytls.go
+@@ -69,7 +69,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ 	}
+ 
+ 	// create uot on tcp
+-	destination := M.SocksaddrFromNet(metadata.UDPAddr())
++	destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 	return NewPacketConn(N.NewThreadSafePacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination})), t), nil
+ }
+ 
+@@ -104,6 +104,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option: &option,
+ 	}
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index 01e00798..e7c2cb7f 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -27,19 +27,20 @@ type ProxyAdapter interface {
+ }
+ 
+ type Base struct {
+-	name   string
+-	addr   string
+-	tp     C.AdapterType
+-	pdName string
+-	udp    bool
+-	xudp   bool
+-	tfo    bool
+-	mpTcp  bool
+-	iface  string
+-	rmark  int
+-	prefer C.DNSPrefer
+-	dialer C.Dialer
+-	id     uuid.UUID
++	name      string
++	addr      string
++	tp        C.AdapterType
++	pdName    string
++	udp       bool
++	xudp      bool
++	tfo       bool
++	mpTcp     bool
++	iface     string
++	rmark     int
++	prefer    C.DNSPrefer
++	remoteDNS bool
++	dialer    C.Dialer
++	id        uuid.UUID
+ }
+ 
+ type BaseOption struct {
+@@ -54,22 +55,24 @@ type BaseOption struct {
+ 	Interface    string
+ 	RoutingMark  int
+ 	Prefer       C.DNSPrefer
++	RemoteDNS    bool
+ }
+ 
+ func NewBase(opt BaseOption) *Base {
+ 	return &Base{
+-		name:   opt.Name,
+-		addr:   opt.Addr,
+-		tp:     opt.Type,
+-		pdName: opt.ProviderName,
+-		udp:    opt.UDP,
+-		xudp:   opt.XUDP,
+-		tfo:    opt.TFO,
+-		mpTcp:  opt.MPTCP,
+-		iface:  opt.Interface,
+-		rmark:  opt.RoutingMark,
+-		prefer: opt.Prefer,
+-		id:     utils.NewUUIDV4(),
++		name:      opt.Name,
++		addr:      opt.Addr,
++		tp:        opt.Type,
++		pdName:    opt.ProviderName,
++		udp:       opt.UDP,
++		xudp:      opt.XUDP,
++		tfo:       opt.TFO,
++		mpTcp:     opt.MPTCP,
++		iface:     opt.Interface,
++		rmark:     opt.RoutingMark,
++		prefer:    opt.Prefer,
++		remoteDNS: opt.RemoteDNS,
++		id:        utils.NewUUIDV4(),
+ 	}
+ }
+ 
+@@ -176,6 +179,9 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
+ }
+ 
+ func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
++	if b.remoteDNS && metadata.Host != "" {
++		return nil
++	}
+ 	if !metadata.Resolved() {
+ 		ip, err := resolveIPWithResolver(ctx, metadata.Host, b.prefer, resolver.DefaultResolver)
+ 		if err != nil {
+diff --git a/adapter/outbound/base_udp_test.go b/adapter/outbound/base_udp_test.go
+new file mode 100644
+index 00000000..7482a8a5
+--- /dev/null
++++ b/adapter/outbound/base_udp_test.go
+@@ -0,0 +1,27 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestRemoteResolveUDPPreservesDomain(t *testing.T) {
++	base := NewBase(BaseOption{RemoteDNS: true})
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    "quic.example",
++		DstPort: 443,
++	}
++
++	if err := base.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.Host != "quic.example" {
++		t.Fatalf("ResolveUDP() host = %q", metadata.Host)
++	}
++	if metadata.DstIP.IsValid() {
++		t.Fatalf("ResolveUDP() unexpectedly resolved domain to %s", metadata.DstIP)
++	}
++}
+diff --git a/adapter/outbound/hysteria.go b/adapter/outbound/hysteria.go
+index 26032953..f945daed 100644
+--- a/adapter/outbound/hysteria.go
++++ b/adapter/outbound/hysteria.go
+@@ -252,6 +252,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:    &option,
+ 		client:    client,
+@@ -281,7 +282,7 @@ func (c *hyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+ 		return
+ 	}
+ 	n = copy(p, b)
+-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
++	addr = hysteriaPacketAddr(addrStr)
+ 	return
+ }
+ 
+@@ -291,10 +292,18 @@ func (c *hyPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, e
+ 		return
+ 	}
+ 	data = b
+-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
++	addr = hysteriaPacketAddr(addrStr)
+ 	return
+ }
+ 
++func hysteriaPacketAddr(addr string) net.Addr {
++	destination := M.ParseSocksaddr(addr)
++	if destination.IsFqdn() {
++		return destination
++	}
++	return destination.UDPAddr()
++}
++
+ func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+ 	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
+ 	if err != nil {
+diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
+index 4731611f..6e3018cd 100644
+--- a/adapter/outbound/hysteria2.go
++++ b/adapter/outbound/hysteria2.go
+@@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option: &option,
+ 	}
+diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
+index 8fefe367..fc42ee35 100644
+--- a/adapter/outbound/shadowquic.go
++++ b/adapter/outbound/shadowquic.go
+@@ -167,6 +167,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:     &option,
+ 		quicConfig: quicConfig,
+diff --git a/adapter/outbound/shadowsocks.go b/adapter/outbound/shadowsocks.go
+index 8c562a8d..41e9fcde 100644
+--- a/adapter/outbound/shadowsocks.go
++++ b/adapter/outbound/shadowsocks.go
+@@ -260,7 +260,7 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
+ 		if err = ss.ResolveUDP(ctx, metadata); err != nil {
+ 			return nil, err
+ 		}
+-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
++		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 		if ss.option.UDPOverTCPVersion == uot.LegacyVersion {
+ 			return NewPacketConn(N.NewThreadSafePacketConn(uot.NewConn(c, uot.Request{Destination: destination})), ss), nil
+ 		} else {
+@@ -507,6 +507,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		method: method,
+ 
+diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
+index fd386a8a..31b7793f 100644
+--- a/adapter/outbound/shadowsocksr.go
++++ b/adapter/outbound/shadowsocksr.go
+@@ -169,6 +169,7 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:   &option,
+ 		cipher:   coreCiph,
+diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
+index c4142ec4..4f523d2d 100644
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -272,6 +272,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:          &option,
+ 		psk:             psk,
+diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
+index 7f3f111f..dfde7f09 100644
+--- a/adapter/outbound/socks5.go
++++ b/adapter/outbound/socks5.go
+@@ -201,6 +201,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:         &option,
+ 		user:           option.UserName,
+diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
+index 839be32e..f328663d 100644
+--- a/adapter/outbound/sudoku.go
++++ b/adapter/outbound/sudoku.go
+@@ -237,6 +237,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:   &option,
+ 		baseConf: baseConf,
+diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
+index d581e80a..28f10856 100644
+--- a/adapter/outbound/trojan.go
++++ b/adapter/outbound/trojan.go
+@@ -299,6 +299,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:      &option,
+ 		hexPassword: trojan.Key(option.Password),
+diff --git a/adapter/outbound/tuic.go b/adapter/outbound/tuic.go
+index ed54d99f..15d0efde 100644
+--- a/adapter/outbound/tuic.go
++++ b/adapter/outbound/tuic.go
+@@ -96,7 +96,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
+ 
+ 		// tuic uos use stream-oriented udp with a special address, so we need a net.UDPAddr
+ 
+-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
++		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 		if t.option.UDPOverStreamVersion == uot.LegacyVersion {
+ 			return NewPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
+ 		} else {
+@@ -249,6 +249,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:     &option,
+ 		quicConfig: quicConfig,
+diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
+index 6b9edd38..3ae778e9 100644
+--- a/adapter/outbound/vless.go
++++ b/adapter/outbound/vless.go
+@@ -285,6 +285,12 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 				Host:    packetaddr.SeqPacketMagicAddress,
+ 				DstPort: 443,
+ 			}
++		} else if v.option.XUDP && metadata.Host != "" {
++			metadata = &C.Metadata{
++				NetWork: C.UDP,
++				Host:    metadata.Host,
++				DstPort: metadata.DstPort,
++			}
+ 		} else {
+ 			metadata = &C.Metadata{ // a clear metadata only contains ip
+ 				NetWork: C.UDP,
+@@ -391,7 +397,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
+ 		return NewPacketConn(N.NewThreadSafePacketConn(
+ 			vmessSing.NewXUDPConn(c,
+ 				globalID,
+-				M.SocksaddrFromNet(metadata.UDPAddr())),
++				M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)),
+ 		), v), nil
+ 	} else if v.option.PacketAddr {
+ 		return NewPacketConn(N.NewThreadSafePacketConn(
+@@ -501,6 +507,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    option.XUDP,
+ 		}),
+ 		client: client,
+ 		option: &option,
+diff --git a/adapter/outbound/vless_test.go b/adapter/outbound/vless_test.go
+new file mode 100644
+index 00000000..84e121e7
+--- /dev/null
++++ b/adapter/outbound/vless_test.go
+@@ -0,0 +1,27 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestVlessXUDPLeavesDomainForRemoteResolution(t *testing.T) {
++	v := &Vless{
++		Base:   NewBase(BaseOption{RemoteDNS: true}),
++		option: &VlessOption{XUDP: true},
++	}
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    "quic.example",
++		DstPort: 443,
++	}
++
++	if err := v.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.DstIP.IsValid() {
++		t.Fatalf("ResolveUDP() unexpectedly resolved domain to %s", metadata.DstIP)
++	}
++}
+diff --git a/adapter/outbound/vmess.go b/adapter/outbound/vmess.go
+index aef7cce8..811ea92c 100644
+--- a/adapter/outbound/vmess.go
++++ b/adapter/outbound/vmess.go
+@@ -304,11 +304,11 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 			if useEarly {
+ 				conn = v.client.DialEarlyXUDPPacketConn(c,
+ 					globalID,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			} else {
+ 				conn, err = v.client.DialXUDPPacketConn(c,
+ 					globalID,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			}
+ 		} else if v.option.PacketAddr {
+ 			if useEarly {
+@@ -322,10 +322,10 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 		} else {
+ 			if useEarly {
+ 				conn = v.client.DialEarlyPacketConn(c,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			} else {
+ 				conn, err = v.client.DialPacketConn(c,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			}
+ 		}
+ 	} else {
+@@ -435,7 +435,7 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
+ 	if pc, ok := c.(net.PacketConn); ok {
+ 		return NewPacketConn(N.NewThreadSafePacketConn(pc), v), nil
+ 	}
+-	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: metadata.UDPAddr()}, v), nil
++	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)}, v), nil
+ }
+ 
+ // ProxyInfo implements C.ProxyAdapter
+@@ -504,6 +504,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		client: client,
+ 		option: &option,
+diff --git a/tunnel/connection.go b/tunnel/connection.go
+index 3a66a76e..ca62a9a4 100644
+--- a/tunnel/connection.go
++++ b/tunnel/connection.go
+@@ -11,6 +11,7 @@ import (
+ 	N "github.com/metacubex/mihomo/common/net"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	"github.com/metacubex/mihomo/log"
++	M "github.com/metacubex/sing/common/metadata"
+ )
+ 
+ type packetSender struct {
+@@ -66,7 +67,7 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+ 	defer packet.Drop()
+ 	metadata := packet.Metadata()
+ 
+-	var addr *net.UDPAddr
++	var addr net.Addr
+ 
+ 	s.mappingMutex.RLock()
+ 	targetAddr := s.originToTarget[metadata.String()]
+@@ -91,12 +92,15 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+ 			}
+ 		}
+ 
+-		if !metadata.DstIP.IsValid() {
++		if metadata.DstIP.IsValid() {
++			addr = metadata.UDPAddr()
++		} else if metadata.Host != "" {
++			addr = M.ParseSocksaddrHostPort(metadata.Host, metadata.DstPort)
++		} else {
+ 			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
+ 			return
+ 		}
+ 		s.AddMapping(originMetadata, metadata)
+-		addr = metadata.UDPAddr()
+ 	}
+ 	_ = handleUDPToRemote(packet, pc, addr)
+ }
+@@ -151,7 +155,7 @@ func (s *packetSender) Close() {
+ 
+ func (s *packetSender) DoSniff(metadata *C.Metadata) error { return nil }
+ 
+-func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr *net.UDPAddr) error {
++func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr net.Addr) error {
+ 	if addr == nil {
+ 		return errors.New("udp addr invalid")
+ 	}
+@@ -183,7 +187,9 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+ 		fromUDPAddr, isUDPAddr := from.(*net.UDPAddr)
+ 		if !isUDPAddr {
+ 			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
+-			log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
++			if domainAddr, ok := from.(M.Socksaddr); !ok || !domainAddr.IsFqdn() {
++				log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
++			}
+ 		} else if fromUDPAddr == nil {
+ 			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
+ 			log.Warnln("server return a nil *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", oAddrPort)
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 86dbc14a..813a7c7c 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -430,6 +430,7 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 		return
+ 	}
+ 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
++	originalAddrPort := metadata.AddrPort()
+ 
+ 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
+ 		packet.Drop()
+@@ -480,6 +481,9 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 
+ 			sender.AddMapping(originMetadata, dialMetadata)
+ 			oAddrPort := dialMetadata.AddrPort()
++			if !oAddrPort.IsValid() {
++				oAddrPort = originalAddrPort
++			}
+ 			writeBackProxy := nat.NewWriteBackProxy(packet)
+ 
+ 			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+-- 
+2.55.0
+
