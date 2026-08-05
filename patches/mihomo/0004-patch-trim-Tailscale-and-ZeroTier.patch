@@ -1,0 +1,40 @@
+From 7d5a7d0ad0ed02eb27db2cde0e5f8e2ae00d7e85 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Wed, 5 Aug 2026 11:09:00 +0800
+Subject: [PATCH 4/4] patch: trim Tailscale and ZeroTier
+
+Exclude the optional Tailscale and ZeroTier outbounds from downstream
+release builds. Both implementations already provide dedicated negative
+build tags, so this avoids carrying their protocol stacks without touching
+upstream source files or dependency declarations.
+
+Apply the same tags to the gVisor test build to verify the trimmed feature
+set before producing artifacts.
+---
+ .github/workflows/build.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 53b81d1b..26597829 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -215,7 +215,7 @@ jobs:
+         export SKIP_INTEROP_TEST=1
+         go test ./...
+         echo "---test with_gvisor---"
+-        go test ./... -tags "with_gvisor" -count=1
++        go test ./... -tags "with_gvisor no_tailscale no_zerotier" -count=1
+ 
+     - name: Update CA
+       run: |
+@@ -237,7 +237,7 @@ jobs:
+         GOMIPS: ${{matrix.jobs.gomips}}
+       run: |
+         go env
+-        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
++        go build -v -tags "with_gvisor no_tailscale no_zerotier" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+ 
+     - name: Rename Windows Go120
+       if: ${{ matrix.jobs.goos == 'windows' && matrix.jobs.goversion == '1.20' }}
+-- 
+2.50.1
