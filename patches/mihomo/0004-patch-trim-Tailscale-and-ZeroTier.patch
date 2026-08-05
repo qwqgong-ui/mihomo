@@ -27,7 +27,7 @@ index 53b81d1b..26597829 100644
  
      - name: Update CA
        run: |
-@@ -237,7 +237,7 @@ jobs:
+@@ -241,7 +241,7 @@ jobs:
          GOMIPS: ${{matrix.jobs.gomips}}
        run: |
          go env
