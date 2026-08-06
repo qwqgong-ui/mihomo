@@ -1,16 +1,14 @@
-From d287a0e1e273b08ffbb659ee9613125313ed8205 Mon Sep 17 00:00:00 2001
+From 0602281bb23c7ad4a1efe62b2e5d213f9a141f88 Mon Sep 17 00:00:00 2001
 From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
-Date: Thu, 6 Aug 2026 00:08:24 +0900
+Date: Thu, 6 Aug 2026 20:21:05 +0900
 Subject: [PATCH] patch: preserve remote UDP destination identity
 
-Keep FakeIP-recovered and explicit UDP domains intact for proxy-side resolution. DNSMapping and DNSHosts still use an already-selected DstIP, and this path never invokes the local resolver.
+Keep remote-capable proxy UDP on FQDN while preserving upstream DIRECT behavior: resolve with the built-in direct resolver, send a native UDP address, and keep exact IP NAT mappings.
 
-Restore exact FQDN replies to their original TUN address. For standard Hysteria2 IP-only replies, learn only the first same-port IP of a sole-domain association; revoke the fallback for multiple or mixed destinations instead of guessing.
-
-Source comments document the FQDN-or-IP wire constraint, XUDP/Hysteria2 reply difference, EIM ambiguity, STUN preservation, and typed-nil fallback for future Codex debugging.
+Retain conservative FQDN reply restoration for XUDP and Hysteria2 without applying domain transport semantics to locally resolved outbounds.
 ---
  adapter/outbound/anytls.go        |   3 +-
- adapter/outbound/base.go          |  70 +++++----
+ adapter/outbound/base.go          |  70 +++++---
  adapter/outbound/base_udp_test.go |  72 +++++++++
  adapter/outbound/hysteria.go      |  13 +-
  adapter/outbound/hysteria2.go     |   1 +
@@ -26,16 +24,16 @@ Source comments document the FQDN-or-IP wire constraint, XUDP/Hysteria2 reply di
  adapter/outbound/vless_test.go    |  28 ++++
  adapter/outbound/vmess.go         |  11 +-
  constant/adapters.go              |   4 +-
- tunnel/connection.go              | 234 +++++++++++++++++++++++++-----
- tunnel/connection_test.go         | 203 ++++++++++++++++++++++++++
+ tunnel/connection.go              | 255 ++++++++++++++++++++++++++----
+ tunnel/connection_test.go         | 249 +++++++++++++++++++++++++++++
  tunnel/tunnel.go                  |   4 +
- 20 files changed, 592 insertions(+), 72 deletions(-)
+ 20 files changed, 659 insertions(+), 72 deletions(-)
  create mode 100644 adapter/outbound/base_udp_test.go
  create mode 100644 adapter/outbound/vless_test.go
  create mode 100644 tunnel/connection_test.go
 
 diff --git a/adapter/outbound/anytls.go b/adapter/outbound/anytls.go
-index 2f5992ad..c85fdf82 100644
+index 2f5992a..c85fdf8 100644
 --- a/adapter/outbound/anytls.go
 +++ b/adapter/outbound/anytls.go
 @@ -69,7 +69,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
@@ -56,7 +54,7 @@ index 2f5992ad..c85fdf82 100644
  		option: &option,
  	}
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
-index 01e00798..511235a5 100644
+index 01e0079..511235a 100644
 --- a/adapter/outbound/base.go
 +++ b/adapter/outbound/base.go
 @@ -27,19 +27,20 @@ type ProxyAdapter interface {
@@ -156,7 +154,7 @@ index 01e00798..511235a5 100644
  		if err != nil {
 diff --git a/adapter/outbound/base_udp_test.go b/adapter/outbound/base_udp_test.go
 new file mode 100644
-index 00000000..7fde8849
+index 0000000..7fde884
 --- /dev/null
 +++ b/adapter/outbound/base_udp_test.go
 @@ -0,0 +1,72 @@
@@ -233,7 +231,7 @@ index 00000000..7fde8849
 +	}
 +}
 diff --git a/adapter/outbound/hysteria.go b/adapter/outbound/hysteria.go
-index 26032953..f945daed 100644
+index 2603295..f945dae 100644
 --- a/adapter/outbound/hysteria.go
 +++ b/adapter/outbound/hysteria.go
 @@ -252,6 +252,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
@@ -274,7 +272,7 @@ index 26032953..f945daed 100644
  	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
  	if err != nil {
 diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
-index 4731611f..6e3018cd 100644
+index 4731611..6e3018c 100644
 --- a/adapter/outbound/hysteria2.go
 +++ b/adapter/outbound/hysteria2.go
 @@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
@@ -286,7 +284,7 @@ index 4731611f..6e3018cd 100644
  		option: &option,
  	}
 diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
-index 8fefe367..fc42ee35 100644
+index 8fefe36..fc42ee3 100644
 --- a/adapter/outbound/shadowquic.go
 +++ b/adapter/outbound/shadowquic.go
 @@ -167,6 +167,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
@@ -298,7 +296,7 @@ index 8fefe367..fc42ee35 100644
  		option:     &option,
  		quicConfig: quicConfig,
 diff --git a/adapter/outbound/shadowsocks.go b/adapter/outbound/shadowsocks.go
-index 8c562a8d..41e9fcde 100644
+index 8c562a8..41e9fcd 100644
 --- a/adapter/outbound/shadowsocks.go
 +++ b/adapter/outbound/shadowsocks.go
 @@ -260,7 +260,7 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
@@ -319,7 +317,7 @@ index 8c562a8d..41e9fcde 100644
  		method: method,
  
 diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
-index fd386a8a..31b7793f 100644
+index fd386a8..31b7793 100644
 --- a/adapter/outbound/shadowsocksr.go
 +++ b/adapter/outbound/shadowsocksr.go
 @@ -169,6 +169,7 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
@@ -331,7 +329,7 @@ index fd386a8a..31b7793f 100644
  		option:   &option,
  		cipher:   coreCiph,
 diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
-index c4142ec4..4f523d2d 100644
+index c4142ec..4f523d2 100644
 --- a/adapter/outbound/snell.go
 +++ b/adapter/outbound/snell.go
 @@ -272,6 +272,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
@@ -343,7 +341,7 @@ index c4142ec4..4f523d2d 100644
  		option:          &option,
  		psk:             psk,
 diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
-index 7f3f111f..dfde7f09 100644
+index 7f3f111..dfde7f0 100644
 --- a/adapter/outbound/socks5.go
 +++ b/adapter/outbound/socks5.go
 @@ -201,6 +201,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
@@ -355,7 +353,7 @@ index 7f3f111f..dfde7f09 100644
  		option:         &option,
  		user:           option.UserName,
 diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
-index 839be32e..f328663d 100644
+index 839be32..f328663 100644
 --- a/adapter/outbound/sudoku.go
 +++ b/adapter/outbound/sudoku.go
 @@ -237,6 +237,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
@@ -367,7 +365,7 @@ index 839be32e..f328663d 100644
  		option:   &option,
  		baseConf: baseConf,
 diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
-index d581e80a..28f10856 100644
+index d581e80..28f1085 100644
 --- a/adapter/outbound/trojan.go
 +++ b/adapter/outbound/trojan.go
 @@ -299,6 +299,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
@@ -379,7 +377,7 @@ index d581e80a..28f10856 100644
  		option:      &option,
  		hexPassword: trojan.Key(option.Password),
 diff --git a/adapter/outbound/tuic.go b/adapter/outbound/tuic.go
-index ed54d99f..15d0efde 100644
+index ed54d99..15d0efd 100644
 --- a/adapter/outbound/tuic.go
 +++ b/adapter/outbound/tuic.go
 @@ -96,7 +96,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
@@ -400,7 +398,7 @@ index ed54d99f..15d0efde 100644
  		option:     &option,
  		quicConfig: quicConfig,
 diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
-index 6b9edd38..3ae778e9 100644
+index 6b9edd3..3ae778e 100644
 --- a/adapter/outbound/vless.go
 +++ b/adapter/outbound/vless.go
 @@ -285,6 +285,12 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
@@ -435,7 +433,7 @@ index 6b9edd38..3ae778e9 100644
  		option: &option,
 diff --git a/adapter/outbound/vless_test.go b/adapter/outbound/vless_test.go
 new file mode 100644
-index 00000000..4c83403c
+index 0000000..4c83403
 --- /dev/null
 +++ b/adapter/outbound/vless_test.go
 @@ -0,0 +1,28 @@
@@ -468,7 +466,7 @@ index 00000000..4c83403c
 +	}
 +}
 diff --git a/adapter/outbound/vmess.go b/adapter/outbound/vmess.go
-index aef7cce8..811ea92c 100644
+index aef7cce..811ea92 100644
 --- a/adapter/outbound/vmess.go
 +++ b/adapter/outbound/vmess.go
 @@ -304,11 +304,11 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
@@ -516,7 +514,7 @@ index aef7cce8..811ea92c 100644
  		client: client,
  		option: &option,
 diff --git a/constant/adapters.go b/constant/adapters.go
-index a28ac547..e5d0d275 100644
+index a28ac54..e5d0d27 100644
 --- a/constant/adapters.go
 +++ b/constant/adapters.go
 @@ -331,8 +331,8 @@ type PacketSender interface {
@@ -531,7 +529,7 @@ index a28ac547..e5d0d275 100644
  
  type NatTable interface {
 diff --git a/tunnel/connection.go b/tunnel/connection.go
-index 3a66a76e..ec276f7c 100644
+index 3a66a76..1900738 100644
 --- a/tunnel/connection.go
 +++ b/tunnel/connection.go
 @@ -5,23 +5,41 @@ import (
@@ -580,7 +578,7 @@ index 3a66a76e..ec276f7c 100644
  }
  
  // newPacketSender return a chan based C.PacketSender
-@@ -34,46 +52,167 @@ func newPacketSender() C.PacketSender {
+@@ -34,46 +52,188 @@ func newPacketSender() C.PacketSender {
  		cancel: cancel,
  		ch:     ch,
  
@@ -590,9 +588,9 @@ index 3a66a76e..ec276f7c 100644
 +		targetToOrigin:        make(map[netip.Addr]netip.Addr),
 +		remoteDomains:         make(map[string]*remoteDomainTarget),
 +		learnedTargetToOrigin: make(map[netip.Addr]netip.Addr),
-+	}
-+}
-+
+ 	}
+ }
+ 
 +func canonicalUDPDomain(domain string) string {
 +	return strings.TrimSuffix(strings.ToLower(domain), ".")
 +}
@@ -606,10 +604,25 @@ index 3a66a76e..ec276f7c 100644
 +	}
 +	if udpAddr, isUDPAddr := addr.(*net.UDPAddr); isUDPAddr && udpAddr == nil {
 +		return M.Socksaddr{}
- 	}
++	}
 +	return M.SocksaddrFromNet(addr).Unwrap()
- }
- 
++}
++
++func udpDestination(metadata *C.Metadata) M.Socksaddr {
++	if metadata.DstIP.IsValid() {
++		// Preserve upstream behavior for DIRECT and every locally resolved
++		// adapter. Host may remain populated for rules and logging after
++		// ResolveUDP, but a native UDP socket must receive the selected IP.
++		return M.SocksaddrFromNet(metadata.UDPAddr()).Unwrap()
++	}
++	if metadata.Host != "" {
++		// RemoteDNS adapters deliberately leave DstIP invalid so capable
++		// proxy protocols can carry the original FQDN to the server.
++		return M.ParseSocksaddrHostPort(metadata.Host, metadata.DstPort).Unwrap()
++	}
++	return M.Socksaddr{}
++}
++
  func (s *packetSender) AddMapping(originMetadata *C.Metadata, metadata *C.Metadata) {
  	s.mappingMutex.Lock()
  	defer s.mappingMutex.Unlock()
@@ -620,10 +633,10 @@ index 3a66a76e..ec276f7c 100644
 -	if addr := s.originToTarget[originKey]; !addr.IsValid() { // overwrite only if the record is illegal
 -		s.originToTarget[originKey] = targetAddr
 +	originAddr := originMetadata.DstIP.Unmap()
-+	target := M.ParseSocksaddrHostPort(metadata.String(), 0).Unwrap()
++	target := udpDestination(metadata)
 +	if addr := s.originToTarget[originKey]; !addr.IsValid() && target.IsValid() { // overwrite only if the record is illegal
 +		s.originToTarget[originKey] = target
- 	}
++	}
 +	if !originAddr.IsValid() || !target.IsValid() {
 +		return
 +	}
@@ -655,7 +668,7 @@ index 3a66a76e..ec276f7c 100644
 +			remoteTarget.ports[metadata.DstPort] = struct{}{}
 +		}
 +		return
-+	}
+ 	}
 +
 +	targetAddr := target.Addr.Unmap()
  	if addr := s.targetToOrigin[targetAddr]; !addr.IsValid() { // overwrite only if the record is illegal
@@ -666,9 +679,8 @@ index 3a66a76e..ec276f7c 100644
 +		// ambiguous. Exact IP mappings remain available above.
 +		s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
 +	}
- }
- 
--func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
++}
++
 +// singleRemoteOriginLocked returns the sole remote-domain origin when port
 +// matches one of its requested ports. The caller must hold mappingMutex.
 +func (s *packetSender) singleRemoteOriginLocked(port uint16) netip.Addr {
@@ -681,8 +693,9 @@ index 3a66a76e..ec276f7c 100644
 +		}
 +	}
 +	return netip.Addr{}
-+}
-+
+ }
+ 
+-func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
 +func (s *packetSender) RestoreReadFrom(addr net.Addr) netip.Addr {
 +	source := udpSocksaddrFromNet(addr)
 +	if source.IsFqdn() {
@@ -756,31 +769,37 @@ index 3a66a76e..ec276f7c 100644
 +		// A cached Socksaddr deliberately retains whether the target was an FQDN
 +		// or an IP. Rebuilding it from DstIP would discard that identity.
 +		targetAddr.Port = metadata.DstPort
-+		addr = targetAddr
++		if targetAddr.IsFqdn() {
++			addr = targetAddr
++		} else {
++			// Match upstream DIRECT behavior: native UDP sockets receive a
++			// *net.UDPAddr, never a domain-capable proxy address wrapper.
++			addr = net.UDPAddrFromAddrPort(targetAddr.AddrPort())
++		}
  	}
  
  	if addr == nil {
-@@ -91,12 +230,17 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+@@ -91,12 +251,17 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
  			}
  		}
  
 -		if !metadata.DstIP.IsValid() {
-+		if metadata.Host != "" {
-+			// Host wins intentionally. In DNSFakeIP mode DstIP is the local
-+			// synthetic address, not a routable server-side destination.
-+			addr = M.ParseSocksaddrHostPort(metadata.Host, metadata.DstPort)
-+		} else if metadata.DstIP.IsValid() {
-+			addr = metadata.UDPAddr()
-+		} else {
++		targetAddr = udpDestination(metadata)
++		if !targetAddr.IsValid() {
  			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
  			return
  		}
++		if targetAddr.IsFqdn() {
++			addr = targetAddr
++		} else {
++			addr = metadata.UDPAddr()
++		}
  		s.AddMapping(originMetadata, metadata)
 -		addr = metadata.UDPAddr()
  	}
  	_ = handleUDPToRemote(packet, pc, addr)
  }
-@@ -151,7 +295,7 @@ func (s *packetSender) Close() {
+@@ -151,7 +316,7 @@ func (s *packetSender) Close() {
  
  func (s *packetSender) DoSniff(metadata *C.Metadata) error { return nil }
  
@@ -789,7 +808,7 @@ index 3a66a76e..ec276f7c 100644
  	if addr == nil {
  		return errors.New("udp addr invalid")
  	}
-@@ -180,24 +324,46 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+@@ -180,24 +345,46 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
  			return
  		}
  
@@ -853,10 +872,10 @@ index 3a66a76e..ec276f7c 100644
  		}
 diff --git a/tunnel/connection_test.go b/tunnel/connection_test.go
 new file mode 100644
-index 00000000..4722124f
+index 0000000..7e891a0
 --- /dev/null
 +++ b/tunnel/connection_test.go
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,249 @@
 +package tunnel
 +
 +import (
@@ -871,7 +890,8 @@ index 00000000..4722124f
 +)
 +
 +type recordingPacketConn struct {
-+	written net.Addr
++	written    net.Addr
++	resolvedIP netip.Addr
 +}
 +
 +func (c *recordingPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
@@ -882,16 +902,21 @@ index 00000000..4722124f
 +	c.written = addr
 +	return len(p), nil
 +}
-+func (c *recordingPacketConn) Close() error                                  { return nil }
-+func (c *recordingPacketConn) LocalAddr() net.Addr                           { return udpAddr("127.0.0.1", 12345) }
-+func (c *recordingPacketConn) SetDeadline(time.Time) error                   { return nil }
-+func (c *recordingPacketConn) SetReadDeadline(time.Time) error               { return nil }
-+func (c *recordingPacketConn) SetWriteDeadline(time.Time) error              { return nil }
-+func (c *recordingPacketConn) Chains() C.Chain                               { return nil }
-+func (c *recordingPacketConn) ProviderChains() C.Chain                       { return nil }
-+func (c *recordingPacketConn) AppendToChains(C.ProxyAdapter)                 {}
-+func (c *recordingPacketConn) RemoteDestination() string                     { return "" }
-+func (c *recordingPacketConn) ResolveUDP(context.Context, *C.Metadata) error { return nil }
++func (c *recordingPacketConn) Close() error                     { return nil }
++func (c *recordingPacketConn) LocalAddr() net.Addr              { return udpAddr("127.0.0.1", 12345) }
++func (c *recordingPacketConn) SetDeadline(time.Time) error      { return nil }
++func (c *recordingPacketConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *recordingPacketConn) SetWriteDeadline(time.Time) error { return nil }
++func (c *recordingPacketConn) Chains() C.Chain                  { return nil }
++func (c *recordingPacketConn) ProviderChains() C.Chain          { return nil }
++func (c *recordingPacketConn) AppendToChains(C.ProxyAdapter)    {}
++func (c *recordingPacketConn) RemoteDestination() string        { return "" }
++func (c *recordingPacketConn) ResolveUDP(_ context.Context, metadata *C.Metadata) error {
++	if c.resolvedIP.IsValid() {
++		metadata.DstIP = c.resolvedIP
++	}
++	return nil
++}
 +
 +type mappingTestPacket struct {
 +	data    []byte
@@ -928,10 +953,10 @@ index 00000000..4722124f
 +	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.MustParseAddr(ip), port))
 +}
 +
-+func TestPacketSenderSendsHostInsteadOfFakeIP(t *testing.T) {
++func TestPacketSenderSendsUnresolvedHostToRemoteDNS(t *testing.T) {
 +	sender := newMappingTestSender(t)
 +	packet := &mappingTestPacket{data: []byte("payload")}
-+	metadata := udpMetadata("198.18.0.6", "quic.example", 443)
++	metadata := udpMetadata("", "quic.example", 443)
 +	metadata.DNSMode = C.DNSFakeIP
 +	adapter := C.NewPacketAdapter(packet, metadata)
 +	conn := &recordingPacketConn{}
@@ -941,6 +966,42 @@ index 00000000..4722124f
 +	destination := M.SocksaddrFromNet(conn.written)
 +	if !destination.IsFqdn() || destination.Fqdn != "quic.example" || destination.Port != 443 {
 +		t.Fatalf("WriteTo() destination = %#v, want quic.example:443", destination)
++	}
++	if !packet.dropped {
++		t.Fatal("processPacket() did not release input packet")
++	}
++}
++
++func TestPacketSenderUsesResolvedIPForDirect(t *testing.T) {
++	sender := newMappingTestSender(t)
++	packet := &mappingTestPacket{data: []byte("payload")}
++	metadata := udpMetadata("", "game.example", 443)
++	metadata.DNSMode = C.DNSFakeIP
++	adapter := C.NewPacketAdapter(packet, metadata)
++	resolvedIP := netip.MustParseAddr("203.0.113.6")
++	conn := &recordingPacketConn{resolvedIP: resolvedIP}
++
++	sender.processPacket(conn, adapter)
++
++	directAddr, ok := conn.written.(*net.UDPAddr)
++	if !ok {
++		t.Fatalf("WriteTo() destination type = %T, want *net.UDPAddr", conn.written)
++	}
++	destination := M.SocksaddrFromNet(directAddr).Unwrap()
++	if destination.IsFqdn() || destination.Addr != resolvedIP || destination.Port != 443 {
++		t.Fatalf("WriteTo() destination = %#v, want %s:443", destination, resolvedIP)
++	}
++
++	// The cached path must keep the same native DIRECT address semantics.
++	cachedPacket := &mappingTestPacket{data: []byte("cached payload")}
++	cachedAdapter := C.NewPacketAdapter(cachedPacket, udpMetadata("", "game.example", 443))
++	conn.resolvedIP = netip.Addr{}
++	sender.processPacket(conn, cachedAdapter)
++	if _, ok := conn.written.(*net.UDPAddr); !ok {
++		t.Fatalf("cached WriteTo() destination type = %T, want *net.UDPAddr", conn.written)
++	}
++	if !cachedPacket.dropped {
++		t.Fatal("cached processPacket() did not release input packet")
 +	}
 +	if !packet.dropped {
 +		t.Fatal("processPacket() did not release input packet")
@@ -1044,8 +1105,12 @@ index 00000000..4722124f
 +	t.Run("resolved IPv4", func(t *testing.T) {
 +		sender := newMappingTestSender(t)
 +		origin := udpMetadata("198.18.0.11", "", 3478)
-+		target := udpMetadata("203.0.113.13", "", 3478)
++		target := udpMetadata("203.0.113.13", "game.example", 3478)
 +		sender.AddMapping(origin, target)
++		cached := sender.originToTarget[origin.String()]
++		if cached.IsFqdn() || cached.Addr != target.DstIP {
++			t.Fatalf("cached target = %#v, want resolved IP %s", cached, target.DstIP)
++		}
 +		if got := sender.RestoreReadFrom(udpAddr("203.0.113.13", 3478)); got != origin.DstIP {
 +			t.Fatalf("RestoreReadFrom() = %s, want %s", got, origin.DstIP)
 +		}
@@ -1061,10 +1126,10 @@ index 00000000..4722124f
 +	})
 +}
 diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
-index 86dbc14a..813a7c7c 100644
+index e8b2187..34a701c 100644
 --- a/tunnel/tunnel.go
 +++ b/tunnel/tunnel.go
-@@ -430,6 +430,7 @@ func handleUDPConn(packet C.PacketAdapter) {
+@@ -462,6 +462,7 @@ func handleUDPConn(packet C.PacketAdapter) {
  		return
  	}
  	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
@@ -1072,7 +1137,7 @@ index 86dbc14a..813a7c7c 100644
  
  	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
  		packet.Drop()
-@@ -480,6 +481,9 @@ func handleUDPConn(packet C.PacketAdapter) {
+@@ -512,6 +513,9 @@ func handleUDPConn(packet C.PacketAdapter) {
  
  			sender.AddMapping(originMetadata, dialMetadata)
  			oAddrPort := dialMetadata.AddrPort()
