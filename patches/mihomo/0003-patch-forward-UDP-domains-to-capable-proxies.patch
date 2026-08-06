@@ -6,6 +6,8 @@ Subject: [PATCH] patch: preserve remote UDP destination identity
 Keep remote-capable proxy UDP on FQDN while preserving upstream DIRECT behavior: resolve with the built-in direct resolver, send a native UDP address, and keep exact IP NAT mappings.
 
 Retain conservative FQDN reply restoration for XUDP and Hysteria2 without applying domain transport semantics to locally resolved outbounds.
+
+DIRECT intentionally keeps upstream local-DNS and native UDP address semantics.
 ---
  adapter/outbound/anytls.go        |   3 +-
  adapter/outbound/base.go          |  70 +++++---
@@ -1149,4 +1151,3 @@ index e8b2187..34a701c 100644
  			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
 -- 
 2.51.1
-
