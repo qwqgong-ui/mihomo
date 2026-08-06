@@ -1,26 +1,29 @@
 From 217bdfe7e087776f5aadf68de935ba5558a9d1fd Mon Sep 17 00:00:00 2001
 From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
 Date: Wed, 5 Aug 2026 12:41:15 +0800
-Subject: [PATCH 4/4] patch: trim Tailscale and ZeroTier
+Subject: [PATCH 4/4] patch: trim gVisor, Tailscale, and ZeroTier
 
-Exclude the optional Tailscale and ZeroTier outbounds from downstream release builds. Apply the negative build tags to both tests and release artifacts.
+Exclude the optional gVisor TUN stack plus Tailscale and ZeroTier outbounds
+from downstream release builds. Apply the trimmed build tags to both tests
+and release artifacts.
 ---
- .github/workflows/build.yml | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
+ .github/workflows/build.yml | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
 
 diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
-index 53b81d1b..7de80257 100644
+index 53b81d1b..74cb685e 100644
 --- a/.github/workflows/build.yml
 +++ b/.github/workflows/build.yml
 @@ -216,3 +216,3 @@ jobs:
-         echo "---test with_gvisor---"
+-        echo "---test with_gvisor---"
++        echo "---test trimmed build---"
 -        go test ./... -tags "with_gvisor" -count=1
-+        go test ./... -tags "with_gvisor no_tailscale no_zerotier" -count=1
++        go test ./... -tags "no_tailscale no_zerotier" -count=1
  
 @@ -236,3 +236,3 @@ jobs:
          go env
 -        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
-+        go build -v -tags "with_gvisor no_tailscale no_zerotier" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
++        go build -v -tags "no_tailscale no_zerotier" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
          if [ "${{matrix.jobs.goos}}" = "windows" ]; then
 -- 
 2.55.0
