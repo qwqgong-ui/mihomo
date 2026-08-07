@@ -1,0 +1,37 @@
+From a16d476fd7bfa0e0e0348a13aa8c0a5ac6fd53b1 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 10:55:46 +0900
+Subject: [PATCH 5/5] patch: trim gVisor and optional protocols
+
+Exclude the optional gVisor TUN stack plus Tailscale, ZeroTier, WireGuard, OpenVPN, Mieru, and Sudoku from downstream release builds. Apply the trimmed tags to both tests and release artifacts.
+---
+ .github/workflows/build.yml | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 53b81d1..e56375b 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -213,8 +213,8 @@ jobs:
+         export SKIP_CONCURRENT_TEST=1
+         export SKIP_INTEROP_TEST=1
+         go test ./...
+-        echo "---test with_gvisor---"
+-        go test ./... -tags "with_gvisor" -count=1
++        echo "---test trimmed build---"
++        go test ./... -tags "no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku" -count=1
+ 
+     - name: Update CA
+       run: |
+@@ -234,7 +234,7 @@ jobs:
+         GOMIPS: ${{matrix.jobs.gomips}}
+       run: |
+         go env
+-        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
++        go build -v -tags "no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+         if [ "${{matrix.jobs.goos}}" = "windows" ]; then
+           cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+           zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
+-- 
+2.51.1
+

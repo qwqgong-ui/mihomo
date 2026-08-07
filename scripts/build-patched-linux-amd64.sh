@@ -54,7 +54,7 @@ mkdir -p "${OUTPUT_DIR}"
 (
     cd "${SOURCE_DIR}"
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v3 "${GO_BIN}" build \
-        -tags 'no_tailscale no_zerotier' \
+        -tags 'no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku' \
         -trimpath \
         -ldflags "-X github.com/metacubex/mihomo/constant.Version=${VERSION} -X github.com/metacubex/mihomo/constant.BuildTime=${BUILD_TIME} -w -s -buildid=" \
         -o "${TEMP_BINARY}" .

@@ -1,0 +1,1009 @@
+From eca8de80b59194fd743eac9b3552617bc0de44d3 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Fri, 7 Aug 2026 10:55:13 +0900
+Subject: [PATCH 4/5] patch: add optional protocol build tags
+
+Add no_wireguard, no_openvpn, no_mieru, and no_sudoku build tags with parser-compatible stubs. Keep the shared IP stack available to MASQUE and split gVisor integration so trimmed builds do not retain WireGuard dependencies.
+---
+ adapter/outbound/ipstack.go             | 122 ++++++++++++++++++++++++
+ adapter/outbound/ipstack_gvisor.go      |  15 +++
+ adapter/outbound/ipstack_gvisor_stub.go |  12 +++
+ adapter/outbound/mieru.go               |   2 +
+ adapter/outbound/mieru_stub.go          |  28 ++++++
+ adapter/outbound/mieru_test.go          |   2 +
+ adapter/outbound/openvpn.go             |   2 +
+ adapter/outbound/openvpn_stub.go        |  47 +++++++++
+ adapter/outbound/sudoku.go              |   2 +
+ adapter/outbound/sudoku_stub.go         |  45 +++++++++
+ adapter/outbound/wireguard.go           | 113 +---------------------
+ adapter/outbound/wireguard_stub.go      |  82 ++++++++++++++++
+ common/convert/converter_test.go        |  14 +++
+ component/generator/cmd.go              |   3 +-
+ component/generator/sudoku.go           |   9 ++
+ component/generator/sudoku_stub.go      |   9 ++
+ constant/features/no_mieru.go           |   5 +
+ constant/features/no_mieru_stub.go      |   5 +
+ constant/features/no_openvpn.go         |   5 +
+ constant/features/no_openvpn_stub.go    |   5 +
+ constant/features/no_sudoku.go          |   5 +
+ constant/features/no_sudoku_stub.go     |   5 +
+ constant/features/no_wireguard.go       |   5 +
+ constant/features/no_wireguard_stub.go  |   5 +
+ constant/features/tags.go               |  12 +++
+ listener/inbound/mieru.go               |   2 +
+ listener/inbound/mieru_stub.go          |  29 ++++++
+ listener/inbound/mieru_test.go          |   2 +
+ listener/inbound/sudoku.go              |   2 +
+ listener/inbound/sudoku_stub.go         |  46 +++++++++
+ listener/inbound/sudoku_test.go         |   2 +
+ listener/mieru/server.go                |   2 +
+ listener/sudoku/server.go               |   2 +
+ 33 files changed, 533 insertions(+), 113 deletions(-)
+ create mode 100644 adapter/outbound/ipstack.go
+ create mode 100644 adapter/outbound/ipstack_gvisor.go
+ create mode 100644 adapter/outbound/ipstack_gvisor_stub.go
+ create mode 100644 adapter/outbound/mieru_stub.go
+ create mode 100644 adapter/outbound/openvpn_stub.go
+ create mode 100644 adapter/outbound/sudoku_stub.go
+ create mode 100644 adapter/outbound/wireguard_stub.go
+ create mode 100644 component/generator/sudoku.go
+ create mode 100644 component/generator/sudoku_stub.go
+ create mode 100644 constant/features/no_mieru.go
+ create mode 100644 constant/features/no_mieru_stub.go
+ create mode 100644 constant/features/no_openvpn.go
+ create mode 100644 constant/features/no_openvpn_stub.go
+ create mode 100644 constant/features/no_sudoku.go
+ create mode 100644 constant/features/no_sudoku_stub.go
+ create mode 100644 constant/features/no_wireguard.go
+ create mode 100644 constant/features/no_wireguard_stub.go
+ create mode 100644 listener/inbound/mieru_stub.go
+ create mode 100644 listener/inbound/sudoku_stub.go
+
+diff --git a/adapter/outbound/ipstack.go b/adapter/outbound/ipstack.go
+new file mode 100644
+index 0000000..1f24adf
+--- /dev/null
++++ b/adapter/outbound/ipstack.go
+@@ -0,0 +1,122 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"strings"
++	"time"
++
++	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/constant/features"
++
++	"github.com/metacubex/mipstack"
++)
++
++const (
++	ipStackAuto   = "auto"
++	ipStackGVisor = "gvisor"
++	ipStackMips   = "mips"
++)
++
++type IPStackOption struct {
++	Mode                 string `proxy:"mode,omitempty"`
++	CongestionController string `proxy:"congestion-controller,omitempty"`
++}
++
++func (o *IPStackOption) normalize() {
++	o.Mode = strings.ToLower(o.Mode)
++	if o.Mode == "" {
++		o.Mode = ipStackAuto
++	}
++	o.CongestionController = strings.ToLower(o.CongestionController)
++}
++
++func (o IPStackOption) validate() error {
++	switch o.Mode {
++	case ipStackAuto, ipStackMips:
++	case ipStackGVisor:
++		if !features.WithGVisor {
++			return errors.New("gVisor IP stack requires the with_gvisor build tag")
++		}
++	default:
++		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
++	}
++	switch mipstack.CongestionControl(o.CongestionController) {
++	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR:
++		return nil
++	default:
++		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, or bbr", o.CongestionController)
++	}
++}
++
++// ipStack is the mihomo IP stack's packet and socket surface.
++type ipStack interface {
++	Start() error
++	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
++	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
++	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
++	Read(buffers [][]byte, sizes []int, offset int) (int, error)
++	Write(buffers [][]byte, offset int) (int, error)
++	MTU() (int, error)
++	Name() (string, error)
++	BatchSize() int
++	Close() error
++}
++
++// newIPStack constructs the selected userspace IP stack.
++func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
++	mode := option.Mode
++	if mode == ipStackAuto {
++		if features.WithGVisor {
++			mode = ipStackGVisor
++		} else {
++			mode = ipStackMips
++		}
++	}
++	switch mode {
++	case ipStackGVisor:
++		return newGVisorIPStack(localAddresses, mtu)
++	case ipStackMips:
++		return mipstack.New(mipstack.Config{
++			LocalAddresses: localAddresses,
++			MTU:            mtu,
++			TCP: mipstack.TCPSocketDefaults{
++				CongestionControl: mipstack.CongestionControl(option.CongestionController),
++				// Align with sing-wireguard: enable keepalive with 15-second
++				// idle/interval timing and gVisor's default probe count.
++				KeepAlive: true,
++				KeepAliveConfig: mipstack.KeepAliveConfig{
++					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
++				},
++			},
++		})
++	default:
++		return nil, errors.New("invalid IP stack mode")
++	}
++}
++
++var _ ipStack = (*mipstack.Stack)(nil)
++
++type ipStackNetDialer struct {
++	stack ipStack
++}
++
++var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
++
++func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	dst, err := netip.ParseAddrPort(address)
++	if err != nil {
++		return nil, fmt.Errorf("invalid address %q: %w", address, err)
++	}
++	switch {
++	case strings.HasPrefix(network, "tcp"):
++		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
++	case strings.HasPrefix(network, "udp"):
++		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
++	default:
++		return nil, fmt.Errorf("invalid network %q", network)
++	}
++}
+diff --git a/adapter/outbound/ipstack_gvisor.go b/adapter/outbound/ipstack_gvisor.go
+new file mode 100644
+index 0000000..36f00af
+--- /dev/null
++++ b/adapter/outbound/ipstack_gvisor.go
+@@ -0,0 +1,15 @@
++//go:build with_gvisor
++
++package outbound
++
++import (
++	"net/netip"
++
++	wireguard "github.com/metacubex/sing-wireguard"
++)
++
++func newGVisorIPStack(localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
++	return wireguard.NewStackDevice(localAddresses, mtu)
++}
++
++var _ ipStack = (wireguard.Device)(nil)
+diff --git a/adapter/outbound/ipstack_gvisor_stub.go b/adapter/outbound/ipstack_gvisor_stub.go
+new file mode 100644
+index 0000000..eaec154
+--- /dev/null
++++ b/adapter/outbound/ipstack_gvisor_stub.go
+@@ -0,0 +1,12 @@
++//go:build !with_gvisor
++
++package outbound
++
++import (
++	"errors"
++	"net/netip"
++)
++
++func newGVisorIPStack([]netip.Prefix, uint32) (ipStack, error) {
++	return nil, errors.New("gVisor IP stack requires the with_gvisor build tag")
++}
+diff --git a/adapter/outbound/mieru.go b/adapter/outbound/mieru.go
+index 9f4e82d..11fe580 100644
+--- a/adapter/outbound/mieru.go
++++ b/adapter/outbound/mieru.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/mieru_stub.go b/adapter/outbound/mieru_stub.go
+new file mode 100644
+index 0000000..46e6fd3
+--- /dev/null
++++ b/adapter/outbound/mieru_stub.go
+@@ -0,0 +1,28 @@
++//go:build no_mieru
++
++package outbound
++
++import "fmt"
++
++type Mieru struct {
++	*Base
++}
++
++type MieruOption struct {
++	BasicOption
++	Name           string `proxy:"name"`
++	Server         string `proxy:"server"`
++	Port           int    `proxy:"port,omitempty"`
++	PortRange      string `proxy:"port-range,omitempty"`
++	Transport      string `proxy:"transport"`
++	UDP            bool   `proxy:"udp,omitempty"`
++	UserName       string `proxy:"username"`
++	Password       string `proxy:"password"`
++	Multiplexing   string `proxy:"multiplexing,omitempty"`
++	HandshakeMode  string `proxy:"handshake-mode,omitempty"`
++	TrafficPattern string `proxy:"traffic-pattern,omitempty"`
++}
++
++func NewMieru(MieruOption) (*Mieru, error) {
++	return nil, fmt.Errorf("mieru support is disabled by \"no_mieru\" build tag")
++}
+diff --git a/adapter/outbound/mieru_test.go b/adapter/outbound/mieru_test.go
+index f47cf99..661c1dc 100644
+--- a/adapter/outbound/mieru_test.go
++++ b/adapter/outbound/mieru_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package outbound
+ 
+ import "testing"
+diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
+index 65c2798..00369ab 100644
+--- a/adapter/outbound/openvpn.go
++++ b/adapter/outbound/openvpn.go
+@@ -1,3 +1,5 @@
++//go:build !no_openvpn
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/openvpn_stub.go b/adapter/outbound/openvpn_stub.go
+new file mode 100644
+index 0000000..368bf67
+--- /dev/null
++++ b/adapter/outbound/openvpn_stub.go
+@@ -0,0 +1,47 @@
++//go:build no_openvpn
++
++package outbound
++
++import "fmt"
++
++type OpenVPN struct {
++	*Base
++}
++
++type OpenVPNOption struct {
++	BasicOption
++	Name               string            `proxy:"name"`
++	Server             string            `proxy:"server"`
++	Port               int               `proxy:"port"`
++	Proto              string            `proxy:"proto,omitempty"`
++	Dev                string            `proxy:"dev,omitempty"`
++	Cipher             string            `proxy:"cipher,omitempty"`
++	DataCiphers        []string          `proxy:"data-ciphers,omitempty"`
++	DataCipherFallback string            `proxy:"data-ciphers-fallback,omitempty"`
++	Auth               string            `proxy:"auth,omitempty"`
++	CompLZO            string            `proxy:"comp-lzo,omitempty"`
++	CA                 string            `proxy:"ca"`
++	Cert               string            `proxy:"cert,omitempty"`
++	Key                string            `proxy:"key,omitempty"`
++	TLSAuth            string            `proxy:"tls-auth,omitempty"`
++	KeyDirection       string            `proxy:"key-direction,omitempty"`
++	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
++	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
++	Username           string            `proxy:"username,omitempty"`
++	Password           string            `proxy:"password,omitempty"`
++	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
++	Ping               int               `proxy:"ping,omitempty"`
++	PingRestart        int               `proxy:"ping-restart,omitempty"`
++	HandshakeTimeout   int               `proxy:"handshake-timeout,omitempty"`
++	MTU                int               `proxy:"mtu,omitempty"`
++	UDP                bool              `proxy:"udp,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++}
++
++func NewOpenVPN(OpenVPNOption) (*OpenVPN, error) {
++	return nil, fmt.Errorf("openvpn support is disabled by \"no_openvpn\" build tag")
++}
+diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
+index f328663..6b192ba 100644
+--- a/adapter/outbound/sudoku.go
++++ b/adapter/outbound/sudoku.go
+@@ -1,3 +1,5 @@
++//go:build !no_sudoku
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/sudoku_stub.go b/adapter/outbound/sudoku_stub.go
+new file mode 100644
+index 0000000..149d44c
+--- /dev/null
++++ b/adapter/outbound/sudoku_stub.go
+@@ -0,0 +1,45 @@
++//go:build no_sudoku
++
++package outbound
++
++import "fmt"
++
++type Sudoku struct {
++	*Base
++}
++
++type SudokuOption struct {
++	BasicOption
++	Name               string                 `proxy:"name"`
++	Server             string                 `proxy:"server"`
++	Port               int                    `proxy:"port"`
++	Key                string                 `proxy:"key"`
++	AEADMethod         string                 `proxy:"aead-method,omitempty"`
++	PaddingMin         *int                   `proxy:"padding-min,omitempty"`
++	PaddingMax         *int                   `proxy:"padding-max,omitempty"`
++	TableType          string                 `proxy:"table-type,omitempty"`
++	EnablePureDownlink *bool                  `proxy:"enable-pure-downlink,omitempty"`
++	HTTPMask           *bool                  `proxy:"http-mask,omitempty"`
++	HTTPMaskMode       string                 `proxy:"http-mask-mode,omitempty"`
++	HTTPMaskTLS        bool                   `proxy:"http-mask-tls,omitempty"`
++	HTTPMaskHost       string                 `proxy:"http-mask-host,omitempty"`
++	PathRoot           string                 `proxy:"path-root,omitempty"`
++	Multiplex          string                 `proxy:"multiplex,omitempty"`
++	HTTPMaskMultiplex  string                 `proxy:"http-mask-multiplex,omitempty"`
++	HTTPMaskOptions    *SudokuHTTPMaskOptions `proxy:"httpmask,omitempty"`
++	CustomTable        string                 `proxy:"custom-table,omitempty"`
++	CustomTables       []string               `proxy:"custom-tables,omitempty"`
++}
++
++type SudokuHTTPMaskOptions struct {
++	Disable   bool   `proxy:"disable,omitempty"`
++	Mode      string `proxy:"mode,omitempty"`
++	TLS       bool   `proxy:"tls,omitempty"`
++	Host      string `proxy:"host,omitempty"`
++	PathRoot  string `proxy:"path-root,omitempty"`
++	Multiplex string `proxy:"multiplex,omitempty"`
++}
++
++func NewSudoku(SudokuOption) (*Sudoku, error) {
++	return nil, fmt.Errorf("sudoku support is disabled by \"no_sudoku\" build tag")
++}
+diff --git a/adapter/outbound/wireguard.go b/adapter/outbound/wireguard.go
+index aace86f..f1845d2 100644
+--- a/adapter/outbound/wireguard.go
++++ b/adapter/outbound/wireguard.go
+@@ -1,10 +1,11 @@
++//go:build !no_wireguard
++
+ package outbound
+ 
+ import (
+ 	"context"
+ 	"encoding/base64"
+ 	"encoding/hex"
+-	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -20,13 +21,11 @@ import (
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	"github.com/metacubex/mihomo/component/slowdown"
+ 	C "github.com/metacubex/mihomo/constant"
+-	"github.com/metacubex/mihomo/constant/features"
+ 	"github.com/metacubex/mihomo/dns"
+ 	"github.com/metacubex/mihomo/log"
+ 
+ 	amneziav3 "github.com/metacubex/amneziawg-go/device"
+ 	amnezia "github.com/metacubex/amneziawg-go/device_v1"
+-	"github.com/metacubex/mipstack"
+ 	wireguard "github.com/metacubex/sing-wireguard"
+ 	"github.com/metacubex/wireguard-go/device"
+ 	"github.com/metacubex/wireguard-go/tun"
+@@ -36,12 +35,6 @@ import (
+ 	M "github.com/metacubex/sing/common/metadata"
+ )
+ 
+-const (
+-	ipStackAuto   = "auto"
+-	ipStackGVisor = "gvisor"
+-	ipStackMips   = "mips"
+-)
+-
+ type wireguardGoDevice interface {
+ 	Close()
+ 	IpcSet(uapiConf string) error
+@@ -138,108 +131,6 @@ type AmneziaWGOption struct {
+ 	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
+ }
+ 
+-type IPStackOption struct {
+-	Mode                 string `proxy:"mode,omitempty"`
+-	CongestionController string `proxy:"congestion-controller,omitempty"`
+-}
+-
+-func (o *IPStackOption) normalize() {
+-	o.Mode = strings.ToLower(o.Mode)
+-	if o.Mode == "" {
+-		o.Mode = ipStackAuto
+-	}
+-	o.CongestionController = strings.ToLower(o.CongestionController)
+-}
+-
+-func (o IPStackOption) validate() error {
+-	switch o.Mode {
+-	case ipStackAuto, ipStackMips:
+-	case ipStackGVisor:
+-		if !features.WithGVisor {
+-			return errors.New("gVisor IP stack requires the with_gvisor build tag")
+-		}
+-	default:
+-		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
+-	}
+-	switch mipstack.CongestionControl(o.CongestionController) {
+-	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR:
+-		return nil
+-	default:
+-		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, or bbr", o.CongestionController)
+-	}
+-}
+-
+-// ipStack is the mihomo IP stack's packet and socket surface, adapted from
+-// sing-wireguard only for gVisor.
+-type ipStack interface {
+-	Start() error
+-	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+-	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+-	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
+-	Read(buffers [][]byte, sizes []int, offset int) (int, error)
+-	Write(buffers [][]byte, offset int) (int, error)
+-	MTU() (int, error)
+-	Name() (string, error)
+-	BatchSize() int
+-	Close() error
+-}
+-
+-// newIPStack constructs the selected userspace IP stack.
+-func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
+-	mode := option.Mode
+-	if mode == ipStackAuto {
+-		if features.WithGVisor {
+-			mode = ipStackGVisor
+-		} else {
+-			mode = ipStackMips
+-		}
+-	}
+-	switch mode {
+-	case ipStackGVisor:
+-		return wireguard.NewStackDevice(localAddresses, mtu)
+-	case ipStackMips:
+-		return mipstack.New(mipstack.Config{
+-			LocalAddresses: localAddresses,
+-			MTU:            mtu,
+-			TCP: mipstack.TCPSocketDefaults{
+-				CongestionControl: mipstack.CongestionControl(option.CongestionController),
+-				// Align with sing-wireguard: enable keepalive with 15-second
+-				// idle/interval timing and gVisor's default probe count.
+-				KeepAlive: true,
+-				KeepAliveConfig: mipstack.KeepAliveConfig{
+-					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
+-				},
+-			},
+-		})
+-	default:
+-		return nil, errors.New("invalid IP stack mode")
+-	}
+-}
+-
+-var _ ipStack = (*mipstack.Stack)(nil)
+-var _ ipStack = (wireguard.Device)(nil)
+-
+-type ipStackNetDialer struct {
+-	stack ipStack
+-}
+-
+-var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
+-
+-func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+-	dst, err := netip.ParseAddrPort(address)
+-	if err != nil {
+-		return nil, fmt.Errorf("invalid address %q: %w", address, err)
+-	}
+-	switch {
+-	case strings.HasPrefix(network, "tcp"):
+-		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
+-	case strings.HasPrefix(network, "udp"):
+-		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
+-	default:
+-		return nil, fmt.Errorf("invalid network %q", network)
+-	}
+-}
+-
+ type wireguardDevice interface {
+ 	ipStack
+ 	tun.Device
+diff --git a/adapter/outbound/wireguard_stub.go b/adapter/outbound/wireguard_stub.go
+new file mode 100644
+index 0000000..b82519a
+--- /dev/null
++++ b/adapter/outbound/wireguard_stub.go
+@@ -0,0 +1,82 @@
++//go:build no_wireguard
++
++package outbound
++
++import "fmt"
++
++type WireGuard struct {
++	*Base
++}
++
++type WireGuardOption struct {
++	BasicOption
++	WireGuardPeerOption
++	Name                string `proxy:"name"`
++	Ip                  string `proxy:"ip,omitempty"`
++	Ipv6                string `proxy:"ipv6,omitempty"`
++	PrivateKey          string `proxy:"private-key"`
++	Workers             int    `proxy:"workers,omitempty"`
++	MTU                 int    `proxy:"mtu,omitempty"`
++	UDP                 bool   `proxy:"udp,omitempty"`
++	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
++
++	Peers []WireGuardPeerOption `proxy:"peers,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++
++	RefreshServerIPInterval int `proxy:"refresh-server-ip-interval,omitempty"`
++}
++
++type WireGuardPeerOption struct {
++	Server       string   `proxy:"server,omitempty"`
++	Port         int      `proxy:"port,omitempty"`
++	PublicKey    string   `proxy:"public-key,omitempty"`
++	PreSharedKey string   `proxy:"pre-shared-key,omitempty"`
++	Reserved     []uint8  `proxy:"reserved,omitempty"`
++	AllowedIPs   []string `proxy:"allowed-ips,omitempty"`
++}
++
++type AmneziaWGOption struct {
++	Version int `proxy:"version,omitempty"`
++
++	JC   int `proxy:"jc,omitempty"`
++	JMin int `proxy:"jmin,omitempty"`
++	JMax int `proxy:"jmax,omitempty"`
++	S1   int `proxy:"s1,omitempty"`
++	S2   int `proxy:"s2,omitempty"`
++	S3   int `proxy:"s3,omitempty"`
++	S4   int `proxy:"s4,omitempty"`
++
++	H1 string `proxy:"h1,omitempty"`
++	H2 string `proxy:"h2,omitempty"`
++	H3 string `proxy:"h3,omitempty"`
++	H4 string `proxy:"h4,omitempty"`
++
++	I1 string `proxy:"i1,omitempty"`
++	I2 string `proxy:"i2,omitempty"`
++	I3 string `proxy:"i3,omitempty"`
++	I4 string `proxy:"i4,omitempty"`
++	I5 string `proxy:"i5,omitempty"`
++
++	J1    string `proxy:"j1,omitempty"`
++	J2    string `proxy:"j2,omitempty"`
++	J3    string `proxy:"j3,omitempty"`
++	Itime int64  `proxy:"itime,omitempty"`
++
++	HeaderProtectionKey    string `proxy:"header-protection-key,omitempty"`
++	ContentPaddingAddition string `proxy:"content-padding-addition,omitempty"`
++	RekeyAfterTime         string `proxy:"rekey-after-time,omitempty"`
++	RekeyTimeout           string `proxy:"rekey-timeout,omitempty"`
++	RejectAfterTime        string `proxy:"reject-after-time,omitempty"`
++	KeepaliveTimeout       string `proxy:"keepalive-timeout,omitempty"`
++	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
++}
++
++func NewWireGuard(WireGuardOption) (*WireGuard, error) {
++	return nil, fmt.Errorf("wireguard support is disabled by \"no_wireguard\" build tag")
++}
+diff --git a/common/convert/converter_test.go b/common/convert/converter_test.go
+index c29ca70..8c83e23 100644
+--- a/common/convert/converter_test.go
++++ b/common/convert/converter_test.go
+@@ -5,10 +5,18 @@ import (
+ 
+ 	"github.com/metacubex/mihomo/adapter"
+ 	. "github.com/metacubex/mihomo/common/convert"
++	"github.com/metacubex/mihomo/constant/features"
+ 
+ 	"github.com/stretchr/testify/assert"
+ )
+ 
++func requireMieru(t *testing.T) {
++	t.Helper()
++	if features.NoMieru {
++		t.Skip("mieru support is disabled by the no_mieru build tag")
++	}
++}
++
+ // https://v2.hysteria.network/zh/docs/developers/URI-Scheme/
+ func TestConvertsV2Ray_normal(t *testing.T) {
+ 	hy2test := "hysteria2://letmein@example.com:8443/?insecure=1&obfs=salamander&obfs-password=gawrgura&pinSHA256=65b3acd7db555768304a16abb6f4366c1a0c0bb5cec81429617f0150d7d66726&sni=real.example.com&up=114&down=514&alpn=h3,h4#hy2test"
+@@ -72,6 +80,8 @@ func TestConvertsV2Ray_hysteria2RealmScheme(t *testing.T) {
+ }
+ 
+ func TestConvertsV2RayMieru(t *testing.T) {
++	requireMieru(t)
++
+ 	mierusTest := "mierus://user:pass@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_HIGH&port=6666&port=9998-9999&port=6489&port=4896&profile=default&protocol=TCP&protocol=TCP&protocol=UDP&protocol=UDP&traffic-pattern=CCoQARoECAEQCiIYCAMQASoIMDAwMTAyMDMqCDA0MDUwNjA3"
+ 
+ 	expected := []map[string]any{
+@@ -139,6 +149,8 @@ func TestConvertsV2RayMieru(t *testing.T) {
+ }
+ 
+ func TestConvertsV2RayMieruMinimal(t *testing.T) {
++	requireMieru(t)
++
+ 	mierusTest := "mierus://user:pass@example.com?port=443&protocol=TCP&profile=simple"
+ 
+ 	expected := []map[string]any{
+@@ -164,6 +176,8 @@ func TestConvertsV2RayMieruMinimal(t *testing.T) {
+ }
+ 
+ func TestConvertsV2RayMieruFragment(t *testing.T) {
++	requireMieru(t)
++
+ 	mierusTest := "mierus://user:pass@example.com?port=443&protocol=TCP&profile=default#myproxy"
+ 
+ 	proxies, err := ConvertsV2Ray([]byte(mierusTest))
+diff --git a/component/generator/cmd.go b/component/generator/cmd.go
+index fd30c07..45ce38e 100644
+--- a/component/generator/cmd.go
++++ b/component/generator/cmd.go
+@@ -5,7 +5,6 @@ import (
+ 	"fmt"
+ 
+ 	"github.com/metacubex/mihomo/component/ech"
+-	"github.com/metacubex/mihomo/transport/sudoku"
+ 	"github.com/metacubex/mihomo/transport/vless/encryption"
+ 
+ 	"github.com/gofrs/uuid/v5"
+@@ -81,7 +80,7 @@ func Main(args []string) {
+ 		fmt.Printf("[Server] decryption: \"mlkem768x25519plus.native.600s.%s\"\n", privateKeyBase64)
+ 		fmt.Printf("[Client] encryption: \"mlkem768x25519plus.native.0rtt.%s\"\n", passwordBase64)
+ 	case "sudoku-keypair":
+-		privateKey, publicKey, err := sudoku.GenKeyPair()
++		privateKey, publicKey, err := genSudokuKeyPair()
+ 		if err != nil {
+ 			panic(err)
+ 		}
+diff --git a/component/generator/sudoku.go b/component/generator/sudoku.go
+new file mode 100644
+index 0000000..a350aae
+--- /dev/null
++++ b/component/generator/sudoku.go
+@@ -0,0 +1,9 @@
++//go:build !no_sudoku
++
++package generator
++
++import "github.com/metacubex/mihomo/transport/sudoku"
++
++func genSudokuKeyPair() (string, string, error) {
++	return sudoku.GenKeyPair()
++}
+diff --git a/component/generator/sudoku_stub.go b/component/generator/sudoku_stub.go
+new file mode 100644
+index 0000000..30cfd01
+--- /dev/null
++++ b/component/generator/sudoku_stub.go
+@@ -0,0 +1,9 @@
++//go:build no_sudoku
++
++package generator
++
++import "errors"
++
++func genSudokuKeyPair() (string, string, error) {
++	return "", "", errors.New("sudoku support is disabled by \"no_sudoku\" build tag")
++}
+diff --git a/constant/features/no_mieru.go b/constant/features/no_mieru.go
+new file mode 100644
+index 0000000..7045f42
+--- /dev/null
++++ b/constant/features/no_mieru.go
+@@ -0,0 +1,5 @@
++//go:build no_mieru
++
++package features
++
++const NoMieru = true
+diff --git a/constant/features/no_mieru_stub.go b/constant/features/no_mieru_stub.go
+new file mode 100644
+index 0000000..b492ca3
+--- /dev/null
++++ b/constant/features/no_mieru_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_mieru
++
++package features
++
++const NoMieru = false
+diff --git a/constant/features/no_openvpn.go b/constant/features/no_openvpn.go
+new file mode 100644
+index 0000000..4554aec
+--- /dev/null
++++ b/constant/features/no_openvpn.go
+@@ -0,0 +1,5 @@
++//go:build no_openvpn
++
++package features
++
++const NoOpenVPN = true
+diff --git a/constant/features/no_openvpn_stub.go b/constant/features/no_openvpn_stub.go
+new file mode 100644
+index 0000000..26d1218
+--- /dev/null
++++ b/constant/features/no_openvpn_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_openvpn
++
++package features
++
++const NoOpenVPN = false
+diff --git a/constant/features/no_sudoku.go b/constant/features/no_sudoku.go
+new file mode 100644
+index 0000000..e2536cb
+--- /dev/null
++++ b/constant/features/no_sudoku.go
+@@ -0,0 +1,5 @@
++//go:build no_sudoku
++
++package features
++
++const NoSudoku = true
+diff --git a/constant/features/no_sudoku_stub.go b/constant/features/no_sudoku_stub.go
+new file mode 100644
+index 0000000..5ba28d1
+--- /dev/null
++++ b/constant/features/no_sudoku_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_sudoku
++
++package features
++
++const NoSudoku = false
+diff --git a/constant/features/no_wireguard.go b/constant/features/no_wireguard.go
+new file mode 100644
+index 0000000..be7ec32
+--- /dev/null
++++ b/constant/features/no_wireguard.go
+@@ -0,0 +1,5 @@
++//go:build no_wireguard
++
++package features
++
++const NoWireGuard = true
+diff --git a/constant/features/no_wireguard_stub.go b/constant/features/no_wireguard_stub.go
+new file mode 100644
+index 0000000..cf75b59
+--- /dev/null
++++ b/constant/features/no_wireguard_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_wireguard
++
++package features
++
++const NoWireGuard = false
+diff --git a/constant/features/tags.go b/constant/features/tags.go
+index 524c4d7..83a89db 100644
+--- a/constant/features/tags.go
++++ b/constant/features/tags.go
+@@ -16,6 +16,18 @@ func Tags() (tags []string) {
+ 	if NoZeroTier {
+ 		tags = append(tags, "no_zerotier")
+ 	}
++	if NoWireGuard {
++		tags = append(tags, "no_wireguard")
++	}
++	if NoOpenVPN {
++		tags = append(tags, "no_openvpn")
++	}
++	if NoMieru {
++		tags = append(tags, "no_mieru")
++	}
++	if NoSudoku {
++		tags = append(tags, "no_sudoku")
++	}
+ 	if WithGVisor {
+ 		tags = append(tags, "with_gvisor")
+ 	}
+diff --git a/listener/inbound/mieru.go b/listener/inbound/mieru.go
+index a19f557..62a61e6 100644
+--- a/listener/inbound/mieru.go
++++ b/listener/inbound/mieru.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package inbound
+ 
+ import (
+diff --git a/listener/inbound/mieru_stub.go b/listener/inbound/mieru_stub.go
+new file mode 100644
+index 0000000..935bcf2
+--- /dev/null
++++ b/listener/inbound/mieru_stub.go
+@@ -0,0 +1,29 @@
++//go:build no_mieru
++
++package inbound
++
++import (
++	"fmt"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type Mieru struct {
++	*Base
++}
++
++type MieruOption struct {
++	BaseOption
++	Transport           string            `inbound:"transport"`
++	Users               map[string]string `inbound:"users"`
++	TrafficPattern      string            `inbound:"traffic-pattern,omitempty"`
++	UserHintIsMandatory bool              `inbound:"user-hint-is-mandatory,omitempty"`
++}
++
++func (o MieruOption) Equal(config C.InboundConfig) bool {
++	return optionToString(o) == optionToString(config)
++}
++
++func NewMieru(*MieruOption) (*Mieru, error) {
++	return nil, fmt.Errorf("mieru support is disabled by \"no_mieru\" build tag")
++}
+diff --git a/listener/inbound/mieru_test.go b/listener/inbound/mieru_test.go
+index aeecc76..6ffa8fb 100644
+--- a/listener/inbound/mieru_test.go
++++ b/listener/inbound/mieru_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package inbound_test
+ 
+ import (
+diff --git a/listener/inbound/sudoku.go b/listener/inbound/sudoku.go
+index c886bb7..a8fa219 100644
+--- a/listener/inbound/sudoku.go
++++ b/listener/inbound/sudoku.go
+@@ -1,3 +1,5 @@
++//go:build !no_sudoku
++
+ package inbound
+ 
+ import (
+diff --git a/listener/inbound/sudoku_stub.go b/listener/inbound/sudoku_stub.go
+new file mode 100644
+index 0000000..4560271
+--- /dev/null
++++ b/listener/inbound/sudoku_stub.go
+@@ -0,0 +1,46 @@
++//go:build no_sudoku
++
++package inbound
++
++import (
++	"fmt"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type Sudoku struct {
++	*Base
++}
++
++type SudokuOption struct {
++	BaseOption
++	Key                    string                 `inbound:"key"`
++	AEADMethod             string                 `inbound:"aead-method,omitempty"`
++	PaddingMin             *int                   `inbound:"padding-min,omitempty"`
++	PaddingMax             *int                   `inbound:"padding-max,omitempty"`
++	TableType              string                 `inbound:"table-type,omitempty"`
++	HandshakeTimeoutSecond *int                   `inbound:"handshake-timeout,omitempty"`
++	EnablePureDownlink     *bool                  `inbound:"enable-pure-downlink,omitempty"`
++	CustomTable            string                 `inbound:"custom-table,omitempty"`
++	CustomTables           []string               `inbound:"custom-tables,omitempty"`
++	DisableHTTPMask        bool                   `inbound:"disable-http-mask,omitempty"`
++	HTTPMaskMode           string                 `inbound:"http-mask-mode,omitempty"`
++	PathRoot               string                 `inbound:"path-root,omitempty"`
++	Fallback               string                 `inbound:"fallback,omitempty"`
++	HTTPMaskOptions        *SudokuHTTPMaskOptions `inbound:"httpmask,omitempty"`
++	MuxOption              MuxOption              `inbound:"mux-option,omitempty"`
++}
++
++type SudokuHTTPMaskOptions struct {
++	Disable  bool   `inbound:"disable,omitempty"`
++	Mode     string `inbound:"mode,omitempty"`
++	PathRoot string `inbound:"path-root,omitempty"`
++}
++
++func (o SudokuOption) Equal(config C.InboundConfig) bool {
++	return optionToString(o) == optionToString(config)
++}
++
++func NewSudoku(*SudokuOption) (*Sudoku, error) {
++	return nil, fmt.Errorf("sudoku support is disabled by \"no_sudoku\" build tag")
++}
+diff --git a/listener/inbound/sudoku_test.go b/listener/inbound/sudoku_test.go
+index 0075d33..72343d2 100644
+--- a/listener/inbound/sudoku_test.go
++++ b/listener/inbound/sudoku_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_sudoku
++
+ package inbound_test
+ 
+ import (
+diff --git a/listener/mieru/server.go b/listener/mieru/server.go
+index ab80106..70566e4 100644
+--- a/listener/mieru/server.go
++++ b/listener/mieru/server.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package mieru
+ 
+ import (
+diff --git a/listener/sudoku/server.go b/listener/sudoku/server.go
+index e648b65..c511aaf 100644
+--- a/listener/sudoku/server.go
++++ b/listener/sudoku/server.go
+@@ -1,3 +1,5 @@
++//go:build !no_sudoku
++
+ package sudoku
+ 
+ import (
+-- 
+2.51.1
+
