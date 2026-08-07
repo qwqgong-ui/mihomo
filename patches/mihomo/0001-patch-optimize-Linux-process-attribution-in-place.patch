@@ -1,0 +1,592 @@
+From a51eefc72a20c7e57368d553a3bcc760cbee2e70 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Tue, 28 Jul 2026 09:27:42 +0800
+Subject: [PATCH 1/2] patch: optimize Linux process attribution in place
+
+---
+ component/process/process.go               |   7 +
+ component/process/process_darwin.go        |   7 +
+ component/process/process_freebsd_amd64.go |   7 +
+ component/process/process_linux.go         | 313 +++++++++++++++++----
+ component/process/process_other.go         |   7 +
+ component/process/process_windows.go       |   7 +
+ tunnel/tunnel.go                           |  34 ++-
+ 7 files changed, 334 insertions(+), 48 deletions(-)
+
+diff --git a/component/process/process.go b/component/process/process.go
+index 464f5a79..ace3bc63 100644
+--- a/component/process/process.go
++++ b/component/process/process.go
+@@ -22,6 +22,13 @@ func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, str
+ 	return findProcessName(network, srcIP, srcPort)
+ }
+ 
++// FindProcessNameByAddr finds the process owning a socket identified by its
++// local and remote endpoints. Platforms without an endpoint-aware lookup fall
++// back to the source-only implementation.
++func FindProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, string, error) {
++	return findProcessNameByAddr(network, src, dst)
++}
++
+ // PackageNameResolver
+ // never change type traits because it's used in CMFA
+ type PackageNameResolver func(metadata *C.Metadata) (string, error)
+diff --git a/component/process/process_darwin.go b/component/process/process_darwin.go
+index 93cb90ae..30e906a8 100644
+--- a/component/process/process_darwin.go
++++ b/component/process/process_darwin.go
+@@ -109,6 +109,13 @@ func findProcessName(network string, ip netip.Addr, port int) (uint32, string, e
+ 	return 0, "", ErrNotFound
+ }
+ 
++func findProcessNameByAddr(network string, src, _ netip.AddrPort) (uint32, string, error) {
++	if !src.IsValid() {
++		return 0, "", ErrNotFound
++	}
++	return findProcessName(network, src.Addr(), int(src.Port()))
++}
++
+ func getExecPathFromPID(pid uint32) (string, error) {
+ 	buf := make([]byte, procpidpathinfosize)
+ 	_, _, errno := syscall.Syscall6(
+diff --git a/component/process/process_freebsd_amd64.go b/component/process/process_freebsd_amd64.go
+index a6d00c8e..3679836e 100644
+--- a/component/process/process_freebsd_amd64.go
++++ b/component/process/process_freebsd_amd64.go
+@@ -59,6 +59,13 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
+ 	return 0, pp, err
+ }
+ 
++func findProcessNameByAddr(network string, src, _ netip.AddrPort) (uint32, string, error) {
++	if !src.IsValid() {
++		return 0, "", ErrNotFound
++	}
++	return findProcessName(network, src.Addr(), int(src.Port()))
++}
++
+ func getExecPathFromPID(pid uint32) (string, error) {
+ 	buf := make([]byte, 2048)
+ 	size := uint64(len(buf))
+diff --git a/component/process/process_linux.go b/component/process/process_linux.go
+index 2e36f674..422999c8 100644
+--- a/component/process/process_linux.go
++++ b/component/process/process_linux.go
+@@ -13,6 +13,7 @@ import (
+ 	"runtime"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"syscall"
+ 	"unicode"
+ 	"unsafe"
+@@ -25,8 +26,17 @@ const (
+ 	SOCK_DIAG_BY_FAMILY  = 20
+ 	inetDiagRequestSize  = int(unsafe.Sizeof(inetDiagRequest{}))
+ 	inetDiagResponseSize = int(unsafe.Sizeof(inetDiagResponse{}))
++	recentPIDLimit       = 8
+ )
+ 
++type recentPIDs struct {
++	mu   sync.RWMutex
++	pids [recentPIDLimit]string
++	len  int
++}
++
++var recentProcessPIDs sync.Map // map[uint32]*recentPIDs
++
+ type inetDiagRequest struct {
+ 	Family   byte
+ 	Protocol byte
+@@ -63,20 +73,48 @@ type inetDiagResponse struct {
+ }
+ 
+ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+-	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
++	if !ip.IsValid() || srcPort < 0 || srcPort > 65535 {
++		return 0, "", ErrNotFound
++	}
++	return findProcessNameByAddr(network, netip.AddrPortFrom(ip.Unmap(), uint16(srcPort)), netip.AddrPort{})
++}
++
++func findProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, string, error) {
++	if !src.IsValid() {
++		return 0, "", ErrNotFound
++	}
++	src = netip.AddrPortFrom(src.Addr().Unmap(), src.Port())
++	if dst.IsValid() {
++		dst = netip.AddrPortFrom(dst.Addr().Unmap(), dst.Port())
++	}
++
++	var (
++		uid   uint32
++		inode uint32
++		err   error
++	)
++	if canUseExactSocketLookup(src, dst) {
++		uid, inode, err = resolveSocketByNetlinkExact(network, src, dst)
++	}
++	if err != nil || inode == 0 {
++		uid, inode, err = resolveSocketByNetlink(network, src.Addr(), int(src.Port()))
++	}
+ 	if runtime.GOOS == "android" {
+ 		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps
+ 		// so trying fallback to resolve /proc/net/{tcp,tcp6,udp,udp6}
+ 		if err != nil {
+-			uid, inode, err = resolveSocketByProcFS(network, ip, srcPort)
++			uid, inode, err = resolveSocketByProcFS(network, src.Addr(), int(src.Port()))
+ 		} else if uid == 0 {
+-			pUID, pInode, pErr := resolveSocketByProcFS(network, ip, srcPort)
++			pUID, pInode, pErr := resolveSocketByProcFS(network, src.Addr(), int(src.Port()))
+ 			if pErr == nil && pUID != 0 {
+ 				uid, inode, err = pUID, pInode, nil
+ 			}
+ 		}
+ 	}
+-	if err != nil {
++	if err != nil || inode == 0 {
++		if err == nil {
++			err = ErrNotFound
++		}
+ 		return 0, "", err
+ 	}
+ 	pp, err := resolveProcessNameByProcSearch(inode, uid)
+@@ -90,59 +128,151 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
+ 	return uid, pp, err
+ }
+ 
+-func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uint32, inode uint32, err error) {
++func canUseExactSocketLookup(src, dst netip.AddrPort) bool {
++	return src.IsValid() && dst.IsValid() && dst.Port() != 0 && src.Addr().BitLen() == dst.Addr().BitLen()
++}
++
++func resolveSocketByNetlinkExact(network string, src, dst netip.AddrPort) (uint32, uint32, error) {
++	if !canUseExactSocketLookup(src, dst) {
++		return 0, 0, ErrNotFound
++	}
+ 	request := &inetDiagRequest{
+ 		States: 0xffffffff,
+ 		Cookie: [2]uint32{0xffffffff, 0xffffffff},
+ 	}
+ 
+-	if ip.Is4() {
++	if src.Addr().Is4() {
+ 		request.Family = unix.AF_INET
+ 	} else {
+ 		request.Family = unix.AF_INET6
+ 	}
+ 
+-	if strings.HasPrefix(network, "tcp") {
++	isTCP := strings.HasPrefix(network, "tcp")
++	switch {
++	case isTCP:
+ 		request.Protocol = unix.IPPROTO_TCP
+-	} else if strings.HasPrefix(network, "udp") {
++		setInetDiagEndpoints(request, src, dst)
++	case strings.HasPrefix(network, "udp"):
+ 		request.Protocol = unix.IPPROTO_UDP
+-	} else {
++		// udp_diag_dump_one expects the incoming packet direction (remote to
++		// local), historically reversed from inet_diag response fields.
++		setInetDiagEndpoints(request, dst, src)
++	default:
+ 		return 0, 0, ErrInvalidNetwork
+ 	}
+ 
+-	copy(request.Src[:], ip.AsSlice())
++	messages, err := executeInetDiag(request, netlink.Request)
++	if err != nil {
++		return 0, 0, err
++	}
++	for _, msg := range messages {
++		if len(msg.Data) < inetDiagResponseSize {
++			continue
++		}
++		response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
++		if response.INode == 0 {
++			continue
++		}
++		local, ok := inetDiagAddrPort(response.Family, response.Src, response.SrcPort)
++		if !ok || local.Port() != src.Port() {
++			continue
++		}
++		localIP := local.Addr().Unmap()
++		if localIP != src.Addr() && (isTCP || !localIP.IsUnspecified()) {
++			continue
++		}
++		if isTCP {
++			remote, ok := inetDiagAddrPort(response.Family, response.Dst, response.DstPort)
++			if !ok || remote != dst {
++				continue
++			}
++		} else {
++			remote, ok := inetDiagAddrPort(response.Family, response.Dst, response.DstPort)
++			if !ok || (remote.Port() != 0 && remote != dst) {
++				continue
++			}
++		}
++		return response.UID, response.INode, nil
++	}
++	return 0, 0, ErrNotFound
++}
+ 
+-	binary.BigEndian.PutUint16(request.SrcPort[:], uint16(srcPort))
++func setInetDiagEndpoints(request *inetDiagRequest, src, dst netip.AddrPort) {
++	copy(request.Src[:], src.Addr().AsSlice())
++	copy(request.Dst[:], dst.Addr().AsSlice())
++	binary.BigEndian.PutUint16(request.SrcPort[:], src.Port())
++	binary.BigEndian.PutUint16(request.DstPort[:], dst.Port())
++}
++
++func inetDiagAddrPort(family byte, rawIP [16]byte, rawPort [2]byte) (netip.AddrPort, bool) {
++	var ip netip.Addr
++	switch family {
++	case unix.AF_INET:
++		var addr [4]byte
++		copy(addr[:], rawIP[:4])
++		ip = netip.AddrFrom4(addr)
++	case unix.AF_INET6:
++		ip = netip.AddrFrom16(rawIP).Unmap()
++	default:
++		return netip.AddrPort{}, false
++	}
++	return netip.AddrPortFrom(ip, binary.BigEndian.Uint16(rawPort[:])), true
++}
+ 
++func executeInetDiag(request *inetDiagRequest, flags netlink.HeaderFlags) ([]netlink.Message, error) {
+ 	conn, err := netlink.Dial(unix.NETLINK_INET_DIAG, nil)
+ 	if err != nil {
+-		return 0, 0, err
++		return nil, err
+ 	}
+ 	defer conn.Close()
+ 
+-	message := netlink.Message{
++	return conn.Execute(netlink.Message{
+ 		Header: netlink.Header{
+ 			Type:  SOCK_DIAG_BY_FAMILY,
+-			Flags: netlink.Request | netlink.Dump,
++			Flags: flags,
+ 		},
+ 		Data: (*(*[inetDiagRequestSize]byte)(unsafe.Pointer(request)))[:],
++	})
++}
++
++func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uint32, uint32, error) {
++	request := &inetDiagRequest{
++		States: 0xffffffff,
++		Cookie: [2]uint32{0xffffffff, 0xffffffff},
+ 	}
+ 
+-	messages, err := conn.Execute(message)
++	if ip.Is4() {
++		request.Family = unix.AF_INET
++	} else {
++		request.Family = unix.AF_INET6
++	}
++
++	if strings.HasPrefix(network, "tcp") {
++		request.Protocol = unix.IPPROTO_TCP
++	} else if strings.HasPrefix(network, "udp") {
++		request.Protocol = unix.IPPROTO_UDP
++	} else {
++		return 0, 0, ErrInvalidNetwork
++	}
++
++	copy(request.Src[:], ip.AsSlice())
++
++	binary.BigEndian.PutUint16(request.SrcPort[:], uint16(srcPort))
++
++	messages, err := executeInetDiag(request, netlink.Request|netlink.Dump)
+ 	if err != nil {
+ 		return 0, 0, err
+ 	}
+ 
+-	err = ErrNotFound
+ 	for _, msg := range messages {
+ 		if len(msg.Data) < inetDiagResponseSize {
+ 			continue
+ 		}
+ 
+ 		response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
+-
+-		// always set to allow fallback when check fails
+-		uid, inode, err = response.UID, response.INode, nil
++		if response.INode == 0 {
++			continue
++		}
+ 
+ 		// check src port
+ 		if binary.BigEndian.Uint16(response.SrcPort[:]) != uint16(srcPort) {
+@@ -167,67 +297,156 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
+ 			continue
+ 		}
+ 
+-		// this is the one we want
+-		break
++		return response.UID, response.INode, nil
+ 	}
+ 
+-	return
++	return 0, 0, ErrNotFound
+ }
+ 
+ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
++	buffer := make([]byte, unix.PathMax)
++	socket := fmt.Appendf(nil, "socket:[%d]", inode)
++
++	// Most applications create many connections from the same process. Try the
++	// recently successful PIDs for this UID before scanning every /proc entry.
++	// Each candidate is still verified against the current socket inode, so PID
++	// reuse and stale cache entries cannot produce a false match.
++	recentPIDs := loadRecentProcessPIDs(uid)
++	for _, pid := range recentPIDs {
++		processPath := filepath.Join("/proc", pid)
++		info, err := os.Stat(processPath)
++		if err != nil || info.Sys().(*syscall.Stat_t).Uid != uid {
++			continue
++		}
++		name, matched, err := findProcessNameInPath(processPath, socket, buffer)
++		if err != nil {
++			if isTransientProcError(err) {
++				continue
++			}
++			return "", err
++		}
++		if matched {
++			rememberProcessPID(uid, pid)
++			return name, nil
++		}
++	}
++
+ 	files, err := os.ReadDir("/proc")
+ 	if err != nil {
+ 		return "", err
+ 	}
+ 
+-	buffer := make([]byte, unix.PathMax)
+-	socket := fmt.Appendf(nil, "socket:[%d]", inode)
+-
+ 	for _, f := range files {
+ 		if !f.IsDir() || !isPid(f.Name()) {
+ 			continue
+ 		}
++		if containsPID(recentPIDs, f.Name()) {
++			continue
++		}
+ 
+ 		info, err := f.Info()
+ 		if err != nil {
+-			return "", err
++			continue
+ 		}
+ 		if info.Sys().(*syscall.Stat_t).Uid != uid {
+ 			continue
+ 		}
+ 
+ 		processPath := filepath.Join("/proc", f.Name())
+-		fdPath := filepath.Join(processPath, "fd")
+-
+-		fds, err := os.ReadDir(fdPath)
++		name, matched, err := findProcessNameInPath(processPath, socket, buffer)
+ 		if err != nil {
++			if isTransientProcError(err) {
++				continue
++			}
++			return "", err
++		}
++		if matched {
++			rememberProcessPID(uid, f.Name())
++			return name, nil
++		}
++	}
++
++	return "", fmt.Errorf("process of uid(%d),inode(%d) not found", uid, inode)
++}
++
++func isTransientProcError(err error) bool {
++	return os.IsNotExist(err) || os.IsPermission(err)
++}
++
++func containsPID(pids []string, pid string) bool {
++	for _, candidate := range pids {
++		if candidate == pid {
++			return true
++		}
++	}
++	return false
++}
++
++func findProcessNameInPath(processPath string, socket, buffer []byte) (string, bool, error) {
++	fdPath := filepath.Join(processPath, "fd")
++	fds, err := os.ReadDir(fdPath)
++	if err != nil {
++		return "", false, nil
++	}
++
++	for _, fd := range fds {
++		n, err := unix.Readlink(filepath.Join(fdPath, fd.Name()), buffer)
++		if err != nil || !bytes.Equal(buffer[:n], socket) {
+ 			continue
+ 		}
+ 
+-		for _, fd := range fds {
+-			n, err := unix.Readlink(filepath.Join(fdPath, fd.Name()), buffer)
++		if runtime.GOOS == "android" {
++			cmdline, err := os.ReadFile(path.Join(processPath, "cmdline"))
+ 			if err != nil {
+-				continue
++				return "", false, err
+ 			}
++			return splitCmdline(cmdline), true, nil
++		}
+ 
+-			if runtime.GOOS == "android" {
+-				if bytes.Equal(buffer[:n], socket) {
+-					cmdline, err := os.ReadFile(path.Join(processPath, "cmdline"))
+-					if err != nil {
+-						return "", err
+-					}
++		name, err := os.Readlink(filepath.Join(processPath, "exe"))
++		return name, err == nil, err
++	}
+ 
+-					return splitCmdline(cmdline), nil
+-				}
+-			} else {
+-				if bytes.Equal(buffer[:n], socket) {
+-					return os.Readlink(filepath.Join(processPath, "exe"))
+-				}
+-			}
+-		}
++	return "", false, nil
++}
++
++func loadRecentProcessPIDs(uid uint32) []string {
++	value, ok := recentProcessPIDs.Load(uid)
++	if !ok {
++		return nil
+ 	}
++	recent := value.(*recentPIDs)
++	recent.mu.RLock()
++	defer recent.mu.RUnlock()
++	pids := make([]string, recent.len)
++	copy(pids, recent.pids[:recent.len])
++	return pids
++}
+ 
+-	return "", fmt.Errorf("process of uid(%d),inode(%d) not found", uid, inode)
++func rememberProcessPID(uid uint32, pid string) {
++	value, _ := recentProcessPIDs.LoadOrStore(uid, &recentPIDs{})
++	recent := value.(*recentPIDs)
++	recent.mu.Lock()
++	defer recent.mu.Unlock()
++
++	index := recent.len
++	for i := 0; i < recent.len; i++ {
++		if recent.pids[i] == pid {
++			index = i
++			break
++		}
++	}
++	if index == 0 && recent.len > 0 {
++		return
++	}
++	if index == recent.len && recent.len < recentPIDLimit {
++		recent.len++
++	}
++	if index >= recentPIDLimit {
++		index = recentPIDLimit - 1
++	}
++	copy(recent.pids[1:index+1], recent.pids[:index])
++	recent.pids[0] = pid
+ }
+ 
+ // resolveProcessNameByUID returns a process name for any process with uid.
+diff --git a/component/process/process_other.go b/component/process/process_other.go
+index eea6e5fd..9465e69c 100644
+--- a/component/process/process_other.go
++++ b/component/process/process_other.go
+@@ -8,6 +8,13 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
+ 	return 0, "", ErrPlatformNotSupport
+ }
+ 
++func findProcessNameByAddr(network string, src, _ netip.AddrPort) (uint32, string, error) {
++	if !src.IsValid() {
++		return 0, "", ErrNotFound
++	}
++	return findProcessName(network, src.Addr(), int(src.Port()))
++}
++
+ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uint32, uint32, error) {
+ 	return 0, 0, ErrPlatformNotSupport
+ }
+diff --git a/component/process/process_windows.go b/component/process/process_windows.go
+index 6ab0fef0..0fb65384 100644
+--- a/component/process/process_windows.go
++++ b/component/process/process_windows.go
+@@ -197,6 +197,13 @@ func readNativeUint32(b []byte) uint32 {
+ 	return *(*uint32)(unsafe.Pointer(&b[0]))
+ }
+ 
++func findProcessNameByAddr(network string, src, _ netip.AddrPort) (uint32, string, error) {
++	if !src.IsValid() {
++		return 0, "", ErrNotFound
++	}
++	return findProcessName(network, src.Addr(), int(src.Port()))
++}
++
+ func getExecPathFromPID(pid uint32) (string, error) {
+ 	// kernel process starts with a colon in order to distinguish with normal processes
+ 	switch pid {
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 86dbc14a..e8b2187b 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -314,6 +314,37 @@ func preHandleMetadata(metadata *C.Metadata) error {
+ 	return nil
+ }
+ 
++func processLookupEndpoints(metadata *C.Metadata) (src, dst netip.AddrPort) {
++	src = metadata.SourceAddrPort()
++	if rawSrc, ok := addrPortFromNetAddr(metadata.RawSrcAddr); ok {
++		src = rawSrc
++	}
++	dst, _ = addrPortFromNetAddr(metadata.RawDstAddr)
++	return
++}
++
++func addrPortFromNetAddr(addr net.Addr) (netip.AddrPort, bool) {
++	if addr == nil {
++		return netip.AddrPort{}, false
++	}
++	if rawAddr, ok := addr.(interface{ RawAddr() net.Addr }); ok {
++		if raw := rawAddr.RawAddr(); raw != nil {
++			if _, ok := raw.(interface{ AddrPort() netip.AddrPort }); ok {
++				addr = raw
++			}
++		}
++	}
++	addrPorter, ok := addr.(interface{ AddrPort() netip.AddrPort })
++	if !ok {
++		return netip.AddrPort{}, false
++	}
++	addrPort := addrPorter.AddrPort()
++	if !addrPort.IsValid() || addrPort.Port() == 0 {
++		return netip.AddrPort{}, false
++	}
++	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
++}
++
+ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+ 	if metadata.SpecialProxy != "" {
+ 		var exist bool
+@@ -353,7 +384,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 				attemptProcessLookup = false
+ 				if !features.CMFA {
+ 					// normal check for process
+-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
++					src, dst := processLookupEndpoints(metadata)
++					uid, path, err := process.FindProcessNameByAddr(metadata.NetWork.String(), src, dst)
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+ 					} else {

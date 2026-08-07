@@ -1,0 +1,159 @@
+name: Update AndroidCyaml
+
+on:
+  workflow_call:
+    inputs:
+      mihomo_commit:
+        description: Exact mihomo commit to propagate
+        required: true
+        type: string
+    secrets:
+      ANDROIDCYAML_DEPLOY_KEY:
+        required: true
+  workflow_dispatch:
+  push:
+    branches:
+      - Alpha
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/trigger-androidcyaml-update.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-androidcyaml
+  cancel-in-progress: false
+
+jobs:
+  update-androidcyaml:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve mihomo commit
+        id: core
+        shell: bash
+        env:
+          INPUT_COMMIT: ${{ inputs.mihomo_commit }}
+          EVENT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          commit="${INPUT_COMMIT:-$EVENT_COMMIT}"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Check out mihomo
+        uses: actions/checkout@v6
+        with:
+          path: mihomo
+          ref: ${{ steps.core.outputs.commit }}
+
+      - name: Configure AndroidCyaml deploy key
+        shell: bash
+        env:
+          ANDROIDCYAML_DEPLOY_KEY: ${{ secrets.ANDROIDCYAML_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [[ -n "${ANDROIDCYAML_DEPLOY_KEY}" ]]
+          install -d -m 700 "${HOME}/.ssh"
+          printf '%s\n' "${ANDROIDCYAML_DEPLOY_KEY}" > "${HOME}/.ssh/androidcyaml"
+          chmod 600 "${HOME}/.ssh/androidcyaml"
+          ssh-keyscan github.com > "${HOME}/.ssh/known_hosts"
+          chmod 600 "${HOME}/.ssh/known_hosts"
+          {
+            echo "Host github.com"
+            echo "  IdentityFile ${HOME}/.ssh/androidcyaml"
+            echo "  IdentitiesOnly yes"
+          } > "${HOME}/.ssh/config"
+          chmod 600 "${HOME}/.ssh/config"
+
+      - name: Check out AndroidCyaml
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            git@github.com:qwqgong-ui/AndroidCyaml.git \
+            AndroidCyaml
+
+      - name: Verify the complete mihomo patch chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(mihomo/patches/mihomo/*.patch)
+          (( ${#patches[@]} > 0 ))
+          for patch in "${patches[@]}"; do
+            git -C mihomo apply --check --whitespace=error-all "../${patch}"
+            git -C mihomo apply --whitespace=error-all "../${patch}"
+          done
+          git -C mihomo diff --check
+          git -C mihomo add -A
+          android_patch="../AndroidCyaml/patches/mihomo/0001-androidcyaml-platform-hooks.patch"
+          git -C mihomo apply --check --whitespace=error-all "${android_patch}"
+          git -C mihomo apply --whitespace=error-all "${android_patch}"
+          git -C mihomo diff --check
+
+      - name: Update AndroidCyaml main
+        id: bump
+        shell: bash
+        env:
+          MIHOMO_COMMIT: ${{ steps.core.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+
+          core = os.environ["MIHOMO_COMMIT"]
+          gradle_path = pathlib.Path("AndroidCyaml/app/build.gradle.kts")
+          script_path = pathlib.Path("AndroidCyaml/scripts/build_mihomo.sh")
+          gradle = gradle_path.read_text()
+          script = script_path.read_text()
+
+          gradle_core = re.search(r'val mihomoCommit = "([0-9a-f]{40})"', gradle)
+          script_core = re.search(r'readonly MIHOMO_COMMIT="([0-9a-f]{40})"', script)
+          code_match = re.search(r"versionCode = ([0-9]+)", gradle)
+          name_match = re.search(r'versionName = "([0-9]+)\.([0-9]+)\.([0-9]+)"', gradle)
+          if not all((gradle_core, script_core, code_match, name_match)):
+              raise SystemExit("AndroidCyaml patch target format changed")
+
+          output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          if gradle_core.group(1) == core and script_core.group(1) == core:
+              output_path.write_text("changed=false\n")
+              raise SystemExit(0)
+
+          old_code = int(code_match.group(1))
+          major, minor, patch = map(int, name_match.groups())
+          new_code = old_code + 1
+          new_name = f"{major}.{minor}.{patch + 1}"
+
+          gradle = gradle[:gradle_core.start(1)] + core + gradle[gradle_core.end(1):]
+          script = script[:script_core.start(1)] + core + script[script_core.end(1):]
+          gradle = re.sub(r"versionCode = [0-9]+", f"versionCode = {new_code}", gradle, count=1)
+          gradle = re.sub(
+              r'versionName = "[0-9]+\.[0-9]+\.[0-9]+"',
+              f'versionName = "{new_name}"',
+              gradle,
+              count=1,
+          )
+          gradle_path.write_text(gradle)
+          script_path.write_text(script)
+          output_path.write_text(f"changed=true\nversion={new_name}\n")
+          PY
+
+      - name: Commit AndroidCyaml update
+        if: steps.bump.outputs.changed == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+          MIHOMO_COMMIT: ${{ steps.core.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git -C AndroidCyaml config user.name "github-actions[bot]"
+          git -C AndroidCyaml config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C AndroidCyaml diff --check
+          git -C AndroidCyaml add app/build.gradle.kts scripts/build_mihomo.sh
+          git -C AndroidCyaml commit -m "build: use mihomo ${MIHOMO_COMMIT::8} and bump to ${VERSION}"
+          git -C AndroidCyaml push origin HEAD:main
