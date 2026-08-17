@@ -1,0 +1,189 @@
+# Functions:
+# - Built-in proxied Cloudflare DoH for Fake-IP SVCB/HTTPS queries only
+#
+diff --git a/dns/fakeip_svcb_test.go b/dns/fakeip_svcb_test.go
+index 24b35e28..8c4101ce 100644
+--- a/dns/fakeip_svcb_test.go
++++ b/dns/fakeip_svcb_test.go
+@@ -219,7 +219,7 @@ func TestWithFakeIPForwardsAndSynthesizesServiceQueries(t *testing.T) {
+ 			}
+ 			ctx := icontext.NewDNSContext(context.Background())
+ 
+-			response, err := withFakeIP(&fakeip.Skipper{}, fakePool, nil, 1)(next)(ctx, request)
++			response, err := withFakeIP(&fakeip.Skipper{}, fakePool, nil, 1, nil)(next)(ctx, request)
+ 			require.NoError(t, err)
+ 			require.True(t, called)
+ 			require.Equal(t, icontext.DNSTypeFakeIP, ctx.Type())
+@@ -236,6 +236,51 @@ func TestWithFakeIPForwardsAndSynthesizesServiceQueries(t *testing.T) {
+ 	}
+ }
+ 
++type recordingServiceClient struct {
++	calls    []uint16
++	response *D.Msg
++}
++
++func (c *recordingServiceClient) ExchangeContext(_ context.Context, request *D.Msg) (*D.Msg, error) {
++	c.calls = append(c.calls, request.Question[0].Qtype)
++	return c.response.Copy(), nil
++}
++
++func (*recordingServiceClient) Address() string  { return "test://fake-ip-service" }
++func (*recordingServiceClient) ResetConnection() {}
++
++func TestWithFakeIPUsesDedicatedResolverOnlyForServiceQueries(t *testing.T) {
++	fakePool := newTestFakeIPPool(t, "198.18.0.0/16")
++	client := &recordingServiceClient{response: &D.Msg{Answer: []D.RR{testServiceRecord(D.TypeHTTPS, "example.com.")}}}
++	serviceResolver := NewResolverFromClient(client)
++	next := func(_ *icontext.DNSContext, _ *D.Msg) (*D.Msg, error) {
++		t.Fatal("main nameserver was called")
++		return nil, nil
++	}
++	handler := withFakeIP(&fakeip.Skipper{}, fakePool, nil, 1, serviceResolver)(next)
++
++	httpsRequest := new(D.Msg)
++	httpsRequest.SetQuestion("example.com.", D.TypeHTTPS)
++	httpsRequest.Id = 100
++	httpsResponse, err := handler(icontext.NewDNSContext(context.Background()), httpsRequest)
++	require.NoError(t, err)
++	require.Equal(t, uint16(100), httpsResponse.Id)
++	require.Equal(t, []uint16{D.TypeHTTPS}, client.calls)
++	require.Contains(t, serviceRecordValues(httpsResponse.Answer[0]), D.SVCB_ECHCONFIG)
++	httpsRequest.Id = 200
++	httpsResponse, err = handler(icontext.NewDNSContext(context.Background()), httpsRequest)
++	require.NoError(t, err)
++	require.Equal(t, uint16(200), httpsResponse.Id)
++
++	aRequest := new(D.Msg)
++	aRequest.SetQuestion("example.com.", D.TypeA)
++	aResponse, err := handler(icontext.NewDNSContext(context.Background()), aRequest)
++	require.NoError(t, err)
++	require.Equal(t, []uint16{D.TypeHTTPS}, client.calls)
++	require.Len(t, aResponse.Answer, 1)
++	require.IsType(t, &D.A{}, aResponse.Answer[0])
++}
++
+ func TestWithFakeIPRealIPSkipPreservesServiceBindings(t *testing.T) {
+ 	fakePool := newTestFakeIPPool(t, "198.18.0.0/16")
+ 	request := new(D.Msg)
+@@ -250,7 +289,7 @@ func TestWithFakeIPRealIPSkipPreservesServiceBindings(t *testing.T) {
+ 	}
+ 	ctx := icontext.NewDNSContext(context.Background())
+ 
+-	response, err := withFakeIP(&fakeip.Skipper{Mode: C.FilterWhiteList}, fakePool, nil, 1)(next)(ctx, request)
++	response, err := withFakeIP(&fakeip.Skipper{Mode: C.FilterWhiteList}, fakePool, nil, 1, nil)(next)(ctx, request)
+ 	require.NoError(t, err)
+ 	require.Same(t, upstream, response)
+ 	require.Equal(t, icontext.DNSTypeRaw, ctx.Type())
+diff --git a/dns/middleware.go b/dns/middleware.go
+index 98450490..3c973cc4 100644
+--- a/dns/middleware.go
++++ b/dns/middleware.go
+@@ -146,7 +146,7 @@ func withMapping(mapping *lru.LruCache[netip.Addr, string]) middleware {
+ 	}
+ }
+ 
+-func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int) middleware {
++func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int, serviceResolver resolver.Resolver) middleware {
+ 	return func(next handler) handler {
+ 		return func(ctx *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
+ 			q := r.Question[0]
+@@ -177,11 +177,19 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
+ 					AAAA: ip.AsSlice(),
+ 				}
+ 			case D.TypeSVCB, D.TypeHTTPS:
+-				msg, err := next(ctx, r)
++				var msg *D.Msg
++				var err error
++				if serviceResolver == nil {
++					msg, err = next(ctx, r)
++				} else {
++					ctx.SetType(icontext.DNSTypeRaw)
++					msg, err = serviceResolver.ExchangeContext(ctx, r)
++				}
+ 				if err != nil {
+ 					return msg, err
+ 				}
+ 				msg = msg.Copy()
++				msg.SetRcode(r, msg.Rcode)
+ 				if rewriteFakeIPServiceBindings(msg, fakePool, fakePool6, fakeIPTTL) {
+ 					ctx.SetType(icontext.DNSTypeFakeIP)
+ 				}
+@@ -238,7 +245,7 @@ func compose(middlewares []middleware, endpoint handler) handler {
+ 	return h
+ }
+ 
+-func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
++func newHandler(resolver resolver.Resolver, serviceResolver resolver.Resolver, mapper *ResolverEnhancer) handler {
+ 	var middlewares []middleware
+ 
+ 	if mapper.useHosts {
+@@ -246,7 +253,7 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
+ 	}
+ 
+ 	if mapper.mode == C.DNSFakeIP {
+-		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))
++		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL, serviceResolver))
+ 	}
+ 
+ 	if mapper.mode != C.DNSNormal {
+diff --git a/dns/resolver.go b/dns/resolver.go
+index 84e68c77..f2a5203b 100644
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -530,6 +530,25 @@ func NewResolverFromClient(client dnsClient) *Resolver {
+ 	}
+ }
+ 
++// NewFakeIPServiceResolver returns the built-in resolver used only for
++// SVCB/HTTPS queries that are synthesized by fake-IP mode. Address queries
++// never reach this resolver. The DoH transport follows routing rules so the
++// query to 1.1.1.1 is carried by the selected proxy instead of local UDP DNS.
++func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string, cacheMaxSize int) *Resolver {
++	return NewResolver(Config{
++		Main: []NameServer{{
++			Net:       "https",
++			Addr:      "https://1.1.1.1:443/dns-query",
++			ProxyName: RespectRules,
++			Params:    map[string]string{},
++		}},
++		Default:        defaultServers,
++		IPv6:           true,
++		CacheAlgorithm: cacheAlgorithm,
++		CacheMaxSize:   cacheMaxSize,
++	}).Resolver
++}
++
+ func NewResolver(config Config) (rs Resolvers) {
+ 	defaultResolver := &Resolver{
+ 		main:        transform(config.Default, nil),
+diff --git a/dns/service.go b/dns/service.go
+index 12e1781f..c5b04254 100644
+--- a/dns/service.go
++++ b/dns/service.go
+@@ -40,6 +40,6 @@ func (s *Service) ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
+ 
+ var _ resolver.Service = (*Service)(nil)
+ 
+-func NewService(resolver resolver.Resolver, mapper *ResolverEnhancer) *Service {
+-	return &Service{handler: newHandler(resolver, mapper)}
++func NewService(resolver resolver.Resolver, serviceResolver resolver.Resolver, mapper *ResolverEnhancer) *Service {
++	return &Service{handler: newHandler(resolver, serviceResolver, mapper)}
+ }
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index 24b61890..a9ed46d8 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -277,7 +277,11 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
+ 		m.PatchFrom(old.(*dns.ResolverEnhancer))
+ 	}
+ 
+-	s := dns.NewService(r, m)
++	var serviceResolver resolver.Resolver
++	if m.FakeIPEnabled() {
++		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, c.CacheAlgorithm, c.CacheMaxSize)
++	}
++	s := dns.NewService(r, serviceResolver, m)
+ 
+ 	resolver.DefaultResolver = r
+ 	resolver.DefaultHostMapper = m

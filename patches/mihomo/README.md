@@ -87,6 +87,15 @@ Patches:
 
 - `dns.patch`
 
+## Built-in Fake-IP Service Record Resolver
+
+Fake-IP 模式下仅 SVCB/HTTPS（TYPE64/65）使用内置 `https://1.1.1.1/dns-query`，且 DoH 连接按 `RULES` 走代理。A/AAAA 仍由 fake-IP 池本地合成，主 `nameserver`、`direct-nameserver` 和 `proxy-server-nameserver` 语义不变。
+
+Patches:
+
+- `dns.patch`
+- `dns/fakeip-service.patch`
+
 ## Process-Rule Candidate FD Filtering
 
 从 PROCESS、UID、logic、rule-provider 和 wrapper 规则构造候选 matcher，在 Linux 扫描文件描述符前过滤不可能命中的进程。

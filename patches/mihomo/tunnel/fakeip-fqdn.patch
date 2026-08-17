@@ -1,0 +1,132 @@
+# Functions:
+# - Skip nameserver resolution for Fake-IP rule matching
+# - Preserve Fake-IP FQDN for non-DIRECT proxy outbounds
+#
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 7e3b0bc4..c31a74a1 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -398,6 +398,42 @@ func processMatcherForRules(rules []C.Rule) process.ProcessMatcher {
+ 	return matchers
+ }
+ 
++func fakeIPRuleResolver(metadata *C.Metadata, resolveIP func()) func() {
++	if metadata.DNSMode == C.DNSFakeIP {
++		// Fake-IP routing must not ask nameserver for a real address. DIRECT
++		// resolves later through DirectHostResolver; proxies keep the FQDN.
++		return nil
++	}
++	return resolveIP
++}
++
++func keepResolvedFakeIP(adapterType C.AdapterType) bool {
++	switch adapterType {
++	case C.Direct, C.Reject, C.RejectDrop:
++		return true
++	default:
++		return false
++	}
++}
++
++func preserveFakeIPDomain(metadata *C.Metadata, proxy C.Proxy) {
++	if metadata.DNSMode != C.DNSFakeIP || metadata.Host == "" || !metadata.DstIP.IsValid() || proxy == nil {
++		return
++	}
++
++	// Inspect the selected leaf without changing group state. DIRECT keeps the
++	// locally resolved address, and REJECT retains its historical metadata.
++	// Every other outbound receives the original FQDN instead of the address
++	// resolved while evaluating IP-based rules.
++	leaf := proxy
++	for next := leaf.Unwrap(metadata, false); next != nil; next = leaf.Unwrap(metadata, false) {
++		leaf = next
++	}
++	if !keepResolvedFakeIP(leaf.Type()) {
++		metadata.DstIP = netip.Addr{}
++	}
++}
++
+ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+ 	if metadata.SpecialProxy != "" {
+ 		var exist bool
+@@ -405,6 +432,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 		if !exist {
+ 			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+ 		}
++		preserveFakeIPDomain(metadata, proxy)
+ 		return
+ 	}
+ 	var (
+@@ -493,6 +528,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 			return false
+ 		},
+ 	}
++	helper.ResolveIP = fakeIPRuleResolver(metadata, helper.ResolveIP)
+ 
+ 	switch FindProcessMode() {
+ 	case process.FindProcessAlways:
+@@ -501,6 +537,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 	default:
+ 		proxy, rule, err = match(metadata, helper)
+ 	}
++	preserveFakeIPDomain(metadata, proxy)
+ 	return
+ }
+ 
+diff --git a/tunnel/tunnel_test.go b/tunnel/tunnel_test.go
+new file mode 100644
+index 00000000..ad2a2dbd
+--- /dev/null
++++ b/tunnel/tunnel_test.go
+@@ -0,0 +1,51 @@
++package tunnel
++
++import (
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestKeepResolvedFakeIP(t *testing.T) {
++	tests := []struct {
++		name        string
++		adapterType C.AdapterType
++		want        bool
++	}{
++		{name: "direct", adapterType: C.Direct, want: true},
++		{name: "reject", adapterType: C.Reject, want: true},
++		{name: "reject drop", adapterType: C.RejectDrop, want: true},
++		{name: "proxy", adapterType: C.Shadowsocks, want: false},
++		{name: "compatible", adapterType: C.Compatible, want: false},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := keepResolvedFakeIP(test.adapterType); got != test.want {
++				t.Fatalf("keepResolvedFakeIP(%s) = %t, want %t", test.adapterType, got, test.want)
++			}
++		})
++	}
++}
++
++func TestFakeIPRuleResolver(t *testing.T) {
++	for _, test := range []struct {
++		name     string
++		dnsMode  C.DNSMode
++		wantCall bool
++	}{
++		{name: "fake IP", dnsMode: C.DNSFakeIP, wantCall: false},
++		{name: "mapping", dnsMode: C.DNSMapping, wantCall: true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			called := false
++			resolveIP := fakeIPRuleResolver(&C.Metadata{DNSMode: test.dnsMode}, func() { called = true })
++			if resolveIP != nil {
++				resolveIP()
++			}
++			if called != test.wantCall {
++				t.Fatalf("resolver called = %t, want %t", called, test.wantCall)
++			}
++		})
++	}
++}

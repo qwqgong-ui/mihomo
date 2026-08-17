@@ -13,6 +13,7 @@ component/dialer.patch
 component/directrace.patch
 component/resolver.patch
 dns.patch
+dns/fakeip-service.patch
 listener/sing_tun.patch
 config.patch
 config/ecn.patch
@@ -23,3 +24,4 @@ rules/wrapper.patch
 adapter/provider.patch
 transport/hysteria.patch
 transport/tuic.patch
+tunnel/fakeip-fqdn.patch
