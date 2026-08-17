@@ -874,8 +874,10 @@ index aace86f..f1845d2 100644
  type wireguardGoDevice interface {
  	Close()
  	IpcSet(uapiConf string) error
-@@ -138,108 +131,6 @@ type AmneziaWGOption struct {
+@@ -138,110 +131,6 @@ type AmneziaWGOption struct {
  	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
+-	RandomTrailers         bool   `proxy:"random-trailers,omitempty"` // AmneziaWG v3.1+
+-	DisableCookies         bool   `proxy:"disable-cookies,omitempty"` // AmneziaWG v3.1+
  }
  
 -type IPStackOption struct {
@@ -988,7 +990,7 @@ new file mode 100644
 index 0000000..b82519a
 --- /dev/null
 +++ b/adapter/outbound/wireguard_stub.go
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,84 @@
 +//go:build no_wireguard
 +
 +package outbound
@@ -1066,6 +1068,8 @@ index 0000000..b82519a
 +	RejectAfterTime        string `proxy:"reject-after-time,omitempty"`
 +	KeepaliveTimeout       string `proxy:"keepalive-timeout,omitempty"`
 +	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
++	RandomTrailers         bool   `proxy:"random-trailers,omitempty"`
++	DisableCookies         bool   `proxy:"disable-cookies,omitempty"`
 +}
 +
 +func NewWireGuard(WireGuardOption) (*WireGuard, error) {
