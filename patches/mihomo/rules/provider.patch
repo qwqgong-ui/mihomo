@@ -1,0 +1,123 @@
+# Functions:
+# - Process-rule candidate FD filtering
+#
+diff --git a/rules/provider/classical_strategy.go b/rules/provider/classical_strategy.go
+index 497f9168..aefd7f70 100644
+--- a/rules/provider/classical_strategy.go
++++ b/rules/provider/classical_strategy.go
+@@ -29,6 +29,33 @@ func (c *classicalStrategy) Match(metadata *C.Metadata, helper C.RuleMatchHelper
+ 	return false
+ }
+ 
++func (c *classicalStrategy) HasProcessRule() bool {
++	for _, rule := range c.rules {
++		if matcher, ok := rule.(interface{ HasProcessRule() bool }); ok && matcher.HasProcessRule() {
++			return true
++		}
++	}
++	return false
++}
++
++func (c *classicalStrategy) MatchProcess(path string) bool {
++	for _, rule := range c.rules {
++		if matcher, ok := rule.(interface{ MatchProcess(string) bool }); ok && matcher.MatchProcess(path) {
++			return true
++		}
++	}
++	return false
++}
++
++func (c *classicalStrategy) MatchProcessName(name string) bool {
++	for _, rule := range c.rules {
++		if matcher, ok := rule.(interface{ MatchProcessName(string) bool }); ok && matcher.MatchProcessName(name) {
++			return true
++		}
++	}
++	return false
++}
++
+ func (c *classicalStrategy) Count() int {
+ 	return c.count
+ }
+diff --git a/rules/provider/classical_strategy_test.go b/rules/provider/classical_strategy_test.go
+new file mode 100644
+index 00000000..efa02ea1
+--- /dev/null
++++ b/rules/provider/classical_strategy_test.go
+@@ -0,0 +1,38 @@
++package provider
++
++import (
++	"fmt"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/mihomo/rules/common"
++)
++
++func TestClassicalStrategyProcessCandidates(t *testing.T) {
++	strategy := NewClassicalStrategy(func(tp, payload, target string, _ []string, _ map[string][]C.Rule) (C.Rule, error) {
++		switch tp {
++		case "PROCESS-NAME":
++			return common.NewProcess(payload, target, C.ProcessName)
++		case "DOMAIN":
++			return common.NewDomain(payload, target), nil
++		default:
++			return nil, fmt.Errorf("unsupported test rule %s", tp)
++		}
++	})
++	strategy.Insert("DOMAIN,example.com")
++	strategy.Insert("PROCESS-NAME,curl")
++	strategy.Insert("PROCESS-NAME,wget")
++
++	if !strategy.HasProcessRule() {
++		t.Fatal("strategy did not report its process rules")
++	}
++	if !strategy.MatchProcess("/usr/bin/wget") {
++		t.Fatal("strategy did not include a later process rule in its candidate union")
++	}
++	if strategy.MatchProcess("/usr/bin/chromium") {
++		t.Fatal("strategy matched a process absent from its rules")
++	}
++	if !strategy.MatchProcessName("curl") || strategy.MatchProcessName("chromium") {
++		t.Fatal("strategy package candidates do not match the process rule union")
++	}
++}
+diff --git a/rules/provider/rule_set.go b/rules/provider/rule_set.go
+index 13ea323a..b77bf92d 100644
+--- a/rules/provider/rule_set.go
++++ b/rules/provider/rule_set.go
+@@ -35,6 +35,33 @@ func (rs *RuleSet) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool,
+ 	return false, ""
+ }
+ 
++func (rs *RuleSet) HasProcessRule() bool {
++	provider, ok := rs.getProvider()
++	if !ok {
++		return false
++	}
++	matcher, ok := provider.Strategy().(interface{ HasProcessRule() bool })
++	return ok && matcher.HasProcessRule()
++}
++
++func (rs *RuleSet) MatchProcess(path string) bool {
++	provider, ok := rs.getProvider()
++	if !ok {
++		return false
++	}
++	matcher, ok := provider.Strategy().(interface{ MatchProcess(string) bool })
++	return ok && matcher.MatchProcess(path)
++}
++
++func (rs *RuleSet) MatchProcessName(name string) bool {
++	provider, ok := rs.getProvider()
++	if !ok {
++		return false
++	}
++	matcher, ok := provider.Strategy().(interface{ MatchProcessName(string) bool })
++	return ok && matcher.MatchProcessName(name)
++}
++
+ // MatchDomain implements C.DomainMatcher
+ func (rs *RuleSet) MatchDomain(domain string) bool {
+ 	ok, _ := rs.Match(&C.Metadata{Host: domain}, C.RuleMatchHelper{})

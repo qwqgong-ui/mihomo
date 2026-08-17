@@ -1,0 +1,891 @@
+# Functions:
+# - DNS upstream hostname IPv6 preference
+# - Linux endpoint-aware process attribution
+# - Remote UDP destination identity
+# - DIRECT dual-stack race integration
+# - Fake-IP ICMP handling
+# - Process-rule candidate FD filtering
+# - Physical-network DNS dialing
+#
+diff --git a/tunnel/dns_dialer.go b/tunnel/dns_dialer.go
+index c409a298..a98281c5 100644
+--- a/tunnel/dns_dialer.go
++++ b/tunnel/dns_dialer.go
+@@ -31,7 +31,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
+ 	r := d.r
+ 	proxyName := d.proxyName
+ 	proxyAdapter := d.proxyAdapter
+-	var opts []dialer.Option
++	opts := []dialer.Option{dialer.WithPreferIPv6()}
+ 	var rule C.Rule
+ 	metadata := &C.Metadata{
+ 		NetWork: C.TCP,
+@@ -43,14 +43,6 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
+ 	}
+ 	if !strings.Contains(network, "tcp") {
+ 		metadata.NetWork = C.UDP
+-		if !metadata.Resolved() {
+-			// udp must resolve host first
+-			dstIP, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, r)
+-			if err != nil {
+-				return nil, err
+-			}
+-			metadata.DstIP = dstIP
+-		}
+ 	}
+ 
+ 	if proxyAdapter == nil && len(proxyName) != 0 {
+@@ -107,7 +99,16 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
+ 		return conn, nil
+ 	} else {
+ 		if proxyAdapter == nil {
+-			return dialer.DialContext(ctx, network, metadata.AddrPort().String(), opts...)
++			opts = append(opts, dialer.WithResolver(r))
++			return dialer.DialContext(ctx, network, addr, opts...)
++		}
++
++		if !metadata.Resolved() {
++			dstIP, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, r)
++			if err != nil {
++				return nil, err
++			}
++			metadata.DstIP = dstIP
+ 		}
+ 
+ 		if !proxyAdapter.SupportUDP() {
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 86dbc14a..e8b2187b 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -314,6 +314,37 @@ func preHandleMetadata(metadata *C.Metadata) error {
+ 	return nil
+ }
+ 
++func processLookupEndpoints(metadata *C.Metadata) (src, dst netip.AddrPort) {
++	src = metadata.SourceAddrPort()
++	if rawSrc, ok := addrPortFromNetAddr(metadata.RawSrcAddr); ok {
++		src = rawSrc
++	}
++	dst, _ = addrPortFromNetAddr(metadata.RawDstAddr)
++	return
++}
++
++func addrPortFromNetAddr(addr net.Addr) (netip.AddrPort, bool) {
++	if addr == nil {
++		return netip.AddrPort{}, false
++	}
++	if rawAddr, ok := addr.(interface{ RawAddr() net.Addr }); ok {
++		if raw := rawAddr.RawAddr(); raw != nil {
++			if _, ok := raw.(interface{ AddrPort() netip.AddrPort }); ok {
++				addr = raw
++			}
++		}
++	}
++	addrPorter, ok := addr.(interface{ AddrPort() netip.AddrPort })
++	if !ok {
++		return netip.AddrPort{}, false
++	}
++	addrPort := addrPorter.AddrPort()
++	if !addrPort.IsValid() || addrPort.Port() == 0 {
++		return netip.AddrPort{}, false
++	}
++	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
++}
++
+ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+ 	if metadata.SpecialProxy != "" {
+ 		var exist bool
+@@ -353,7 +384,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 				attemptProcessLookup = false
+ 				if !features.CMFA {
+ 					// normal check for process
+-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
++					src, dst := processLookupEndpoints(metadata)
++					uid, path, err := process.FindProcessNameByAddr(metadata.NetWork.String(), src, dst)
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+ 					} else {
+diff --git a/tunnel/connection.go b/tunnel/connection.go
+index 3a66a76..1900738 100644
+--- a/tunnel/connection.go
++++ b/tunnel/connection.go
+@@ -5,23 +5,41 @@ import (
+ 	"errors"
+ 	"net"
+ 	"net/netip"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+ 	N "github.com/metacubex/mihomo/common/net"
+ 	C "github.com/metacubex/mihomo/constant"
+ 	"github.com/metacubex/mihomo/log"
++	M "github.com/metacubex/sing/common/metadata"
+ )
+ 
++type remoteDomainTarget struct {
++	// origin is the local synthetic address (normally FakeIP) that the TUN
++	// application used. ports contains the remote ports requested for this FQDN.
++	origin netip.Addr
++	ports  map[uint16]struct{}
++}
++
+ type packetSender struct {
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
+ 	ch     chan C.PacketAdapter
+ 
+-	// destination NAT mapping
+-	originToTarget map[string]netip.Addr
+-	targetToOrigin map[netip.Addr]netip.Addr
+-	mappingMutex   sync.RWMutex
++	// UDP destination-identity mapping.
++	//
++	// Proxy UDP address fields are a tagged union: either FQDN or IP, never both.
++	// XUDP-capable servers can return the requested FQDN, while a standard
++	// Hysteria2 server normally resolves it and returns only the real IP. Keep
++	// the exact maps separate from the conservative HY2 IP-learning fallback so
++	// future protocol debugging does not accidentally turn ambiguity into a
++	// wrong TUN source address.
++	originToTarget        map[string]M.Socksaddr
++	targetToOrigin        map[netip.Addr]netip.Addr // exact locally-resolved IP -> origin
++	remoteDomains         map[string]*remoteDomainTarget
++	learnedTargetToOrigin map[netip.Addr]netip.Addr // HY2 real IP -> sole-domain origin
++	mappingMutex          sync.RWMutex
+ }
+ 
+ // newPacketSender return a chan based C.PacketSender
+@@ -34,46 +52,188 @@ func newPacketSender() C.PacketSender {
+ 		cancel: cancel,
+ 		ch:     ch,
+ 
+-		originToTarget: make(map[string]netip.Addr),
+-		targetToOrigin: make(map[netip.Addr]netip.Addr),
++		originToTarget:        make(map[string]M.Socksaddr),
++		targetToOrigin:        make(map[netip.Addr]netip.Addr),
++		remoteDomains:         make(map[string]*remoteDomainTarget),
++		learnedTargetToOrigin: make(map[netip.Addr]netip.Addr),
+ 	}
+ }
+ 
++func canonicalUDPDomain(domain string) string {
++	return strings.TrimSuffix(strings.ToLower(domain), ".")
++}
++
++func udpSocksaddrFromNet(addr net.Addr) M.Socksaddr {
++	// Preserve the old typed-nil *net.UDPAddr fallback. Passing a typed nil to
++	// sing's SocksaddrFromNet would dereference it before handleUDPToLocal can
++	// replace the source with the original TUN destination.
++	if addr == nil {
++		return M.Socksaddr{}
++	}
++	if udpAddr, isUDPAddr := addr.(*net.UDPAddr); isUDPAddr && udpAddr == nil {
++		return M.Socksaddr{}
++	}
++	return M.SocksaddrFromNet(addr).Unwrap()
++}
++
++func udpDestination(metadata *C.Metadata) M.Socksaddr {
++	if metadata.DstIP.IsValid() {
++		// Preserve upstream behavior for DIRECT and every locally resolved
++		// adapter. Host may remain populated for rules and logging after
++		// ResolveUDP, but a native UDP socket must receive the selected IP.
++		return M.SocksaddrFromNet(metadata.UDPAddr()).Unwrap()
++	}
++	if metadata.Host != "" {
++		// RemoteDNS adapters deliberately leave DstIP invalid so capable
++		// proxy protocols can carry the original FQDN to the server.
++		return M.ParseSocksaddrHostPort(metadata.Host, metadata.DstPort).Unwrap()
++	}
++	return M.Socksaddr{}
++}
++
+ func (s *packetSender) AddMapping(originMetadata *C.Metadata, metadata *C.Metadata) {
+ 	s.mappingMutex.Lock()
+ 	defer s.mappingMutex.Unlock()
++
+ 	originKey := originMetadata.String()
+-	originAddr := originMetadata.DstIP
+-	targetAddr := metadata.DstIP
+-	if addr := s.originToTarget[originKey]; !addr.IsValid() { // overwrite only if the record is illegal
+-		s.originToTarget[originKey] = targetAddr
++	originAddr := originMetadata.DstIP.Unmap()
++	target := udpDestination(metadata)
++	if addr := s.originToTarget[originKey]; !addr.IsValid() && target.IsValid() { // overwrite only if the record is illegal
++		s.originToTarget[originKey] = target
++	}
++	if !originAddr.IsValid() || !target.IsValid() {
++		return
++	}
++
++	if target.IsFqdn() {
++		// Preserve the canonical domain separately from originToTarget: the
++		// latter is for outgoing packet reuse, whereas this map restores an
++		// incoming FQDN to the exact FakeIP expected by the TUN application.
++		domain := canonicalUDPDomain(target.Fqdn)
++		remoteTarget, loaded := s.remoteDomains[domain]
++		if !loaded {
++			remoteTarget = &remoteDomainTarget{
++				origin: originAddr,
++				ports:  make(map[uint16]struct{}),
++			}
++			s.remoteDomains[domain] = remoteTarget
++			if len(s.remoteDomains) > 1 || len(s.targetToOrigin) > 0 {
++				// An IP-only reply is ambiguous as soon as more than one domain,
++				// or a mixture of domain and IP targets, shares this
++				// endpoint-independent association.
++				s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
++			}
++		} else if remoteTarget.origin != originAddr {
++			// A recycled Fake-IP must never inherit an older association.
++			remoteTarget.origin = netip.Addr{}
++			s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
++		}
++		if metadata.DstPort != 0 {
++			remoteTarget.ports[metadata.DstPort] = struct{}{}
++		}
++		return
+ 	}
++
++	targetAddr := target.Addr.Unmap()
+ 	if addr := s.targetToOrigin[targetAddr]; !addr.IsValid() { // overwrite only if the record is illegal
+ 		s.targetToOrigin[targetAddr] = originAddr
+ 	}
++	if len(s.remoteDomains) > 0 {
++		// A later direct/resolved IP target makes any prior HY2 IP learning
++		// ambiguous. Exact IP mappings remain available above.
++		s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
++	}
++}
++
++// singleRemoteOriginLocked returns the sole remote-domain origin when port
++// matches one of its requested ports. The caller must hold mappingMutex.
++func (s *packetSender) singleRemoteOriginLocked(port uint16) netip.Addr {
++	if len(s.remoteDomains) != 1 || len(s.targetToOrigin) != 0 || port == 0 {
++		return netip.Addr{}
++	}
++	for _, target := range s.remoteDomains {
++		if _, loaded := target.ports[port]; loaded {
++			return target.origin
++		}
++	}
++	return netip.Addr{}
+ }
+ 
+-func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
++func (s *packetSender) RestoreReadFrom(addr net.Addr) netip.Addr {
++	source := udpSocksaddrFromNet(addr)
++	if source.IsFqdn() {
++		s.mappingMutex.RLock()
++		target := s.remoteDomains[canonicalUDPDomain(source.Fqdn)]
++		var originAddr netip.Addr
++		if target != nil {
++			originAddr = target.origin
++		}
++		s.mappingMutex.RUnlock()
++		return originAddr
++	}
++
++	sourceAddr := source.Addr.Unmap()
++	if !sourceAddr.IsValid() {
++		return netip.Addr{}
++	}
++
+ 	s.mappingMutex.RLock()
+-	defer s.mappingMutex.RUnlock()
+-	if originAddr := s.targetToOrigin[addr]; originAddr.IsValid() {
++	if originAddr := s.targetToOrigin[sourceAddr]; originAddr.IsValid() {
++		s.mappingMutex.RUnlock()
++		return originAddr
++	}
++	if originAddr := s.learnedTargetToOrigin[sourceAddr]; originAddr.IsValid() {
++		s.mappingMutex.RUnlock()
++		return originAddr
++	}
++	originAddr := s.singleRemoteOriginLocked(source.Port)
++	canLearn := originAddr.IsValid() && len(s.learnedTargetToOrigin) == 0
++	s.mappingMutex.RUnlock()
++	if !canLearn {
++		return sourceAddr
++	}
++
++	// Standard Hysteria2 returns the resolved IP instead of the requested
++	// FQDN. Bind only the first same-port reply of a single-domain EIM
++	// association. Additional IPs remain visible for STUN alternate-address
++	// behavior, and multiple domains are never guessed.
++	s.mappingMutex.Lock()
++	defer s.mappingMutex.Unlock()
++	if originAddr = s.targetToOrigin[sourceAddr]; originAddr.IsValid() {
+ 		return originAddr
+ 	}
+-	return addr
++	if originAddr = s.learnedTargetToOrigin[sourceAddr]; originAddr.IsValid() {
++		return originAddr
++	}
++	originAddr = s.singleRemoteOriginLocked(source.Port)
++	if originAddr.IsValid() && len(s.learnedTargetToOrigin) == 0 {
++		s.learnedTargetToOrigin[sourceAddr] = originAddr
++		return originAddr
++	}
++	return sourceAddr
+ }
+ 
+ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+ 	defer packet.Drop()
+ 	metadata := packet.Metadata()
+ 
+-	var addr *net.UDPAddr
++	var addr net.Addr
+ 
+ 	s.mappingMutex.RLock()
+ 	targetAddr := s.originToTarget[metadata.String()]
+ 	s.mappingMutex.RUnlock()
+ 
+ 	if targetAddr.IsValid() {
+-		addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(targetAddr, metadata.DstPort))
++		// A cached Socksaddr deliberately retains whether the target was an FQDN
++		// or an IP. Rebuilding it from DstIP would discard that identity.
++		targetAddr.Port = metadata.DstPort
++		if targetAddr.IsFqdn() {
++			addr = targetAddr
++		} else {
++			// Match upstream DIRECT behavior: native UDP sockets receive a
++			// *net.UDPAddr, never a domain-capable proxy address wrapper.
++			addr = net.UDPAddrFromAddrPort(targetAddr.AddrPort())
++		}
+ 	}
+ 
+ 	if addr == nil {
+@@ -91,12 +251,17 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+ 			}
+ 		}
+ 
+-		if !metadata.DstIP.IsValid() {
++		targetAddr = udpDestination(metadata)
++		if !targetAddr.IsValid() {
+ 			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
+ 			return
+ 		}
++		if targetAddr.IsFqdn() {
++			addr = targetAddr
++		} else {
++			addr = metadata.UDPAddr()
++		}
+ 		s.AddMapping(originMetadata, metadata)
+-		addr = metadata.UDPAddr()
+ 	}
+ 	_ = handleUDPToRemote(packet, pc, addr)
+ }
+@@ -151,7 +316,7 @@ func (s *packetSender) Close() {
+ 
+ func (s *packetSender) DoSniff(metadata *C.Metadata) error { return nil }
+ 
+-func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr *net.UDPAddr) error {
++func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr net.Addr) error {
+ 	if addr == nil {
+ 		return errors.New("udp addr invalid")
+ 	}
+@@ -180,24 +345,46 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+ 			return
+ 		}
+ 
+-		fromUDPAddr, isUDPAddr := from.(*net.UDPAddr)
+-		if !isUDPAddr {
+-			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
+-			log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
+-		} else if fromUDPAddr == nil {
+-			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
+-			log.Warnln("server return a nil *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", oAddrPort)
++		source := udpSocksaddrFromNet(from)
++		fromPort := source.Port
++		if fromPort == 0 {
++			fromPort = oAddrPort.Port()
+ 		}
+ 
+-		fromAddrPort := fromUDPAddr.AddrPort()
+-		fromAddr := fromAddrPort.Addr().Unmap()
+-
+-		// restore DestinationNAT
+-		fromAddr = sender.RestoreReadFrom(fromAddr).Unmap()
+-
+-		fromAddrPort = netip.AddrPortFrom(fromAddr, fromAddrPort.Port())
++		// Restore both locally resolved IP mappings and remote FQDN mappings.
++		fromAddr := sender.RestoreReadFrom(from).Unmap()
++		var writeBackAddr net.Addr
++		switch {
++		case fromAddr.IsValid() && fromPort != 0:
++			writeBackAddr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(fromAddr, fromPort))
++		case source.IsFqdn() && !oAddrPort.IsValid():
++			// Non-transparent inbounds such as SOCKS can preserve the domain
++			// directly even when there is no Fake-IP to restore.
++			writeBackAddr = source
++		case source.IsFqdn():
++			// A transparent inbound cannot write a domain as the packet source.
++			// Falling back to the association's first FakeIP would silently
++			// misattribute an unknown domain on a multi-destination EIM socket.
++			if put != nil {
++				put()
++			}
++			log.Warnln("server returned an unmapped UDP domain [%s], drop instead of guessing (%s)", source, oAddrPort)
++			return
++		case oAddrPort.IsValid():
++			// Retain the historical fallback for invalid/typed-nil server
++			// addresses; unlike an unknown domain, these carry no identity that
++			// could be incorrectly assigned to another destination.
++			writeBackAddr = net.UDPAddrFromAddrPort(oAddrPort)
++			log.Warnln("server returned an unrestorable [%T](%v), force replace to (%s)", from, from, oAddrPort)
++		default:
++			if put != nil {
++				put()
++			}
++			log.Warnln("server returned an invalid UDP source [%T](%v)", from, from)
++			return
++		}
+ 
+-		_, err = writeBack.WriteBack(data, net.UDPAddrFromAddrPort(fromAddrPort))
++		_, err = writeBack.WriteBack(data, writeBackAddr)
+ 		if put != nil {
+ 			put()
+ 		}
+diff --git a/tunnel/connection_test.go b/tunnel/connection_test.go
+new file mode 100644
+index 0000000..7e891a0
+--- /dev/null
++++ b/tunnel/connection_test.go
+@@ -0,0 +1,249 @@
++package tunnel
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"testing"
++	"time"
++
++	C "github.com/metacubex/mihomo/constant"
++	M "github.com/metacubex/sing/common/metadata"
++)
++
++type recordingPacketConn struct {
++	written    net.Addr
++	resolvedIP netip.Addr
++}
++
++func (c *recordingPacketConn) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
++func (c *recordingPacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
++	return nil, nil, nil, net.ErrClosed
++}
++func (c *recordingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
++	c.written = addr
++	return len(p), nil
++}
++func (c *recordingPacketConn) Close() error                     { return nil }
++func (c *recordingPacketConn) LocalAddr() net.Addr              { return udpAddr("127.0.0.1", 12345) }
++func (c *recordingPacketConn) SetDeadline(time.Time) error      { return nil }
++func (c *recordingPacketConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *recordingPacketConn) SetWriteDeadline(time.Time) error { return nil }
++func (c *recordingPacketConn) Chains() C.Chain                  { return nil }
++func (c *recordingPacketConn) ProviderChains() C.Chain          { return nil }
++func (c *recordingPacketConn) AppendToChains(C.ProxyAdapter)    {}
++func (c *recordingPacketConn) RemoteDestination() string        { return "" }
++func (c *recordingPacketConn) ResolveUDP(_ context.Context, metadata *C.Metadata) error {
++	if c.resolvedIP.IsValid() {
++		metadata.DstIP = c.resolvedIP
++	}
++	return nil
++}
++
++type mappingTestPacket struct {
++	data    []byte
++	dropped bool
++}
++
++func (p *mappingTestPacket) Data() []byte { return p.data }
++func (p *mappingTestPacket) WriteBack(b []byte, _ net.Addr) (int, error) {
++	return len(b), nil
++}
++func (p *mappingTestPacket) Drop()               { p.dropped = true }
++func (p *mappingTestPacket) LocalAddr() net.Addr { return udpAddr("192.0.2.1", 23456) }
++
++func newMappingTestSender(t *testing.T) *packetSender {
++	t.Helper()
++	sender := newPacketSender().(*packetSender)
++	t.Cleanup(sender.Close)
++	return sender
++}
++
++func udpMetadata(ip, host string, port uint16) *C.Metadata {
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    host,
++		DstPort: port,
++	}
++	if ip != "" {
++		metadata.DstIP = netip.MustParseAddr(ip)
++	}
++	return metadata
++}
++
++func udpAddr(ip string, port uint16) *net.UDPAddr {
++	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(netip.MustParseAddr(ip), port))
++}
++
++func TestPacketSenderSendsUnresolvedHostToRemoteDNS(t *testing.T) {
++	sender := newMappingTestSender(t)
++	packet := &mappingTestPacket{data: []byte("payload")}
++	metadata := udpMetadata("", "quic.example", 443)
++	metadata.DNSMode = C.DNSFakeIP
++	adapter := C.NewPacketAdapter(packet, metadata)
++	conn := &recordingPacketConn{}
++
++	sender.processPacket(conn, adapter)
++
++	destination := M.SocksaddrFromNet(conn.written)
++	if !destination.IsFqdn() || destination.Fqdn != "quic.example" || destination.Port != 443 {
++		t.Fatalf("WriteTo() destination = %#v, want quic.example:443", destination)
++	}
++	if !packet.dropped {
++		t.Fatal("processPacket() did not release input packet")
++	}
++}
++
++func TestPacketSenderUsesResolvedIPForDirect(t *testing.T) {
++	sender := newMappingTestSender(t)
++	packet := &mappingTestPacket{data: []byte("payload")}
++	metadata := udpMetadata("", "game.example", 443)
++	metadata.DNSMode = C.DNSFakeIP
++	adapter := C.NewPacketAdapter(packet, metadata)
++	resolvedIP := netip.MustParseAddr("203.0.113.6")
++	conn := &recordingPacketConn{resolvedIP: resolvedIP}
++
++	sender.processPacket(conn, adapter)
++
++	directAddr, ok := conn.written.(*net.UDPAddr)
++	if !ok {
++		t.Fatalf("WriteTo() destination type = %T, want *net.UDPAddr", conn.written)
++	}
++	destination := M.SocksaddrFromNet(directAddr).Unwrap()
++	if destination.IsFqdn() || destination.Addr != resolvedIP || destination.Port != 443 {
++		t.Fatalf("WriteTo() destination = %#v, want %s:443", destination, resolvedIP)
++	}
++
++	// The cached path must keep the same native DIRECT address semantics.
++	cachedPacket := &mappingTestPacket{data: []byte("cached payload")}
++	cachedAdapter := C.NewPacketAdapter(cachedPacket, udpMetadata("", "game.example", 443))
++	conn.resolvedIP = netip.Addr{}
++	sender.processPacket(conn, cachedAdapter)
++	if _, ok := conn.written.(*net.UDPAddr); !ok {
++		t.Fatalf("cached WriteTo() destination type = %T, want *net.UDPAddr", conn.written)
++	}
++	if !cachedPacket.dropped {
++		t.Fatal("cached processPacket() did not release input packet")
++	}
++	if !packet.dropped {
++		t.Fatal("processPacket() did not release input packet")
++	}
++}
++
++func TestUDPSocksaddrFromNetAcceptsTypedNil(t *testing.T) {
++	var addr *net.UDPAddr
++	if got := udpSocksaddrFromNet(addr); got.IsValid() {
++		t.Fatalf("udpSocksaddrFromNet(typed nil) = %#v, want invalid", got)
++	}
++}
++
++func TestPacketSenderRestoresRemoteDomainReply(t *testing.T) {
++	sender := newMappingTestSender(t)
++	origin := udpMetadata("198.18.0.7", "", 443)
++	target := udpMetadata("", "Quic.Example", 443)
++	sender.AddMapping(origin, target)
++
++	got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("quic.example", 443))
++	if got != origin.DstIP {
++		t.Fatalf("RestoreReadFrom() = %s, want Fake-IP %s", got, origin.DstIP)
++	}
++	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("unknown.example", 443)); got.IsValid() {
++		t.Fatalf("unknown domain restored to %s; want invalid instead of guessed FakeIP", got)
++	}
++
++	cached := sender.originToTarget[origin.String()]
++	if !cached.IsFqdn() || canonicalUDPDomain(cached.Fqdn) != "quic.example" {
++		t.Fatalf("cached target = %#v, want quic.example", cached)
++	}
++}
++
++func TestPacketSenderLearnsOneRemoteIPWithoutMaskingAlternates(t *testing.T) {
++	sender := newMappingTestSender(t)
++	origin := udpMetadata("198.18.0.8", "", 443)
++	sender.AddMapping(origin, udpMetadata("", "video.example", 443))
++
++	wrongPort := udpAddr("203.0.113.9", 8443)
++	if got := sender.RestoreReadFrom(wrongPort); got != wrongPort.AddrPort().Addr() {
++		t.Fatalf("wrong-port reply = %s, want actual source %s", got, wrongPort.IP)
++	}
++
++	primary := udpAddr("203.0.113.10", 443)
++	if got := sender.RestoreReadFrom(primary); got != origin.DstIP {
++		t.Fatalf("primary reply = %s, want Fake-IP %s", got, origin.DstIP)
++	}
++	if got := sender.RestoreReadFrom(primary); got != origin.DstIP {
++		t.Fatalf("cached primary reply = %s, want Fake-IP %s", got, origin.DstIP)
++	}
++
++	alternate := udpAddr("203.0.113.11", 443)
++	if got := sender.RestoreReadFrom(alternate); got != alternate.AddrPort().Addr() {
++		t.Fatalf("alternate reply = %s, want actual source %s", got, alternate.IP)
++	}
++}
++
++func TestPacketSenderDoesNotGuessAmbiguousRemoteIP(t *testing.T) {
++	sender := newMappingTestSender(t)
++	firstOrigin := udpMetadata("198.18.0.9", "", 443)
++	secondOrigin := udpMetadata("198.18.0.10", "", 443)
++	sender.AddMapping(firstOrigin, udpMetadata("", "first.example", 443))
++	sender.AddMapping(secondOrigin, udpMetadata("", "second.example", 443))
++
++	actual := udpAddr("203.0.113.12", 443)
++	if got := sender.RestoreReadFrom(actual); got != actual.AddrPort().Addr() {
++		t.Fatalf("ambiguous IP reply = %s, want actual source %s", got, actual.IP)
++	}
++	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("first.example", 443)); got != firstOrigin.DstIP {
++		t.Fatalf("first domain reply = %s, want %s", got, firstOrigin.DstIP)
++	}
++	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("second.example", 443)); got != secondOrigin.DstIP {
++		t.Fatalf("second domain reply = %s, want %s", got, secondOrigin.DstIP)
++	}
++}
++
++func TestPacketSenderDoesNotGuessMixedDomainAndIP(t *testing.T) {
++	sender := newMappingTestSender(t)
++	domainOrigin := udpMetadata("198.18.0.12", "", 443)
++	sender.AddMapping(domainOrigin, udpMetadata("", "domain.example", 443))
++
++	// The first reply is learnable while the association has one target.
++	domainIP := udpAddr("203.0.113.14", 443)
++	if got := sender.RestoreReadFrom(domainIP); got != domainOrigin.DstIP {
++		t.Fatalf("single-domain reply = %s, want %s", got, domainOrigin.DstIP)
++	}
++
++	// Adding a direct IP makes future IP-only replies ambiguous and must revoke
++	// the learned fallback. The exact direct mapping still works.
++	direct := udpMetadata("203.0.113.15", "", 443)
++	sender.AddMapping(direct, direct)
++	if got := sender.RestoreReadFrom(domainIP); got != domainIP.AddrPort().Addr() {
++		t.Fatalf("mixed-target reply = %s, want actual source %s", got, domainIP.IP)
++	}
++	if got := sender.RestoreReadFrom(udpAddr("203.0.113.15", 443)); got != direct.DstIP {
++		t.Fatalf("direct reply = %s, want %s", got, direct.DstIP)
++	}
++}
++
++func TestPacketSenderRestoresResolvedAndIPv6Targets(t *testing.T) {
++	t.Run("resolved IPv4", func(t *testing.T) {
++		sender := newMappingTestSender(t)
++		origin := udpMetadata("198.18.0.11", "", 3478)
++		target := udpMetadata("203.0.113.13", "game.example", 3478)
++		sender.AddMapping(origin, target)
++		cached := sender.originToTarget[origin.String()]
++		if cached.IsFqdn() || cached.Addr != target.DstIP {
++			t.Fatalf("cached target = %#v, want resolved IP %s", cached, target.DstIP)
++		}
++		if got := sender.RestoreReadFrom(udpAddr("203.0.113.13", 3478)); got != origin.DstIP {
++			t.Fatalf("RestoreReadFrom() = %s, want %s", got, origin.DstIP)
++		}
++	})
++
++	t.Run("remote IPv6", func(t *testing.T) {
++		sender := newMappingTestSender(t)
++		origin := udpMetadata("2001:2::7", "", 443)
++		sender.AddMapping(origin, udpMetadata("", "ipv6.example", 443))
++		if got := sender.RestoreReadFrom(udpAddr("2001:db8::7", 443)); got != origin.DstIP {
++			t.Fatalf("RestoreReadFrom() = %s, want %s", got, origin.DstIP)
++		}
++	})
++}
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index e8b2187..34a701c 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -462,6 +462,7 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 		return
+ 	}
+ 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
++	originalAddrPort := metadata.AddrPort()
+ 
+ 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
+ 		packet.Drop()
+@@ -512,6 +513,9 @@ func handleUDPConn(packet C.PacketAdapter) {
+ 
+ 			sender.AddMapping(originMetadata, dialMetadata)
+ 			oAddrPort := dialMetadata.AddrPort()
++			if !oAddrPort.IsValid() {
++				oAddrPort = originalAddrPort
++			}
+ 			writeBackProxy := nat.NewWriteBackProxy(packet)
+ 
+ 			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 34a701c4..ec7c1596 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -116,6 +116,24 @@ func (t tunnel) NatTable() C.NatTable {
+ 	return natTable
+ }
+ 
++// ResolveICMPDirect runs the normal rule engine without opening a connection
++// and returns the final adapter only when proxy-group unwrapping ends at
++// DIRECT. TUN ICMP uses this optional method to avoid bypassing proxy rules.
++func (t tunnel) ResolveICMPDirect(metadata *C.Metadata) C.ProxyAdapter {
++	metadata = metadata.Clone()
++	proxy, _, err := resolveMetadata(metadata)
++	if err != nil || proxy == nil {
++		return nil
++	}
++	for next := proxy.Unwrap(metadata, false); next != nil; next = proxy.Unwrap(metadata, false) {
++		proxy = next
++	}
++	if proxy.Type() != C.Direct {
++		return nil
++	}
++	return proxy.Adapter()
++}
++
+ func (t tunnel) Proxies() map[string]C.Proxy {
+ 	return proxies
+ }
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index ec7c1596..7e3b0bc4 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -363,6 +363,40 @@ func addrPortFromNetAddr(addr net.Addr) (netip.AddrPort, bool) {
+ 	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
+ }
+ 
++type rulesProcessMatcher []process.RuleProcessMatcher
++
++func (m rulesProcessMatcher) MatchProcess(path string) bool {
++	for _, matcher := range m {
++		if matcher.MatchProcess(path) {
++			return true
++		}
++	}
++	return false
++}
++
++func (m rulesProcessMatcher) MatchProcessName(name string) bool {
++	for _, matcher := range m {
++		if matcher.MatchProcessName(name) {
++			return true
++		}
++	}
++	return false
++}
++
++func processMatcherForRules(rules []C.Rule) process.ProcessMatcher {
++	matchers := make(rulesProcessMatcher, 0)
++	for _, rule := range rules {
++		matcher, ok := rule.(process.RuleProcessMatcher)
++		if ok && matcher.HasProcessRule() {
++			matchers = append(matchers, matcher)
++		}
++	}
++	if len(matchers) == 0 {
++		return nil
++	}
++	return matchers
++}
++
+ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+ 	if metadata.SpecialProxy != "" {
+ 		var exist bool
+@@ -401,9 +435,13 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 			if attemptProcessLookup {
+ 				attemptProcessLookup = false
+ 				if !features.CMFA {
++					matcher := processMatcherForRules(getRules(metadata))
++					if matcher == nil {
++						return
++					}
+ 					// normal check for process
+ 					src, dst := processLookupEndpoints(metadata)
+-					uid, path, err := process.FindProcessNameByAddr(metadata.NetWork.String(), src, dst)
++					uid, path, err := process.FindProcessNameByAddrWithMatcher(metadata.NetWork.String(), src, dst, matcher)
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+ 					} else {
+@@ -420,6 +458,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 					pkg, err := process.FindPackageName(metadata)
+ 					if err != nil {
+ 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
++					} else if matcher := processMatcherForRules(getRules(metadata)); matcher != nil && !matcher.MatchProcessName(pkg) {
++						return
+ 					} else {
+ 						metadata.Process = pkg
+ 					}
+@@ -442,7 +482,9 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
+ 
+ 	switch FindProcessMode() {
+ 	case process.FindProcessAlways:
++		configMux.RLock()
+ 		helper.FindProcess()
++		configMux.RUnlock()
+ 		helper.FindProcess = nil
+ 	case process.FindProcessOff:
+ 		helper.FindProcess = nil
+diff --git a/tunnel/dns_dialer.go b/tunnel/dns_dialer.go
+index a98281c5..c6d4a1d6 100644
+--- a/tunnel/dns_dialer.go
++++ b/tunnel/dns_dialer.go
+@@ -18,20 +18,36 @@ import (
+ const DnsRespectRules = "RULES"
+ 
+ type DNSDialer struct {
+-	r            resolver.Resolver
+-	proxyAdapter C.ProxyAdapter
+-	proxyName    string
++	r             resolver.Resolver
++	proxyAdapter  C.ProxyAdapter
++	proxyName     string
++	interfaceName string
++	systemDNS     bool
+ }
+ 
+ func NewDNSDialer(r resolver.Resolver, proxyAdapter C.ProxyAdapter, proxyName string) *DNSDialer {
+ 	return &DNSDialer{r: r, proxyAdapter: proxyAdapter, proxyName: proxyName}
+ }
+ 
++// NewSystemDNSDialer creates a direct DNS dialer pinned to the physical
++// interface that supplied the system name server. It explicitly applies
++// sing-tun's active auto-redirect output bypass mark on Linux. On Windows,
++// WithInterface becomes IP_UNICAST_IF/IPV6_UNICAST_IF.
++func NewSystemDNSDialer(r resolver.Resolver, interfaceName string) *DNSDialer {
++	return &DNSDialer{r: r, interfaceName: interfaceName, systemDNS: true}
++}
++
+ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+ 	r := d.r
+ 	proxyName := d.proxyName
+ 	proxyAdapter := d.proxyAdapter
+ 	opts := []dialer.Option{dialer.WithPreferIPv6()}
++	if d.interfaceName != "" {
++		opts = append(opts, dialer.WithInterface(d.interfaceName))
++	}
++	if d.systemDNS {
++		opts = append(opts, dialer.WithRoutingMark(int(dialer.SystemDNSRoutingMark.Load())))
++	}
+ 	var rule C.Rule
+ 	metadata := &C.Metadata{
+ 		NetWork: C.TCP,
+@@ -134,6 +150,12 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
+ 	proxyAdapter := d.proxyAdapter
+ 	proxyName := d.proxyName
+ 	var opts []dialer.Option
++	if d.interfaceName != "" {
++		opts = append(opts, dialer.WithInterface(d.interfaceName))
++	}
++	if d.systemDNS {
++		opts = append(opts, dialer.WithRoutingMark(int(dialer.SystemDNSRoutingMark.Load())))
++	}
+ 	metadata := &C.Metadata{
+ 		NetWork: C.UDP,
+ 		Type:    C.INNER,

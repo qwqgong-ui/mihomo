@@ -1,0 +1,31 @@
+diff --git a/config/config.go b/config/config.go
+--- a/config/config.go
++++ b/config/config.go
+@@ -564,13 +564,9 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
+ 			Enable:           false,
+ 			InboundInterface: "lo",
+ 			Bypass:           []string{},
+ 			DnsRedirect:      true,
+ 		},
+-		Experimental: RawExperimental{
+-			// https://github.com/quic-go/quic-go/issues/4178
+-			// Quic-go currently cannot automatically fall back on platforms that do not support ecn, so this feature is turned off by default.
+-			QUICGoDisableECN: true,
+-		},
++		Experimental: RawExperimental{},
+ 		Profile: RawProfile{
+ 			StoreSelected: true,
+ 		},
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -214,8 +214,6 @@ func updateExperimental(c *config.Experimental) {
+ 	if c.QUICGoDisableGSO {
+ 		_ = os.Setenv("QUIC_GO_DISABLE_GSO", strconv.FormatBool(true))
+ 	}
+-	if c.QUICGoDisableECN {
+-		_ = os.Setenv("QUIC_GO_DISABLE_ECN", strconv.FormatBool(true))
+-	}
++	_ = os.Setenv("QUIC_GO_DISABLE_ECN", strconv.FormatBool(c.QUICGoDisableECN))
+ 	resolver.SetIP4PEnable(c.IP4PEnable)
+ }

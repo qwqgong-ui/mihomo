@@ -1,0 +1,1791 @@
+# Functions:
+# - DIRECT dual-stack TCP race
+# - Fake-IP ICMP handling
+# - Physical-network DNS dialing
+# - TCP concurrent winner cache
+#
+diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
+index c4e9c5ce..0c0ac1d1 100644
+--- a/component/dialer/dialer.go
++++ b/component/dialer/dialer.go
+@@ -13,6 +13,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/atomic"
++	"github.com/metacubex/mihomo/component/directrace"
+ 	"github.com/metacubex/mihomo/component/keepalive"
+ 	"github.com/metacubex/mihomo/component/mptcp"
+ 	"github.com/metacubex/mihomo/component/resolver"
+@@ -50,6 +51,10 @@ func DialContext(ctx context.Context, network, address string, options ...Option
+ 		network = fmt.Sprintf("%s%d", network, opt.network)
+ 	}
+ 
++	if network == "tcp" && opt.directRace {
++		return directDualStackDialContext(ctx, network, address, opt)
++	}
++
+ 	ips, port, err := parseAddr(ctx, network, address, opt.resolver)
+ 	if err != nil {
+ 		return nil, err
+@@ -76,6 +81,358 @@ func DialContext(ctx context.Context, network, address string, options ...Option
+ 	}
+ }
+ 
++type lookupResult struct {
++	version int
++	ips     []netip.Addr
++	err     error
++}
++
++// directDualStackDialContext overlaps A/AAAA lookup with real TCP connects.
++// The first family with usable addresses starts immediately. When AAAA wins
++// DNS, IPv6 gets the resolver's ipv6-timeout budget before IPv4 joins, unless
++// every IPv6 connect has already failed. When A wins DNS, IPv4 starts without
++// delay and AAAA may join until that same wait budget expires.
++func directDualStackDialContext(ctx context.Context, network, address string, opt option) (net.Conn, error) {
++	host, port, err := net.SplitHostPort(address)
++	if err != nil {
++		return nil, err
++	}
++
++	preferResolver := opt.resolver
++	if preferResolver == nil {
++		preferResolver = resolver.ProxyServerHostResolver
++	}
++	// Keep the effective resolver on the option copy so its ipv6-timeout is
++	// used even when the caller relied on the default resolver selection.
++	opt.resolver = preferResolver
++
++	raceCtx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	lookups := make(chan lookupResult, 2)
++	lookup := func(version int) {
++		var ips []netip.Addr
++		var lookupErr error
++		if version == 4 {
++			ips, lookupErr = resolver.LookupIPv4WithResolver(raceCtx, host, preferResolver)
++		} else {
++			ips, lookupErr = resolver.LookupIPv6WithResolver(raceCtx, host, preferResolver)
++		}
++		for i, ip := range ips {
++			ips[i] = ip.Unmap()
++		}
++		ips = prioritizeDirectWinner(host, opt.directAdapter, ips)
++		lookups <- lookupResult{version: version, ips: ips, err: lookupErr}
++	}
++	go lookup(4)
++	go lookup(6)
++	if opt.prefer == 4 || opt.prefer == 6 {
++		return directPreferredDialContext(ctx, raceCtx, network, port, opt, lookups, opt.prefer)
++	}
++
++	var lookupErrs []error
++	for completed := 0; completed < 2; completed++ {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case result := <-lookups:
++			if result.err != nil || len(result.ips) == 0 {
++				if result.err == nil {
++					result.err = ErrorNoIpAddress
++				}
++				lookupErrs = append(lookupErrs, fmt.Errorf("dns resolve IPv%d failed: %w", result.version, result.err))
++				continue
++			}
++
++			otherPending := completed == 0
++			if result.version == 4 {
++				return directIPv4First(ctx, raceCtx, network, port, opt, result.ips, lookups, otherPending, lookupErrs)
++			}
++			return directIPv6First(ctx, raceCtx, network, port, opt, result.ips, lookups, otherPending, lookupErrs)
++		}
++	}
++	return nil, errors.Join(lookupErrs...)
++}
++
++func prioritizeDirectWinner(host, adapter string, ips []netip.Addr) []netip.Addr {
++	preferred, loaded := directrace.Prefer(host, adapter, ips)
++	if !loaded || len(ips) < 2 || ips[0] == preferred {
++		return ips
++	}
++	ordered := append([]netip.Addr(nil), ips...)
++	for index, ip := range ordered {
++		if ip == preferred {
++			copy(ordered[1:index+1], ordered[:index])
++			ordered[0] = preferred
++			break
++		}
++	}
++	return ordered
++}
++
++func startDirectConnects(ctx context.Context, network, port string, opt option, ips []netip.Addr, isPrimary bool, results chan<- dialResult) int {
++	for _, ip := range ips {
++		go func(ip netip.Addr) {
++			conn, err := dialContext(ctx, network, ip, port, opt)
++			result := dialResult{ip: ip, Conn: conn, error: err, isPrimary: isPrimary}
++			select {
++			case results <- result:
++			case <-ctx.Done():
++				if conn != nil {
++					_ = conn.Close()
++				}
++			}
++		}(ip)
++	}
++	return len(ips)
++}
++
++// directPreferredDialContext starts both address families as soon as their DNS
++// answers arrive, but keeps the configured family preference when choosing the
++// winner. A successful fallback connection is held ready instead of delaying
++// its TCP handshake until the preferred family times out.
++func directPreferredDialContext(ctx, raceCtx context.Context, network, port string, opt option, lookups <-chan lookupResult, preferredVersion int) (net.Conn, error) {
++	connects := make(chan dialResult)
++	var errs []error
++	var fallback net.Conn
++	var preferredPending, fallbackPending int
++	var preferredLookupDone bool
++	var preferredFailed, fallbackFailed bool
++	var preferredAbandoned bool
++
++	var lookupTimer, preferenceTimer *time.Timer
++	var lookupTimeout, preferenceTimeout <-chan time.Time
++	defer func() {
++		if lookupTimer != nil {
++			lookupTimer.Stop()
++		}
++		if preferenceTimer != nil {
++			preferenceTimer.Stop()
++		}
++	}()
++
++	closeFallback := func() {
++		if fallback != nil {
++			conn := fallback
++			fallback = nil
++			go func() { _ = conn.Close() }()
++		}
++	}
++	returnFallback := func() (net.Conn, error) {
++		conn := fallback
++		fallback = nil
++		return conn, nil
++	}
++	startPreferenceTimer := func() {
++		if preferenceTimer == nil {
++			preferenceTimer = time.NewTimer(dualStackFallbackTimeout)
++			preferenceTimeout = preferenceTimer.C
++		}
++	}
++	stopLookupTimer := func() {
++		if lookupTimer != nil {
++			lookupTimer.Stop()
++			lookupTimeout = nil
++		}
++	}
++
++	for {
++		if (preferredFailed || preferredAbandoned) && fallback != nil {
++			return returnFallback()
++		}
++		if (preferredFailed || preferredAbandoned) && fallbackFailed {
++			return nil, errors.Join(errs...)
++		}
++
++		select {
++		case <-ctx.Done():
++			closeFallback()
++			return nil, ctx.Err()
++		case result := <-lookups:
++			isPreferred := result.version == preferredVersion
++			if isPreferred {
++				preferredLookupDone = true
++				stopLookupTimer()
++			}
++
++			if result.err != nil || len(result.ips) == 0 {
++				if result.err == nil {
++					result.err = ErrorNoIpAddress
++				}
++				errs = append(errs, fmt.Errorf("dns resolve IPv%d failed: %w", result.version, result.err))
++				if isPreferred {
++					preferredFailed = true
++				} else {
++					fallbackFailed = true
++				}
++				continue
++			}
++
++			if isPreferred {
++				if preferredAbandoned {
++					continue
++				}
++				preferredPending = startDirectConnects(raceCtx, network, port, opt, result.ips, true, connects)
++				startPreferenceTimer()
++			} else {
++				fallbackPending = startDirectConnects(raceCtx, network, port, opt, result.ips, false, connects)
++				if !preferredLookupDone && lookupTimer == nil {
++					lookupTimer = time.NewTimer(resolver.IPv6Timeout(opt.resolver))
++					lookupTimeout = lookupTimer.C
++				}
++			}
++		case result := <-connects:
++			if result.isPrimary {
++				preferredPending--
++				if result.error == nil {
++					closeFallback()
++					return result.Conn, nil
++				}
++				errs = append(errs, fmt.Errorf("connect %s failed: %w", result.ip, result.error))
++				if preferredPending == 0 {
++					preferredFailed = true
++				}
++				continue
++			}
++
++			fallbackPending--
++			if result.error == nil {
++				if fallback == nil {
++					fallback = result.Conn
++				} else {
++					go func() { _ = result.Conn.Close() }()
++				}
++				if preferredFailed || preferredAbandoned || preferenceTimeout == nil && preferenceTimer != nil {
++					return returnFallback()
++				}
++			} else {
++				errs = append(errs, fmt.Errorf("connect %s failed: %w", result.ip, result.error))
++			}
++			if fallbackPending == 0 && fallback == nil {
++				fallbackFailed = true
++			}
++		case <-lookupTimeout:
++			lookupTimeout = nil
++			preferredAbandoned = true
++			if fallback != nil {
++				return returnFallback()
++			}
++		case <-preferenceTimeout:
++			preferenceTimeout = nil
++			if fallback != nil {
++				return returnFallback()
++			}
++		}
++	}
++}
++
++func receiveDirectConnect(result dialResult, pending *int, errs *[]error) net.Conn {
++	*pending--
++	if result.error == nil {
++		return result.Conn
++	}
++	*errs = append(*errs, fmt.Errorf("connect %s failed: %w", result.ip, result.error))
++	return nil
++}
++
++func directIPv4First(ctx, raceCtx context.Context, network, port string, opt option, ipv4s []netip.Addr, lookups <-chan lookupResult, ipv6Pending bool, errs []error) (net.Conn, error) {
++	connects := make(chan dialResult)
++	pending := startDirectConnects(raceCtx, network, port, opt, ipv4s, true, connects)
++	if !ipv6Pending {
++		return waitDirectConnects(ctx, connects, pending, errs)
++	}
++
++	timer := time.NewTimer(resolver.IPv6Timeout(opt.resolver))
++	defer timer.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case result := <-connects:
++			if conn := receiveDirectConnect(result, &pending, &errs); conn != nil {
++				return conn, nil
++			}
++			// Even after all IPv4 attempts fail, AAAA still owns the configured
++			// wait budget and may enter the race before it expires.
++		case result := <-lookups:
++			if result.err != nil || len(result.ips) == 0 {
++				if result.err == nil {
++					result.err = ErrorNoIpAddress
++				}
++				errs = append(errs, fmt.Errorf("dns resolve IPv6 failed: %w", result.err))
++				return waitDirectConnects(ctx, connects, pending, errs)
++			}
++			pending += startDirectConnects(raceCtx, network, port, opt, result.ips, true, connects)
++			return waitDirectConnects(ctx, connects, pending, errs)
++		case <-timer.C:
++			return waitDirectConnects(ctx, connects, pending, errs)
++		}
++	}
++}
++
++func directIPv6First(ctx, raceCtx context.Context, network, port string, opt option, ipv6s []netip.Addr, lookups <-chan lookupResult, ipv4Pending bool, errs []error) (net.Conn, error) {
++	connects := make(chan dialResult)
++	pending := startDirectConnects(raceCtx, network, port, opt, ipv6s, true, connects)
++	if !ipv4Pending {
++		return waitDirectConnects(ctx, connects, pending, errs)
++	}
++
++	timer := time.NewTimer(resolver.IPv6Timeout(opt.resolver))
++	defer timer.Stop()
++	var ipv4 lookupResult
++	for {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case result := <-connects:
++			if conn := receiveDirectConnect(result, &pending, &errs); conn != nil {
++				return conn, nil
++			}
++			if pending == 0 {
++				return directIPv4Fallback(ctx, raceCtx, network, port, opt, connects, pending, lookups, ipv4, errs)
++			}
++		case result := <-lookups:
++			ipv4 = result
++			lookups = nil
++		case <-timer.C:
++			return directIPv4Fallback(ctx, raceCtx, network, port, opt, connects, pending, lookups, ipv4, errs)
++		}
++	}
++}
++
++func directIPv4Fallback(ctx, raceCtx context.Context, network, port string, opt option, connects chan dialResult, pending int, lookups <-chan lookupResult, ipv4 lookupResult, errs []error) (net.Conn, error) {
++	if lookups != nil {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case ipv4 = <-lookups:
++		}
++	}
++	if ipv4.err != nil || len(ipv4.ips) == 0 {
++		if ipv4.err == nil {
++			ipv4.err = ErrorNoIpAddress
++		}
++		errs = append(errs, fmt.Errorf("dns resolve IPv4 failed: %w", ipv4.err))
++		return waitDirectConnects(ctx, connects, pending, errs)
++	}
++	pending += startDirectConnects(raceCtx, network, port, opt, ipv4.ips, true, connects)
++	return waitDirectConnects(ctx, connects, pending, errs)
++}
++
++func waitDirectConnects(ctx context.Context, results <-chan dialResult, pending int, errs []error) (net.Conn, error) {
++	for pending > 0 {
++		select {
++		case <-ctx.Done():
++			return nil, ctx.Err()
++		case result := <-results:
++			if conn := receiveDirectConnect(result, &pending, &errs); conn != nil {
++				return conn, nil
++			}
++		}
++	}
++	return nil, errors.Join(errs...)
++}
++
+ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort, options ...Option) (net.PacketConn, error) {
+ 	opt := applyOptions(options...)
+ 
+@@ -175,12 +532,20 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+ }
+ 
+ func ICMPControl(destination netip.Addr) func(network, address string, conn syscall.RawConn) error {
++	return ICMPControlWithOptions(destination)
++}
++
++func ICMPControlWithOptions(destination netip.Addr, options ...Option) func(network, address string, conn syscall.RawConn) error {
++	opt := applyOptions(options...)
+ 	return func(network, address string, conn syscall.RawConn) error {
+ 		if DefaultSocketHook != nil {
+ 			return DefaultSocketHook(network, address, conn)
+ 		}
+ 		dialer := &net.Dialer{}
+-		interfaceName := DefaultInterface.Load()
++		interfaceName := opt.interfaceName
++		if interfaceName == "" {
++			interfaceName = DefaultInterface.Load()
++		}
+ 		if interfaceName == "" {
+ 			if finder := DefaultInterfaceFinder.Load(); finder != nil {
+ 				interfaceName = finder.FindInterfaceName(destination)
+@@ -191,7 +556,10 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
+ 				return err
+ 			}
+ 		}
+-		routingMark := int(DefaultRoutingMark.Load())
++		routingMark := opt.routingMark
++		if routingMark == 0 {
++			routingMark = int(DefaultRoutingMark.Load())
++		}
+ 		if routingMark != 0 {
+ 			bindMarkToDialer(routingMark, dialer, network, destination)
+ 		}
+diff --git a/component/dialer/direct_dualstack_test.go b/component/dialer/direct_dualstack_test.go
+new file mode 100644
+index 00000000..ee01d4e0
+--- /dev/null
++++ b/component/dialer/direct_dualstack_test.go
+@@ -0,0 +1,454 @@
++package dialer
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"os"
++	"testing"
++	"time"
++
++	DR "github.com/metacubex/mihomo/component/directrace"
++	R "github.com/metacubex/mihomo/component/resolver"
++
++	D "github.com/miekg/dns"
++)
++
++type controlledLookup struct {
++	v4Gate  <-chan struct{}
++	v6Gate  <-chan struct{}
++	v4      []netip.Addr
++	v6      []netip.Addr
++	timeout time.Duration
++}
++
++func (r *controlledLookup) lookup(ctx context.Context, gate <-chan struct{}, ips []netip.Addr) ([]netip.Addr, error) {
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-gate:
++		return ips, nil
++	}
++}
++
++func (r *controlledLookup) LookupIP(ctx context.Context, _ string) ([]netip.Addr, error) {
++	v4, err := r.LookupIPv4(ctx, "")
++	if err != nil {
++		return nil, err
++	}
++	v6, _ := r.LookupIPv6(ctx, "")
++	return append(v4, v6...), nil
++}
++
++func (r *controlledLookup) LookupIPv4(ctx context.Context, _ string) ([]netip.Addr, error) {
++	return r.lookup(ctx, r.v4Gate, r.v4)
++}
++
++func (r *controlledLookup) LookupIPv6(ctx context.Context, _ string) ([]netip.Addr, error) {
++	return r.lookup(ctx, r.v6Gate, r.v6)
++}
++
++func (r *controlledLookup) IPv6Timeout() time.Duration { return r.timeout }
++func (r *controlledLookup) ResolveECH(context.Context, string) ([]byte, error) {
++	return nil, errors.New("not implemented")
++}
++func (r *controlledLookup) ExchangeContext(context.Context, *D.Msg) (*D.Msg, error) {
++	return nil, errors.New("not implemented")
++}
++func (r *controlledLookup) Invalid() bool    { return true }
++func (r *controlledLookup) ClearCache()      {}
++func (r *controlledLookup) ResetConnection() {}
++
++type connectBehavior struct {
++	gate <-chan struct{}
++	err  error
++}
++
++type controlledDialer struct {
++	attempts  chan netip.Addr
++	behaviors map[netip.Addr]connectBehavior
++}
++
++func (d *controlledDialer) DialContext(ctx context.Context, _, address string) (net.Conn, error) {
++	host, _, err := net.SplitHostPort(address)
++	if err != nil {
++		return nil, err
++	}
++	ip := netip.MustParseAddr(host)
++	d.attempts <- ip
++	behavior := d.behaviors[ip]
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-behavior.gate:
++		if behavior.err != nil {
++			return nil, behavior.err
++		}
++		left, right := net.Pipe()
++		_ = right.Close()
++		return left, nil
++	}
++}
++
++func closedGate() <-chan struct{} {
++	gate := make(chan struct{})
++	close(gate)
++	return gate
++}
++
++func TestMain(m *testing.M) {
++	R.DisableIPv6 = false
++	os.Exit(m.Run())
++}
++
++func receiveAttempt(t *testing.T, attempts <-chan netip.Addr) netip.Addr {
++	t.Helper()
++	select {
++	case ip := <-attempts:
++		return ip
++	case <-time.After(time.Second):
++		t.Fatal("timed out waiting for TCP attempt")
++		return netip.Addr{}
++	}
++}
++
++func runDirectRace(t *testing.T, lookup *controlledLookup, dial *controlledDialer, options ...Option) <-chan dialResult {
++	t.Helper()
++	result := make(chan dialResult, 1)
++	go func() {
++		options = append([]Option{WithResolver(lookup), WithNetDialer(dial), WithDirectDualStack()}, options...)
++		conn, err := DialContext(context.Background(), "tcp", "example.test:443", options...)
++		result <- dialResult{Conn: conn, error: err}
++	}()
++	return result
++}
++
++func requireRaceSuccess(t *testing.T, result <-chan dialResult) {
++	t.Helper()
++	select {
++	case result := <-result:
++		if result.error != nil {
++			t.Fatalf("race failed: %v", result.error)
++		}
++		_ = result.Conn.Close()
++	case <-time.After(time.Second):
++		t.Fatal("timed out waiting for race winner")
++	}
++}
++
++func TestDirectDualStackIPv4StartsBeforeAAAA(t *testing.T) {
++	v6Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	never := make(chan struct{})
++	v4a := netip.MustParseAddr("192.0.2.1")
++	v4b := netip.MustParseAddr("192.0.2.2")
++	lookup := &controlledLookup{
++		v4Gate: closedGate(), v6Gate: v6Lookup,
++		v4: []netip.Addr{v4a, v4b}, v6: []netip.Addr{netip.MustParseAddr("2001:db8::1")},
++		timeout: 200 * time.Millisecond,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4a: {gate: v4Winner},
++			v4b: {gate: never},
++		},
++	}
++	result := runDirectRace(t, lookup, dial)
++
++	seen := map[netip.Addr]bool{receiveAttempt(t, dial.attempts): true, receiveAttempt(t, dial.attempts): true}
++	if !seen[v4a] || !seen[v4b] {
++		t.Fatalf("all IPv4 addresses did not start concurrently: %v", seen)
++	}
++	close(v4Winner)
++	requireRaceSuccess(t, result)
++}
++
++func TestDirectDualStackAAAAJoinsIPv4Race(t *testing.T) {
++	v6Lookup := make(chan struct{})
++	v6Winner := make(chan struct{})
++	never := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	lookup := &controlledLookup{
++		v4Gate: closedGate(), v6Gate: v6Lookup,
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: 200 * time.Millisecond,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: never},
++			v6: {gate: v6Winner},
++		},
++	}
++	result := runDirectRace(t, lookup, dial)
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("first attempt = %s, want IPv4 %s", got, v4)
++	}
++	close(v6Lookup)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("joined attempt = %s, want IPv6 %s", got, v6)
++	}
++	close(v6Winner)
++	requireRaceSuccess(t, result)
++}
++
++func TestDirectDualStackAAAAFirstWaitsBeforeIPv4(t *testing.T) {
++	v4Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	never := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	waitBudget := 80 * time.Millisecond
++	lookup := &controlledLookup{
++		v4Gate: v4Lookup, v6Gate: closedGate(),
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: waitBudget,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++			v6: {gate: never},
++		},
++	}
++	result := runDirectRace(t, lookup, dial)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("first attempt = %s, want IPv6 %s", got, v6)
++	}
++	close(v4Lookup)
++	select {
++	case got := <-dial.attempts:
++		t.Fatalf("IPv4 %s started before ipv6-timeout", got)
++	case <-time.After(waitBudget / 2):
++	}
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("fallback attempt = %s, want IPv4 %s", got, v4)
++	}
++	close(v4Winner)
++	requireRaceSuccess(t, result)
++}
++
++func TestDirectDualStackIPv6FailureTriggersImmediateIPv4(t *testing.T) {
++	v4Lookup := make(chan struct{})
++	v6Failure := make(chan struct{})
++	v4Winner := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	waitBudget := 500 * time.Millisecond
++	lookup := &controlledLookup{
++		v4Gate: v4Lookup, v6Gate: closedGate(),
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: waitBudget,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++			v6: {gate: v6Failure, err: errors.New("unreachable")},
++		},
++	}
++	result := runDirectRace(t, lookup, dial)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("first attempt = %s, want IPv6 %s", got, v6)
++	}
++	close(v4Lookup)
++	started := time.Now()
++	close(v6Failure)
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("fallback attempt = %s, want IPv4 %s", got, v4)
++	}
++	if elapsed := time.Since(started); elapsed >= waitBudget/2 {
++		t.Fatalf("IPv4 fallback waited for timeout after explicit IPv6 failure: %v", elapsed)
++	}
++	close(v4Winner)
++	requireRaceSuccess(t, result)
++}
++
++func TestDirectPreferIPv6HoldsReadyIPv4ForIPv6(t *testing.T) {
++	v6Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	v6Winner := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	lookup := &controlledLookup{
++		v4Gate: closedGate(), v6Gate: v6Lookup,
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: 100 * time.Millisecond,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++			v6: {gate: v6Winner},
++		},
++	}
++	result := runDirectRace(t, lookup, dial, WithPreferIPv6())
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("first attempt = %s, want IPv4 %s", got, v4)
++	}
++	close(v4Winner)
++	select {
++	case early := <-result:
++		if early.Conn != nil {
++			_ = early.Conn.Close()
++		}
++		t.Fatal("ready IPv4 returned before preferred IPv6 was tested")
++	case <-time.After(20 * time.Millisecond):
++	}
++	close(v6Lookup)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("preferred attempt = %s, want IPv6 %s", got, v6)
++	}
++	close(v6Winner)
++	requireRaceSuccess(t, result)
++}
++
++func TestDirectPreferIPv6FailureUsesReadyIPv4(t *testing.T) {
++	v6Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	v6Failure := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	lookup := &controlledLookup{
++		v4Gate: closedGate(), v6Gate: v6Lookup,
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: 100 * time.Millisecond,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++			v6: {gate: v6Failure, err: errors.New("unreachable")},
++		},
++	}
++	result := runDirectRace(t, lookup, dial, WithPreferIPv6())
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("first attempt = %s, want IPv4 %s", got, v4)
++	}
++	close(v4Winner)
++	close(v6Lookup)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("preferred attempt = %s, want IPv6 %s", got, v6)
++	}
++	started := time.Now()
++	close(v6Failure)
++	requireRaceSuccess(t, result)
++	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
++		t.Fatalf("ready IPv4 was not returned immediately after IPv6 failed: %v", elapsed)
++	}
++}
++
++func TestDirectPreferIPv6LookupTimeoutUsesReadyIPv4(t *testing.T) {
++	v6Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	lookupBudget := 40 * time.Millisecond
++	lookup := &controlledLookup{
++		v4Gate: closedGate(), v6Gate: v6Lookup,
++		v4: []netip.Addr{v4}, v6: []netip.Addr{netip.MustParseAddr("2001:db8::1")}, timeout: lookupBudget,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 2),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++		},
++	}
++	result := runDirectRace(t, lookup, dial, WithPreferIPv6())
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("first attempt = %s, want IPv4 %s", got, v4)
++	}
++	started := time.Now()
++	close(v4Winner)
++	requireRaceSuccess(t, result)
++	if elapsed := time.Since(started); elapsed < lookupBudget/2 || elapsed > 200*time.Millisecond {
++		t.Fatalf("IPv4 fallback did not follow the AAAA wait budget: %v", elapsed)
++	}
++}
++
++func TestDirectPreferIPv6BlackholeUsesWarmIPv4AfterFallbackTimeout(t *testing.T) {
++	v4Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	never := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	lookup := &controlledLookup{
++		v4Gate: v4Lookup, v6Gate: closedGate(),
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: 100 * time.Millisecond,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++			v6: {gate: never},
++		},
++	}
++	result := runDirectRace(t, lookup, dial, WithPreferIPv6())
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("first attempt = %s, want IPv6 %s", got, v6)
++	}
++	close(v4Lookup)
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("fallback attempt = %s, want IPv4 %s", got, v4)
++	}
++	started := time.Now()
++	close(v4Winner)
++	requireRaceSuccess(t, result)
++	if elapsed := time.Since(started); elapsed < dualStackFallbackTimeout/2 || elapsed > dualStackFallbackTimeout+200*time.Millisecond {
++		t.Fatalf("warm IPv4 fallback did not respect preference timeout: %v", elapsed)
++	}
++}
++
++func TestDirectPreferIPv4MirrorsPreferredFamilySelection(t *testing.T) {
++	v4Lookup := make(chan struct{})
++	v4Winner := make(chan struct{})
++	v6Winner := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	lookup := &controlledLookup{
++		v4Gate: v4Lookup, v6Gate: closedGate(),
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: 100 * time.Millisecond,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Winner},
++			v6: {gate: v6Winner},
++		},
++	}
++	result := runDirectRace(t, lookup, dial, WithPreferIPv4())
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("first attempt = %s, want IPv6 fallback %s", got, v6)
++	}
++	close(v6Winner)
++	select {
++	case early := <-result:
++		if early.Conn != nil {
++			_ = early.Conn.Close()
++		}
++		t.Fatal("ready IPv6 returned before preferred IPv4 was tested")
++	case <-time.After(20 * time.Millisecond):
++	}
++	close(v4Lookup)
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("preferred attempt = %s, want IPv4 %s", got, v4)
++	}
++	close(v4Winner)
++	requireRaceSuccess(t, result)
++}
++
++var _ R.Resolver = (*controlledLookup)(nil)
++var _ NetDialer = (*controlledDialer)(nil)
++
++func TestPrioritizeDirectWinnerValidatesRRSet(t *testing.T) {
++	host := "tcp-game.example"
++	adapter := "DIRECT-tcp-test"
++	first := netip.MustParseAddr("192.0.2.70")
++	winner := netip.MustParseAddr("192.0.2.71")
++	DR.Store(host, adapter, winner)
++	ordered := prioritizeDirectWinner(host, adapter, []netip.Addr{first, winner})
++	if ordered[0] != winner || ordered[1] != first {
++		t.Fatalf("ordered = %v, want winner first", ordered)
++	}
++	unchanged := prioritizeDirectWinner(host, adapter, []netip.Addr{first})
++	if len(unchanged) != 1 || unchanged[0] != first {
++		t.Fatalf("stale winner changed RRset: %v", unchanged)
++	}
++}
+diff --git a/component/dialer/options.go b/component/dialer/options.go
+index c1c622dd..02732bc0 100644
+--- a/component/dialer/options.go
++++ b/component/dialer/options.go
+@@ -37,6 +37,8 @@ type option struct {
+ 	routingMark   int
+ 	network       int
+ 	prefer        int
++	directRace    bool
++	directAdapter string
+ 	tfo           bool
+ 	mpTcp         bool
+ 	resolver      resolver.Resolver
+@@ -87,6 +89,23 @@ func WithPreferIPv6() Option {
+ 	}
+ }
+ 
++// WithDirectDualStack enables the asynchronous A/AAAA and TCP connection race
++// used by the DIRECT outbound. It is intentionally separate from the generic
++// dual-stack dialer so DNS upstream hostnames keep their existing behavior.
++func WithDirectDualStack() Option {
++	return func(opt *option) {
++		opt.directRace = true
++	}
++}
++
++// WithDirectRacePreference identifies the DIRECT adapter whose recent ICMP
++// winner may be scheduled first after it is validated against the DNS RRset.
++func WithDirectRacePreference(adapter string) Option {
++	return func(opt *option) {
++		opt.directAdapter = adapter
++	}
++}
++
+ func WithOnlySingleStack(isIPv4 bool) Option {
+ 	return func(opt *option) {
+ 		if isIPv4 {
+diff --git a/component/dialer/options.go b/component/dialer/options.go
+index 02732bc0..78d43cf4 100644
+--- a/component/dialer/options.go
++++ b/component/dialer/options.go
+@@ -12,8 +12,14 @@ import (
+ var (
+ 	DefaultInterface   = atomic.NewTypedValue[string]("")
+ 	DefaultRoutingMark = atomic.NewInt32(0)
+-
+-	DefaultInterfaceFinder = atomic.NewTypedValue[InterfaceFinder](nil)
++	// SystemDNSRoutingMark is the active sing-tun auto-redirect output mark.
++	// It is intentionally separate from DefaultRoutingMark: ordinary direct
++	// sockets only need the global mark in mark mode, while system DNS sockets
++	// must always be identifiable as TUN-bypass traffic.
++	SystemDNSRoutingMark = atomic.NewInt32(0)
++
++	DefaultInterfaceFinder   = atomic.NewTypedValue[InterfaceFinder](nil)
++	SystemDNSInterfaceFinder = atomic.NewTypedValue[InterfaceFinder](nil)
+ )
+ 
+ type InterfaceFinder interface {
+diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
+index 0c0ac1d1..3f38c7ff 100644
+--- a/component/dialer/dialer.go
++++ b/component/dialer/dialer.go
+@@ -51,7 +51,7 @@ func DialContext(ctx context.Context, network, address string, options ...Option
+ 		network = fmt.Sprintf("%s%d", network, opt.network)
+ 	}
+ 
+-	if network == "tcp" && opt.directRace {
++	if network == "tcp" && opt.directRace && !GetTcpConcurrent() {
+ 		return directDualStackDialContext(ctx, network, address, opt)
+ 	}
+ 
+@@ -59,23 +59,41 @@ func DialContext(ctx context.Context, network, address string, options ...Option
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	host, _, _ := net.SplitHostPort(address)
+ 
+ 	tcpConcurrent := GetTcpConcurrent()
+ 
+ 	switch network {
+ 	case "tcp4", "tcp6", "udp4", "udp6":
++		var dialFn dialFunc = serialDialContext
+ 		if tcpConcurrent {
+-			return parallelDialContext(ctx, network, ips, port, opt)
++			dialFn = parallelDialContext
+ 		}
+-		return serialDialContext(ctx, network, ips, port, opt)
++		var result dialResult
++		if tcpConcurrent && strings.HasPrefix(network, "tcp") {
++			result = tcpConcurrentDialContext(ctx, network, host, ips, port, opt, dialFn)
++		} else {
++			result = dialFn(ctx, network, ips, port, opt)
++		}
++		return result.Conn, result.error
+ 	case "tcp", "udp":
+ 		if tcpConcurrent {
+-			if opt.prefer != 4 && opt.prefer != 6 {
+-				return parallelDialContext(ctx, network, ips, port, opt)
++			var fallback dialFunc = parallelDialContext
++			if opt.prefer == 4 || opt.prefer == 6 {
++				fallback = func(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult {
++					return dualStackDialContext(ctx, parallelDialContext, network, ips, port, opt)
++				}
+ 			}
+-			return dualStackDialContext(ctx, parallelDialContext, network, ips, port, opt)
++			var result dialResult
++			if network == "tcp" {
++				result = tcpConcurrentDialContext(ctx, network, host, ips, port, opt, fallback)
++			} else {
++				result = fallback(ctx, network, ips, port, opt)
++			}
++			return result.Conn, result.error
+ 		}
+-		return dualStackDialContext(ctx, serialDialContext, network, ips, port, opt)
++		result := dualStackDialContext(ctx, serialDialContext, network, ips, port, opt)
++		return result.Conn, result.error
+ 	default:
+ 		return nil, ErrorInvalidedNetworkStack
+ 	}
+@@ -570,12 +588,12 @@ func ICMPControlWithOptions(destination netip.Addr, options ...Option) func(netw
+ 	}
+ }
+ 
+-type dialFunc func(ctx context.Context, network string, ips []netip.Addr, port string, opt option) (net.Conn, error)
++type dialFunc func(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult
+ 
+-func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string, ips []netip.Addr, port string, opt option) (net.Conn, error) {
++func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string, ips []netip.Addr, port string, opt option) dialResult {
+ 	ipv4s, ipv6s := resolver.SortationAddr(ips)
+ 	if len(ipv4s) == 0 && len(ipv6s) == 0 {
+-		return nil, ErrorNoIpAddress
++		return dialResult{error: ErrorNoIpAddress}
+ 	}
+ 	if len(ipv4s) == 0 && len(ipv6s) != 0 {
+ 		return dialFn(ctx, network, ipv6s, port, opt)
+@@ -596,7 +614,8 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
+ 
+ 	racer := func(ips []netip.Addr, isPrimary bool) {
+ 		defer wg.Done()
+-		result := dialResult{isPrimary: isPrimary}
++		result := dialFn(ctx, network, ips, port, opt)
++		result.isPrimary = isPrimary
+ 		defer func() {
+ 			select {
+ 			case results <- result:
+@@ -606,7 +625,6 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
+ 				}
+ 			}
+ 		}()
+-		result.Conn, result.error = dialFn(ctx, network, ips, port, opt)
+ 	}
+ 
+ 	if len(ipv4s) != 0 {
+@@ -632,7 +650,7 @@ loop:
+ 		select {
+ 		case <-fallbackTicker.C:
+ 			if fallback.error == nil && fallback.Conn != nil {
+-				return fallback.Conn, nil
++				return fallback
+ 			}
+ 		case res, ok := <-results:
+ 			if !ok {
+@@ -645,7 +663,7 @@ loop:
+ 							_ = fallback.Conn.Close()
+ 						}()
+ 					}
+-					return res.Conn, nil
++					return res
+ 				}
+ 				fallback = res
+ 			} else {
+@@ -659,17 +677,19 @@ loop:
+ 	}
+ 
+ 	if fallback.error == nil && fallback.Conn != nil {
+-		return fallback.Conn, nil
++		return fallback
+ 	}
+-	return nil, errors.Join(errs...)
++	return dialResult{error: errors.Join(errs...)}
+ }
+ 
+-func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) (net.Conn, error) {
++func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult {
+ 	if len(ips) == 0 {
+-		return nil, ErrorNoIpAddress
++		return dialResult{error: ErrorNoIpAddress}
+ 	}
+ 	if len(ips) == 1 {
+-		return dialContext(ctx, network, ips[0], port, opt)
++		result := dialResult{ip: ips[0]}
++		result.Conn, result.error = dialContext(ctx, network, ips[0], port, opt)
++		return result
+ 	}
+ 	results := make(chan dialResult)
+ 	returned := make(chan struct{})
+@@ -695,30 +715,30 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
+ 	for i := 0; i < len(ips); i++ {
+ 		res := <-results
+ 		if res.error == nil {
+-			return res.Conn, nil
++			return res
+ 		}
+ 		errs = append(errs, res.error)
+ 	}
+ 
+ 	if len(errs) > 0 {
+-		return nil, errors.Join(errs...)
++		return dialResult{error: errors.Join(errs...)}
+ 	}
+-	return nil, os.ErrDeadlineExceeded
++	return dialResult{error: os.ErrDeadlineExceeded}
+ }
+ 
+-func serialDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) (net.Conn, error) {
++func serialDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult {
+ 	if len(ips) == 0 {
+-		return nil, ErrorNoIpAddress
++		return dialResult{error: ErrorNoIpAddress}
+ 	}
+ 	var errs []error
+ 	for _, ip := range ips {
+ 		if conn, err := dialContext(ctx, network, ip, port, opt); err == nil {
+-			return conn, nil
++			return dialResult{ip: ip, Conn: conn}
+ 		} else {
+ 			errs = append(errs, err)
+ 		}
+ 	}
+-	return nil, errors.Join(errs...)
++	return dialResult{error: errors.Join(errs...)}
+ }
+ 
+ type dialResult struct {
+diff --git a/component/dialer/tcp_concurrent_cache.go b/component/dialer/tcp_concurrent_cache.go
+new file mode 100644
+index 00000000..7a042770
+--- /dev/null
++++ b/component/dialer/tcp_concurrent_cache.go
+@@ -0,0 +1,191 @@
++package dialer
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"strings"
++	"time"
++
++	"github.com/metacubex/mihomo/common/lru"
++)
++
++const (
++	defaultTCPConcurrentCacheSize = 4096
++	defaultTCPConcurrentCacheTTL  = 30 * time.Minute
++	tcpConcurrentFastPathTimeout  = 100 * time.Millisecond
++)
++
++type tcpConcurrentCacheEntry struct {
++	winner   netip.Addr
++	expireAt time.Time
++}
++
++// TCPConcurrentCache stores the most recent successful address for a TCP
++// destination. It is deliberately independent from the DNS cache: callers
++// still have to validate a cached winner against the current DNS candidates.
++type TCPConcurrentCache struct {
++	entries *lru.LruCache[string, tcpConcurrentCacheEntry]
++	ttl     time.Duration
++	now     func() time.Time
++}
++
++// NewTCPConcurrentCache creates a bounded winner cache. Non-positive values
++// use the production defaults.
++func NewTCPConcurrentCache(maxSize int, ttl time.Duration) *TCPConcurrentCache {
++	if maxSize <= 0 {
++		maxSize = defaultTCPConcurrentCacheSize
++	}
++	if ttl <= 0 {
++		ttl = defaultTCPConcurrentCacheTTL
++	}
++	return &TCPConcurrentCache{
++		entries: lru.New(lru.WithSize[string, tcpConcurrentCacheEntry](maxSize)),
++		ttl:     ttl,
++		now:     time.Now,
++	}
++}
++
++// Get returns an unexpired cached winner.
++func (c *TCPConcurrentCache) Get(key string) (netip.Addr, bool) {
++	if c == nil || key == "" {
++		return netip.Addr{}, false
++	}
++	now := c.now()
++	entry, loaded := c.entries.Compute(key, func(entry tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
++		if !loaded || !now.Before(entry.expireAt) {
++			return tcpConcurrentCacheEntry{}, true
++		}
++		return entry, false
++	})
++	if !loaded {
++		return netip.Addr{}, false
++	}
++	return entry.winner, true
++}
++
++// Set records a successful TCP winner and starts a fresh lifetime.
++func (c *TCPConcurrentCache) Set(key string, winner netip.Addr) {
++	if c == nil || key == "" || !winner.IsValid() {
++		return
++	}
++	c.entries.Set(key, tcpConcurrentCacheEntry{
++		winner:   winner.Unmap(),
++		expireAt: c.now().Add(c.ttl),
++	})
++}
++
++// Delete removes a destination from the cache.
++func (c *TCPConcurrentCache) Delete(key string) {
++	if c == nil || key == "" {
++		return
++	}
++	c.entries.Delete(key)
++}
++
++// Clear removes every cached TCP winner.
++func (c *TCPConcurrentCache) Clear() {
++	if c == nil {
++		return
++	}
++	c.entries.Clear()
++}
++
++var tcpConcurrentCache = NewTCPConcurrentCache(0, 0)
++
++// ClearTCPConcurrentCache clears the winner cache without changing DNS cache
++// entries or DNS semantics.
++func ClearTCPConcurrentCache() {
++	tcpConcurrentCache.Clear()
++}
++
++func tcpConcurrentCacheKey(host, port, network string) (string, bool) {
++	switch network {
++	case "tcp", "tcp4", "tcp6":
++	default:
++		return "", false
++	}
++	host = strings.TrimSuffix(strings.ToLower(host), ".")
++	if host == "" {
++		return "", false
++	}
++	if _, err := netip.ParseAddr(host); err == nil {
++		return "", false
++	}
++	return net.JoinHostPort(host, port) + "/" + network, true
++}
++
++func containsTCPConcurrentCandidate(candidates []netip.Addr, winner netip.Addr) bool {
++	winner = winner.Unmap()
++	for _, candidate := range candidates {
++		if candidate.Unmap() == winner {
++			return true
++		}
++	}
++	return false
++}
++
++func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []netip.Addr, port string, opt option, fallback dialFunc) dialResult {
++	key, cacheable := tcpConcurrentCacheKey(host, port, network)
++	if !cacheable {
++		return fallback(ctx, network, ips, port, opt)
++	}
++
++	if cachedIP, loaded := tcpConcurrentCache.Get(key); loaded {
++		if !containsTCPConcurrentCandidate(ips, cachedIP) {
++			tcpConcurrentCache.Delete(key)
++		} else {
++			fastCtx, cancelFast := context.WithCancel(ctx)
++			fastResult := make(chan dialResult)
++			go func() {
++				result := dialResult{ip: cachedIP}
++				result.Conn, result.error = dialContext(fastCtx, network, cachedIP, port, opt)
++				select {
++				case fastResult <- result:
++				case <-fastCtx.Done():
++					if result.Conn != nil {
++						_ = result.Conn.Close()
++					}
++				}
++			}()
++
++			fastTimer := time.NewTimer(tcpConcurrentFastPathTimeout)
++			select {
++			case result := <-fastResult:
++				if !fastTimer.Stop() {
++					select {
++					case <-fastTimer.C:
++					default:
++					}
++				}
++				cancelFast()
++				if result.error == nil {
++					tcpConcurrentCache.Set(key, cachedIP)
++					return result
++				}
++				if ctx.Err() != nil {
++					return dialResult{error: ctx.Err()}
++				}
++				tcpConcurrentCache.Delete(key)
++			case <-fastTimer.C:
++				cancelFast()
++				tcpConcurrentCache.Delete(key)
++			case <-ctx.Done():
++				if !fastTimer.Stop() {
++					select {
++					case <-fastTimer.C:
++					default:
++					}
++				}
++				cancelFast()
++				return dialResult{error: ctx.Err()}
++			}
++		}
++	}
++
++	result := fallback(ctx, network, ips, port, opt)
++	if result.error == nil && result.ip.IsValid() {
++		tcpConcurrentCache.Set(key, result.ip)
++	}
++	return result
++}
+diff --git a/component/dialer/tcp_concurrent_cache_test.go b/component/dialer/tcp_concurrent_cache_test.go
+new file mode 100644
+index 00000000..575a95b7
+--- /dev/null
++++ b/component/dialer/tcp_concurrent_cache_test.go
+@@ -0,0 +1,472 @@
++package dialer
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"sync"
++	"testing"
++	"time"
++
++	R "github.com/metacubex/mihomo/component/resolver"
++)
++
++func TestTCPConcurrentCacheLifecycle(t *testing.T) {
++	cache := NewTCPConcurrentCache(2, 30*time.Minute)
++	now := time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC)
++	cache.now = func() time.Time { return now }
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	ipC := netip.MustParseAddr("192.0.2.3")
++
++	cache.Set("a:443/tcp", ipA)
++	cache.Set("b:443/tcp", ipB)
++	if winner, loaded := cache.Get("a:443/tcp"); !loaded || winner != ipA {
++		t.Fatalf("Get(a) = %s, %v; want %s, true", winner, loaded, ipA)
++	}
++
++	// Reading a makes b the least-recently used entry.
++	cache.Set("c:443/tcp", ipC)
++	if _, loaded := cache.Get("b:443/tcp"); loaded {
++		t.Fatal("least-recently used entry was not evicted")
++	}
++
++	cache.Delete("a:443/tcp")
++	if _, loaded := cache.Get("a:443/tcp"); loaded {
++		t.Fatal("deleted entry still exists")
++	}
++
++	cache.Clear()
++	if _, loaded := cache.Get("c:443/tcp"); loaded {
++		t.Fatal("cleared entry still exists")
++	}
++}
++
++func TestTCPConcurrentCacheExpirationAndRefresh(t *testing.T) {
++	cache := NewTCPConcurrentCache(2, 30*time.Minute)
++	now := time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC)
++	cache.now = func() time.Time { return now }
++	key := "example.test:443/tcp"
++	ip := netip.MustParseAddr("192.0.2.1")
++
++	cache.Set(key, ip)
++	now = now.Add(20 * time.Minute)
++	cache.Set(key, ip)
++	now = now.Add(20 * time.Minute)
++	if winner, loaded := cache.Get(key); !loaded || winner != ip {
++		t.Fatalf("refreshed entry = %s, %v; want %s, true", winner, loaded, ip)
++	}
++
++	now = now.Add(11 * time.Minute)
++	if _, loaded := cache.Get(key); loaded {
++		t.Fatal("expired entry was returned")
++	}
++}
++
++func TestTCPConcurrentCacheKey(t *testing.T) {
++	key, cacheable := tcpConcurrentCacheKey("WWW.Example.COM.", "443", "tcp")
++	if !cacheable || key != "www.example.com:443/tcp" {
++		t.Fatalf("cache key = %q, %v", key, cacheable)
++	}
++	if _, cacheable := tcpConcurrentCacheKey("192.0.2.1", "443", "tcp"); cacheable {
++		t.Fatal("literal IP should not be cached")
++	}
++	if _, cacheable := tcpConcurrentCacheKey("example.com", "443", "udp"); cacheable {
++		t.Fatal("UDP destination should not be cached")
++	}
++}
++
++type testDialBehavior struct {
++	release <-chan struct{}
++	err     error
++}
++
++type testTCPDialer struct {
++	mu        sync.Mutex
++	behaviors map[netip.Addr][]testDialBehavior
++	counts    map[netip.Addr]int
++	attempts  chan netip.Addr
++}
++
++type staticTestResolver struct {
++	R.Resolver
++	ips []netip.Addr
++}
++
++func (r *staticTestResolver) LookupIP(context.Context, string) ([]netip.Addr, error) {
++	return r.ips, nil
++}
++
++func (r *staticTestResolver) LookupIPv4(context.Context, string) ([]netip.Addr, error) {
++	var ips []netip.Addr
++	for _, ip := range r.ips {
++		if ip.Unmap().Is4() {
++			ips = append(ips, ip)
++		}
++	}
++	return ips, nil
++}
++
++func (r *staticTestResolver) LookupIPv6(context.Context, string) ([]netip.Addr, error) {
++	var ips []netip.Addr
++	for _, ip := range r.ips {
++		if ip.Unmap().Is6() {
++			ips = append(ips, ip)
++		}
++	}
++	return ips, nil
++}
++
++func (r *staticTestResolver) Invalid() bool { return true }
++
++func newTestTCPDialer(behaviors map[netip.Addr][]testDialBehavior) *testTCPDialer {
++	return &testTCPDialer{
++		behaviors: behaviors,
++		counts:    make(map[netip.Addr]int),
++		attempts:  make(chan netip.Addr, 32),
++	}
++}
++
++func (d *testTCPDialer) DialContext(ctx context.Context, _, address string) (net.Conn, error) {
++	host, _, err := net.SplitHostPort(address)
++	if err != nil {
++		return nil, err
++	}
++	ip := netip.MustParseAddr(host).Unmap()
++
++	d.mu.Lock()
++	index := d.counts[ip]
++	d.counts[ip]++
++	behaviors := d.behaviors[ip]
++	behavior := testDialBehavior{err: errors.New("unexpected TCP attempt")}
++	if len(behaviors) > 0 {
++		if index >= len(behaviors) {
++			index = len(behaviors) - 1
++		}
++		behavior = behaviors[index]
++	}
++	d.mu.Unlock()
++	d.attempts <- ip
++
++	if behavior.release == nil {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	}
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case <-behavior.release:
++	}
++	if behavior.err != nil {
++		return nil, behavior.err
++	}
++	client, peer := net.Pipe()
++	_ = peer.Close()
++	return client, nil
++}
++
++func (d *testTCPDialer) count(ip netip.Addr) int {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return d.counts[ip]
++}
++
++func closedTestGate() <-chan struct{} {
++	gate := make(chan struct{})
++	close(gate)
++	return gate
++}
++
++func installTestTCPConcurrentCache(t *testing.T) *TCPConcurrentCache {
++	t.Helper()
++	previous := tcpConcurrentCache
++	cache := NewTCPConcurrentCache(32, 30*time.Minute)
++	tcpConcurrentCache = cache
++	t.Cleanup(func() { tcpConcurrentCache = previous })
++	return cache
++}
++
++func mustTCPConcurrentCacheKey(t *testing.T, host, port, network string) string {
++	t.Helper()
++	key, cacheable := tcpConcurrentCacheKey(host, port, network)
++	if !cacheable {
++		t.Fatalf("destination %s:%s/%s is not cacheable", host, port, network)
++	}
++	return key
++}
++
++func waitForAttemptCount(t *testing.T, dialer *testTCPDialer, ip netip.Addr, want int) {
++	t.Helper()
++	deadline := time.NewTimer(time.Second)
++	defer deadline.Stop()
++	ticker := time.NewTicker(time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if dialer.count(ip) >= want {
++			return
++		}
++		select {
++		case <-deadline.C:
++			t.Fatalf("attempt count for %s = %d, want at least %d", ip, dialer.count(ip), want)
++		case <-ticker.C:
++		}
++	}
++}
++
++func TestDirectDialContextUsesTCPConcurrentCache(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	previousConcurrent := GetTcpConcurrent()
++	SetTcpConcurrent(true)
++	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	cache.Set(key, ipB)
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: closedTestGate()}},
++		ipB: {{release: closedTestGate()}},
++	})
++
++	conn, err := DialContext(
++		context.Background(),
++		"tcp",
++		"example.test:443",
++		WithDirectDualStack(),
++		WithResolver(&staticTestResolver{ips: []netip.Addr{ipA, ipB}}),
++		WithNetDialer(dialer),
++	)
++	if err != nil {
++		t.Fatalf("DialContext failed: %v", err)
++	}
++	_ = conn.Close()
++	if dialer.count(ipA) != 0 || dialer.count(ipB) != 1 {
++		t.Fatalf("attempt counts = A:%d B:%d; want A:0 B:1", dialer.count(ipA), dialer.count(ipB))
++	}
++}
++
++func TestTCPConcurrentCacheMissStoresFullRaceWinner(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	blocked := make(chan struct{})
++	var releaseOnce sync.Once
++	releaseBlocked := func() { releaseOnce.Do(func() { close(blocked) }) }
++	t.Cleanup(releaseBlocked)
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	ipC := netip.MustParseAddr("192.0.2.3")
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: blocked}},
++		ipB: {{release: blocked}},
++		ipC: {{release: closedTestGate()}},
++	})
++
++	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB, ipC}, "443", option{netDialer: dialer}, parallelDialContext)
++	if result.error != nil || result.ip != ipC {
++		t.Fatalf("race result = %s, %v; want %s, nil", result.ip, result.error, ipC)
++	}
++	_ = result.Conn.Close()
++	waitForAttemptCount(t, dialer, ipA, 1)
++	waitForAttemptCount(t, dialer, ipB, 1)
++	waitForAttemptCount(t, dialer, ipC, 1)
++	releaseBlocked()
++
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	if winner, loaded := cache.Get(key); !loaded || winner != ipC {
++		t.Fatalf("cached winner = %s, %v; want %s, true", winner, loaded, ipC)
++	}
++}
++
++func TestTCPConcurrentCacheHitUsesOnlyFastPathAndRefreshes(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	now := time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC)
++	cache.now = func() time.Time { return now }
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	cache.Set(key, ipB)
++	now = now.Add(20 * time.Minute)
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: closedTestGate()}},
++		ipB: {{release: closedTestGate()}},
++	})
++
++	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB}, "443", option{netDialer: dialer}, parallelDialContext)
++	if result.error != nil || result.ip != ipB {
++		t.Fatalf("fast-path result = %s, %v; want %s, nil", result.ip, result.error, ipB)
++	}
++	_ = result.Conn.Close()
++	if dialer.count(ipA) != 0 || dialer.count(ipB) != 1 {
++		t.Fatalf("attempt counts = A:%d B:%d; want A:0 B:1", dialer.count(ipA), dialer.count(ipB))
++	}
++
++	now = now.Add(20 * time.Minute)
++	if winner, loaded := cache.Get(key); !loaded || winner != ipB {
++		t.Fatalf("refreshed winner = %s, %v; want %s, true", winner, loaded, ipB)
++	}
++}
++
++func TestTCPConcurrentFastPathErrorFallsBackImmediately(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	blocked := make(chan struct{})
++	var releaseOnce sync.Once
++	releaseBlocked := func() { releaseOnce.Do(func() { close(blocked) }) }
++	t.Cleanup(releaseBlocked)
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	ipC := netip.MustParseAddr("192.0.2.3")
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	cache.Set(key, ipB)
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: blocked}},
++		ipB: {
++			{release: closedTestGate(), err: errors.New("cached address failed")},
++			{release: blocked},
++		},
++		ipC: {{release: closedTestGate()}},
++	})
++
++	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB, ipC}, "443", option{netDialer: dialer}, parallelDialContext)
++	if result.error != nil || result.ip != ipC {
++		t.Fatalf("fallback result = %s, %v; want %s, nil", result.ip, result.error, ipC)
++	}
++	_ = result.Conn.Close()
++	waitForAttemptCount(t, dialer, ipA, 1)
++	waitForAttemptCount(t, dialer, ipB, 2)
++	waitForAttemptCount(t, dialer, ipC, 1)
++	releaseBlocked()
++	if winner, loaded := cache.Get(key); !loaded || winner != ipC {
++		t.Fatalf("replacement winner = %s, %v; want %s, true", winner, loaded, ipC)
++	}
++}
++
++func TestTCPConcurrentFastPathTimeoutFallsBackToAllCandidates(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	blocked := make(chan struct{})
++	var releaseOnce sync.Once
++	releaseBlocked := func() { releaseOnce.Do(func() { close(blocked) }) }
++	t.Cleanup(releaseBlocked)
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	ipC := netip.MustParseAddr("192.0.2.3")
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	cache.Set(key, ipB)
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: blocked}},
++		ipB: {
++			{release: nil},
++			{release: blocked},
++		},
++		ipC: {{release: closedTestGate()}},
++	})
++
++	resultChannel := make(chan dialResult, 1)
++	started := time.Now()
++	go func() {
++		resultChannel <- tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB, ipC}, "443", option{netDialer: dialer}, parallelDialContext)
++	}()
++	select {
++	case first := <-dialer.attempts:
++		if first != ipB {
++			t.Fatalf("first attempt = %s, want cached %s", first, ipB)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("cached fast path did not start")
++	}
++	select {
++	case attempt := <-dialer.attempts:
++		t.Fatalf("fallback attempt %s started before fast-path timeout", attempt)
++	case <-time.After(tcpConcurrentFastPathTimeout / 2):
++	}
++
++	var result dialResult
++	select {
++	case result = <-resultChannel:
++	case <-time.After(time.Second):
++		t.Fatal("fallback did not produce a result")
++	}
++	if result.error != nil || result.ip != ipC {
++		t.Fatalf("fallback result = %s, %v; want %s, nil", result.ip, result.error, ipC)
++	}
++	_ = result.Conn.Close()
++	if elapsed := time.Since(started); elapsed < tcpConcurrentFastPathTimeout {
++		t.Fatalf("fallback started too early: %s", elapsed)
++	}
++	waitForAttemptCount(t, dialer, ipA, 1)
++	waitForAttemptCount(t, dialer, ipB, 2)
++	waitForAttemptCount(t, dialer, ipC, 1)
++	releaseBlocked()
++	if winner, loaded := cache.Get(key); !loaded || winner != ipC {
++		t.Fatalf("replacement winner = %s, %v; want %s, true", winner, loaded, ipC)
++	}
++}
++
++func TestTCPConcurrentCachedWinnerMustRemainCandidate(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	blocked := make(chan struct{})
++	var releaseOnce sync.Once
++	releaseBlocked := func() { releaseOnce.Do(func() { close(blocked) }) }
++	t.Cleanup(releaseBlocked)
++	ipA := netip.MustParseAddr("192.0.2.1")
++	staleIP := netip.MustParseAddr("192.0.2.2")
++	ipC := netip.MustParseAddr("192.0.2.3")
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	cache.Set(key, staleIP)
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: blocked}},
++		ipC: {{release: closedTestGate()}},
++	})
++
++	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipC}, "443", option{netDialer: dialer}, parallelDialContext)
++	if result.error != nil || result.ip != ipC {
++		t.Fatalf("fallback result = %s, %v; want %s, nil", result.ip, result.error, ipC)
++	}
++	_ = result.Conn.Close()
++	waitForAttemptCount(t, dialer, ipA, 1)
++	waitForAttemptCount(t, dialer, ipC, 1)
++	releaseBlocked()
++	if dialer.count(staleIP) != 0 {
++		t.Fatalf("stale cached address was dialed %d times", dialer.count(staleIP))
++	}
++	if winner, loaded := cache.Get(key); !loaded || winner != ipC {
++		t.Fatalf("replacement winner = %s, %v; want %s, true", winner, loaded, ipC)
++	}
++}
++
++func TestTCPConcurrentDoesNotCacheFailedFallback(t *testing.T) {
++	cache := installTestTCPConcurrentCache(t)
++	ipA := netip.MustParseAddr("192.0.2.1")
++	ipB := netip.MustParseAddr("192.0.2.2")
++	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
++	cache.Set(key, ipB)
++	failure := errors.New("dial failed")
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipA: {{release: closedTestGate(), err: failure}},
++		ipB: {
++			{release: closedTestGate(), err: failure},
++			{release: closedTestGate(), err: failure},
++		},
++	})
++
++	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB}, "443", option{netDialer: dialer}, parallelDialContext)
++	if result.error == nil {
++		t.Fatal("failed full race returned nil error")
++	}
++	if _, loaded := cache.Get(key); loaded {
++		t.Fatal("failed fallback left a cached winner")
++	}
++}
++
++func TestDualStackConcurrentReturnsPreferredWinnerIP(t *testing.T) {
++	ipv4 := netip.MustParseAddr("192.0.2.1")
++	ipv6 := netip.MustParseAddr("2001:db8::1")
++	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
++		ipv4: {{release: closedTestGate()}},
++		ipv6: {{release: closedTestGate()}},
++	})
++
++	result := dualStackDialContext(context.Background(), parallelDialContext, "tcp", []netip.Addr{ipv4, ipv6}, "443", option{netDialer: dialer, prefer: 6})
++	if result.error != nil || result.ip != ipv6 {
++		t.Fatalf("dual-stack result = %s, %v; want %s, nil", result.ip, result.error, ipv6)
++	}
++	_ = result.Conn.Close()
++}

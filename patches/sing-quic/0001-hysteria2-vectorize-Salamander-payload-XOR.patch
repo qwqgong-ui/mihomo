@@ -1,0 +1,312 @@
+From c8b9c339b20059e3805dfa34a4ad605839c76a50 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Mon, 10 Aug 2026 17:02:34 +0800
+Subject: [PATCH] hysteria2: vectorize Salamander payload XOR
+
+Use AVX2 on supported amd64 CPUs and NEON on arm64 to process the repeating 32-byte BLAKE2b key one vector block at a time. Keep a scalar fallback for other architectures and purego builds.
+
+The helper accepts separate, in-place, and forward-overlapping buffers so Salamander can decrypt while removing its salt without adding a memmove. Gecko automatically uses the same path through its wrapped Salamander PacketConn.
+---
+ go.mod                   |  3 +-
+ go.sum                   |  2 ++
+ hysteria2/salamander.go  | 10 ++-----
+ hysteria2/xor.go         |  9 ++++++
+ hysteria2/xor_amd64.go   | 24 +++++++++++++++
+ hysteria2/xor_amd64.s    | 23 +++++++++++++++
+ hysteria2/xor_arm64.go   | 22 ++++++++++++++
+ hysteria2/xor_arm64.s    | 20 +++++++++++++
+ hysteria2/xor_generic.go | 10 +++++++
+ hysteria2/xor_test.go    | 63 ++++++++++++++++++++++++++++++++++++++++
+ 10 files changed, 178 insertions(+), 8 deletions(-)
+ create mode 100644 hysteria2/xor.go
+ create mode 100644 hysteria2/xor_amd64.go
+ create mode 100644 hysteria2/xor_amd64.s
+ create mode 100644 hysteria2/xor_arm64.go
+ create mode 100644 hysteria2/xor_arm64.s
+ create mode 100644 hysteria2/xor_generic.go
+ create mode 100644 hysteria2/xor_test.go
+
+diff --git a/go.mod b/go.mod
+index d454e4c..0710064 100644
+--- a/go.mod
++++ b/go.mod
+@@ -10,6 +10,8 @@ require (
+ 	github.com/metacubex/tls v0.1.0
+ 	golang.org/x/crypto v0.33.0
+ 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e
++	golang.org/x/sync v0.11.0
++	golang.org/x/sys v0.30.0
+ )
+ 
+ require (
+@@ -19,6 +21,5 @@ require (
+ 	github.com/metacubex/mlkem v0.1.0 // indirect
+ 	github.com/metacubex/qpack v0.6.0 // indirect
+ 	golang.org/x/net v0.35.0 // indirect
+-	golang.org/x/sys v0.30.0 // indirect
+ 	golang.org/x/text v0.22.0 // indirect
+ )
+diff --git a/go.sum b/go.sum
+index db50da3..22b37f3 100644
+--- a/go.sum
++++ b/go.sum
+@@ -28,6 +28,8 @@ golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e h1:I88y4caeGeuDQxgdoFPUq097j
+ golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e/go.mod h1:akd2r19cwCdwSwWeIdzYQGa/EZZyqcOdwWiwj5L5eKQ=
+ golang.org/x/net v0.35.0 h1:T5GQRQb2y08kTAByq9L4/bz8cipCdA8FbRTXewonqY8=
+ golang.org/x/net v0.35.0/go.mod h1:EglIi67kWsHKlRzzVMUD93VMSWGFOMSZgxFjparz1Qk=
++golang.org/x/sync v0.11.0 h1:GGz8+XQP4FvTTrjZPzNKTMFtSXH80RAzG+5ghFPgK9w=
++golang.org/x/sync v0.11.0/go.mod h1:Czt+wKu1gCyEFDUtn0jG5QVvpJ6rzVqr5aXyt9drQfk=
+ golang.org/x/sys v0.30.0 h1:QjkSwP/36a20jFYWkSue1YwXzLmsV5Gfq7Eiy72C1uc=
+ golang.org/x/sys v0.30.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=
+ golang.org/x/text v0.22.0 h1:bofq7m3/HAFvbF51jz3Q9wLg3jkvSPuiZu/pD1XwgtM=
+diff --git a/hysteria2/salamander.go b/hysteria2/salamander.go
+index 4868ee8..7e1e3a9 100644
+--- a/hysteria2/salamander.go
++++ b/hysteria2/salamander.go
+@@ -3,7 +3,6 @@ package hysteria2
+ import (
+ 	"net"
+ 
+-	"github.com/metacubex/sing/common"
+ 	"github.com/metacubex/sing/common/buf"
+ 
+ 	"golang.org/x/crypto/blake2b"
+@@ -35,9 +34,7 @@ func (s *SalamanderPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err err
+ 		return
+ 	}
+ 	key := blake2b.Sum256(append(s.password, p[:salamanderSaltLen]...))
+-	for index, c := range p[salamanderSaltLen:n] {
+-		p[index] = c ^ key[index%blake2b.Size256]
+-	}
++	xorKeyStream(p[:n-salamanderSaltLen], p[salamanderSaltLen:n], &key)
+ 	return n - salamanderSaltLen, addr, nil
+ }
+ 
+@@ -46,9 +43,8 @@ func (s *SalamanderPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
+ 	defer buffer.Release()
+ 	buffer.WriteRandom(salamanderSaltLen)
+ 	key := blake2b.Sum256(append(s.password, buffer.Bytes()...))
+-	for index, c := range p {
+-		common.Must(buffer.WriteByte(c ^ key[index%blake2b.Size256]))
+-	}
++	payload := buffer.Extend(len(p))
++	xorKeyStream(payload, p, &key)
+ 	_, err = s.PacketConn.WriteTo(buffer.Bytes(), addr)
+ 	if err != nil {
+ 		return
+diff --git a/hysteria2/xor.go b/hysteria2/xor.go
+new file mode 100644
+index 0000000..887fcf3
+--- /dev/null
++++ b/hysteria2/xor.go
+@@ -0,0 +1,9 @@
++package hysteria2
++
++const xorKeySize = 32
++
++func xorKeyStreamGeneric(dst, src []byte, key *[xorKeySize]byte) {
++	for i, c := range src {
++		dst[i] = c ^ key[i&(xorKeySize-1)]
++	}
++}
+diff --git a/hysteria2/xor_amd64.go b/hysteria2/xor_amd64.go
+new file mode 100644
+index 0000000..2f35fbd
+--- /dev/null
++++ b/hysteria2/xor_amd64.go
+@@ -0,0 +1,24 @@
++//go:build amd64 && !purego
++
++package hysteria2
++
++import "golang.org/x/sys/cpu"
++
++func xorKeyStream(dst, src []byte, key *[xorKeySize]byte) {
++	if len(dst) != len(src) {
++		panic("hysteria2: xor source and destination length mismatch")
++	}
++	if !cpu.X86.HasAVX2 || len(src) < xorKeySize {
++		xorKeyStreamGeneric(dst, src, key)
++		return
++	}
++
++	blocksLen := len(src) &^ (xorKeySize - 1)
++	xorBlocksAVX2(&dst[0], &src[0], blocksLen, key)
++	if blocksLen != len(src) {
++		xorKeyStreamGeneric(dst[blocksLen:], src[blocksLen:], key)
++	}
++}
++
++//go:noescape
++func xorBlocksAVX2(dst, src *byte, n int, key *[xorKeySize]byte)
+diff --git a/hysteria2/xor_amd64.s b/hysteria2/xor_amd64.s
+new file mode 100644
+index 0000000..3de3811
+--- /dev/null
++++ b/hysteria2/xor_amd64.s
+@@ -0,0 +1,23 @@
++//go:build amd64 && !purego
++
++#include "textflag.h"
++
++// func xorBlocksAVX2(dst, src *byte, n int, key *[32]byte)
++TEXT ·xorBlocksAVX2(SB), NOSPLIT, $0-32
++	MOVQ dst+0(FP), DI
++	MOVQ src+8(FP), SI
++	MOVQ n+16(FP), CX
++	MOVQ key+24(FP), AX
++	VMOVDQU (AX), Y0
++
++loop:
++	VMOVDQU (SI), Y1
++	VPXOR Y0, Y1, Y1
++	VMOVDQU Y1, (DI)
++	ADDQ $32, SI
++	ADDQ $32, DI
++	SUBQ $32, CX
++	JNZ loop
++
++	VZEROUPPER
++	RET
+diff --git a/hysteria2/xor_arm64.go b/hysteria2/xor_arm64.go
+new file mode 100644
+index 0000000..f0cd478
+--- /dev/null
++++ b/hysteria2/xor_arm64.go
+@@ -0,0 +1,22 @@
++//go:build arm64 && !purego
++
++package hysteria2
++
++func xorKeyStream(dst, src []byte, key *[xorKeySize]byte) {
++	if len(dst) != len(src) {
++		panic("hysteria2: xor source and destination length mismatch")
++	}
++	if len(src) < xorKeySize {
++		xorKeyStreamGeneric(dst, src, key)
++		return
++	}
++
++	blocksLen := len(src) &^ (xorKeySize - 1)
++	xorBlocksNEON(&dst[0], &src[0], blocksLen, key)
++	if blocksLen != len(src) {
++		xorKeyStreamGeneric(dst[blocksLen:], src[blocksLen:], key)
++	}
++}
++
++//go:noescape
++func xorBlocksNEON(dst, src *byte, n int, key *[xorKeySize]byte)
+diff --git a/hysteria2/xor_arm64.s b/hysteria2/xor_arm64.s
+new file mode 100644
+index 0000000..cea13e9
+--- /dev/null
++++ b/hysteria2/xor_arm64.s
+@@ -0,0 +1,20 @@
++//go:build arm64 && !purego
++
++#include "textflag.h"
++
++// func xorBlocksNEON(dst, src *byte, n int, key *[32]byte)
++TEXT ·xorBlocksNEON(SB), NOSPLIT, $0-32
++	MOVD dst+0(FP), R0
++	MOVD src+8(FP), R1
++	MOVD n+16(FP), R2
++	MOVD key+24(FP), R3
++	VLD1 (R3), [V0.B16, V1.B16]
++
++loop:
++	VLD1.P 32(R1), [V2.B16, V3.B16]
++	VEOR V0.B16, V2.B16, V2.B16
++	VEOR V1.B16, V3.B16, V3.B16
++	VST1.P [V2.B16, V3.B16], 32(R0)
++	SUBS $32, R2
++	BNE loop
++	RET
+diff --git a/hysteria2/xor_generic.go b/hysteria2/xor_generic.go
+new file mode 100644
+index 0000000..a10d678
+--- /dev/null
++++ b/hysteria2/xor_generic.go
+@@ -0,0 +1,10 @@
++//go:build (!amd64 && !arm64) || purego
++
++package hysteria2
++
++func xorKeyStream(dst, src []byte, key *[xorKeySize]byte) {
++	if len(dst) != len(src) {
++		panic("hysteria2: xor source and destination length mismatch")
++	}
++	xorKeyStreamGeneric(dst, src, key)
++}
+diff --git a/hysteria2/xor_test.go b/hysteria2/xor_test.go
+new file mode 100644
+index 0000000..1faaa75
+--- /dev/null
++++ b/hysteria2/xor_test.go
+@@ -0,0 +1,63 @@
++package hysteria2
++
++import (
++	"bytes"
++	"math/rand"
++	"strconv"
++	"testing"
++)
++
++func TestXorKeyStream(t *testing.T) {
++	var key [xorKeySize]byte
++	for i := range key {
++		key[i] = byte(i*7 + 3)
++	}
++
++	for n := 0; n <= 4096; n++ {
++		src := make([]byte, n)
++		_, _ = rand.New(rand.NewSource(int64(n))).Read(src)
++		want := make([]byte, n)
++		xorKeyStreamGeneric(want, src, &key)
++
++		got := make([]byte, n)
++		xorKeyStream(got, src, &key)
++		if !bytes.Equal(got, want) {
++			t.Fatalf("separate buffers, length %d: result mismatch", n)
++		}
++
++		got = bytes.Clone(src)
++		xorKeyStream(got, got, &key)
++		if !bytes.Equal(got, want) {
++			t.Fatalf("in-place, length %d: result mismatch", n)
++		}
++
++		got = make([]byte, n+salamanderSaltLen)
++		copy(got[salamanderSaltLen:], src)
++		xorKeyStream(got[:n], got[salamanderSaltLen:], &key)
++		if !bytes.Equal(got[:n], want) {
++			t.Fatalf("overlap, length %d: result mismatch", n)
++		}
++	}
++}
++
++func BenchmarkXorKeyStream(b *testing.B) {
++	var key [xorKeySize]byte
++	for _, size := range []int{300, 1200, 4096} {
++		src := make([]byte, size)
++		dst := make([]byte, size)
++		b.Run(strconv.Itoa(size), func(b *testing.B) {
++			b.Run("dispatch", func(b *testing.B) {
++				b.SetBytes(int64(size))
++				for i := 0; i < b.N; i++ {
++					xorKeyStream(dst, src, &key)
++				}
++			})
++			b.Run("generic", func(b *testing.B) {
++				b.SetBytes(int64(size))
++				for i := 0; i < b.N; i++ {
++					xorKeyStreamGeneric(dst, src, &key)
++				}
++			})
++		})
++	}
++}
+-- 
+2.55.0
+

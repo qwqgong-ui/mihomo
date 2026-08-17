@@ -1,0 +1,31 @@
+# Functions:
+# - DIRECT dual-stack DNS race timing
+#
+diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
+index e87a9103..3de37ee7 100644
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -55,6 +55,23 @@ type Resolver interface {
+ 	ResetConnection()
+ }
+ 
++const defaultIPv6Timeout = 100 * time.Millisecond
++
++// IPv6Timeout returns the resolver's AAAA wait budget. Resolver
++// implementations that do not expose one retain LookupIP's historical 100ms
++// default.
++func IPv6Timeout(r Resolver) time.Duration {
++	type timeoutProvider interface {
++		IPv6Timeout() time.Duration
++	}
++	if provider, ok := r.(timeoutProvider); ok {
++		if timeout := provider.IPv6Timeout(); timeout > 0 {
++			return timeout
++		}
++	}
++	return defaultIPv6Timeout
++}
++
+ // LookupIPv4WithResolver same as LookupIPv4, but with a resolver
+ func LookupIPv4WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+ 	if node, ok := DefaultHosts.Search(host, false); ok {
