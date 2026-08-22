@@ -1,0 +1,27 @@
+From 08631c51e2819dea08196664de5be16f51dec91c Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Mon, 10 Aug 2026 17:19:38 +0800
+Subject: [PATCH] hysteria2: use local BLAKE2b dispatch
+
+---
+ hysteria2/salamander.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/hysteria2/salamander.go b/hysteria2/salamander.go
+index 7e1e3a9..3926c9b 100644
+--- a/hysteria2/salamander.go
++++ b/hysteria2/salamander.go
+@@ -3,9 +3,9 @@ package hysteria2
+ import (
+ 	"net"
+ 
++	"github.com/metacubex/sing-quic/hysteria2/internal/blake2b"
+ 	"github.com/metacubex/sing/common/buf"
+ 
+-	"golang.org/x/crypto/blake2b"
+ 	"golang.org/x/exp/slices"
+ )
+ 
+-- 
+2.55.0
+

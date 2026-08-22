@@ -1,0 +1,114 @@
+# Functions:
+# - Optional protocol build tags
+#
+diff --git a/constant/features/no_mieru.go b/constant/features/no_mieru.go
+new file mode 100644
+index 0000000..7045f42
+--- /dev/null
++++ b/constant/features/no_mieru.go
+@@ -0,0 +1,5 @@
++//go:build no_mieru
++
++package features
++
++const NoMieru = true
+diff --git a/constant/features/no_mieru_stub.go b/constant/features/no_mieru_stub.go
+new file mode 100644
+index 0000000..b492ca3
+--- /dev/null
++++ b/constant/features/no_mieru_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_mieru
++
++package features
++
++const NoMieru = false
+diff --git a/constant/features/no_openvpn.go b/constant/features/no_openvpn.go
+new file mode 100644
+index 0000000..4554aec
+--- /dev/null
++++ b/constant/features/no_openvpn.go
+@@ -0,0 +1,5 @@
++//go:build no_openvpn
++
++package features
++
++const NoOpenVPN = true
+diff --git a/constant/features/no_openvpn_stub.go b/constant/features/no_openvpn_stub.go
+new file mode 100644
+index 0000000..26d1218
+--- /dev/null
++++ b/constant/features/no_openvpn_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_openvpn
++
++package features
++
++const NoOpenVPN = false
+diff --git a/constant/features/no_sudoku.go b/constant/features/no_sudoku.go
+new file mode 100644
+index 0000000..e2536cb
+--- /dev/null
++++ b/constant/features/no_sudoku.go
+@@ -0,0 +1,5 @@
++//go:build no_sudoku
++
++package features
++
++const NoSudoku = true
+diff --git a/constant/features/no_sudoku_stub.go b/constant/features/no_sudoku_stub.go
+new file mode 100644
+index 0000000..5ba28d1
+--- /dev/null
++++ b/constant/features/no_sudoku_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_sudoku
++
++package features
++
++const NoSudoku = false
+diff --git a/constant/features/no_wireguard.go b/constant/features/no_wireguard.go
+new file mode 100644
+index 0000000..be7ec32
+--- /dev/null
++++ b/constant/features/no_wireguard.go
+@@ -0,0 +1,5 @@
++//go:build no_wireguard
++
++package features
++
++const NoWireGuard = true
+diff --git a/constant/features/no_wireguard_stub.go b/constant/features/no_wireguard_stub.go
+new file mode 100644
+index 0000000..cf75b59
+--- /dev/null
++++ b/constant/features/no_wireguard_stub.go
+@@ -0,0 +1,5 @@
++//go:build !no_wireguard
++
++package features
++
++const NoWireGuard = false
+diff --git a/constant/features/tags.go b/constant/features/tags.go
+index 524c4d7..83a89db 100644
+--- a/constant/features/tags.go
++++ b/constant/features/tags.go
+@@ -16,6 +16,18 @@ func Tags() (tags []string) {
+ 	if NoZeroTier {
+ 		tags = append(tags, "no_zerotier")
+ 	}
++	if NoWireGuard {
++		tags = append(tags, "no_wireguard")
++	}
++	if NoOpenVPN {
++		tags = append(tags, "no_openvpn")
++	}
++	if NoMieru {
++		tags = append(tags, "no_mieru")
++	}
++	if NoSudoku {
++		tags = append(tags, "no_sudoku")
++	}
+ 	if WithGVisor {
+ 		tags = append(tags, "with_gvisor")
+ 	}

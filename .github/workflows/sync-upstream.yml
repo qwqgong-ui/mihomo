@@ -1,0 +1,90 @@
+name: Sync upstream Alpha
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-alpha
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      mihomo_commit: ${{ steps.publish.outputs.mihomo_commit }}
+    steps:
+      - name: Check out Alpha
+        uses: actions/checkout@v6
+        with:
+          ref: Alpha
+          fetch-depth: 0
+
+      - name: Reset to upstream and restore local files
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/MetaCubeX/mihomo.git
+          git fetch --no-tags upstream Alpha
+
+          upstream_sha="$(git rev-parse upstream/Alpha)"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            current_sha="$(git rev-parse HEAD)"
+            echo "Alpha already contains upstream ${upstream_sha:0:8}."
+            echo "mihomo_commit=$current_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          backup="$(mktemp -d)"
+          trap 'rm -rf "$backup"' EXIT
+
+          mkdir -p "$backup" "$backup/workflows"
+          cp -a patches "$backup/"
+          cp -a SKILL.md "$backup/"
+          cp -a .github/workflows/build.yml "$backup/workflows/"
+          cp -a .github/workflows/trigger-androidcyaml-update.yml "$backup/workflows/"
+          cp -a .github/workflows/sync-upstream.yml "$backup/workflows/"
+
+          git reset --hard upstream/Alpha
+          git clean -fdx
+
+          mkdir -p patches .github/workflows
+          cp -a "$backup/patches/." patches/
+          cp -a "$backup/SKILL.md" SKILL.md
+          cp -a "$backup/workflows/build.yml" .github/workflows/
+          cp -a "$backup/workflows/trigger-androidcyaml-update.yml" .github/workflows/
+          cp -a "$backup/workflows/sync-upstream.yml" .github/workflows/
+
+          # CMFA integration is intentionally disabled downstream.
+          rm -f .github/workflows/trigger-cmfa-update.yml
+
+          git add -A patches \
+            SKILL.md \
+            .github/workflows/build.yml \
+            .github/workflows/trigger-androidcyaml-update.yml \
+            .github/workflows/sync-upstream.yml \
+            .github/workflows/trigger-cmfa-update.yml
+
+          git commit -m "chore: sync upstream Alpha ${upstream_sha:0:8}"
+          git push --force-with-lease origin HEAD:Alpha
+
+          synced_sha="$(git rev-parse HEAD)"
+          echo "mihomo_commit=$synced_sha" >> "$GITHUB_OUTPUT"
+
+  update-androidcyaml:
+    needs: sync
+    uses: ./.github/workflows/trigger-androidcyaml-update.yml
+    with:
+      mihomo_commit: ${{ needs.sync.outputs.mihomo_commit }}
+    secrets: inherit

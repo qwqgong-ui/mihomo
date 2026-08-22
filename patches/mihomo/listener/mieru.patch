@@ -1,0 +1,13 @@
+# Functions:
+# - Optional protocol build tags
+#
+diff --git a/listener/mieru/server.go b/listener/mieru/server.go
+index ab80106..70566e4 100644
+--- a/listener/mieru/server.go
++++ b/listener/mieru/server.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package mieru
+ 
+ import (

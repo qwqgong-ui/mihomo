@@ -1,0 +1,62 @@
+# Functions:
+# - TCP concurrent winner cache flush on manual DNS cache clear
+# - Route runtime API IPv6/TUN updates through the availability controller
+#
+diff --git a/hub/route/cache.go b/hub/route/cache.go
+index f2eda53a..2001c0ac 100644
+--- a/hub/route/cache.go
++++ b/hub/route/cache.go
+@@ -1,6 +1,7 @@
+ package route
+ 
+ import (
++	"github.com/metacubex/mihomo/component/dialer"
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 
+ 	"github.com/metacubex/chi"
+@@ -27,5 +28,9 @@ func flushFakeIPPool(w http.ResponseWriter, r *http.Request) {
+ 
+ func flushDnsCache(w http.ResponseWriter, r *http.Request) {
+ 	resolver.ClearCache()
++	// A stale TCP-winner entry can otherwise outlive a manual DNS flush by up
++	// to its own TTL, still pointing at an address the fresh DNS answer no
++	// longer serves.
++	dialer.ClearTCPConcurrentCache()
+ 	render.NoContent(w, r)
+ }
+diff --git a/hub/route/configs.go b/hub/route/configs.go
+index 18a2af48..37711d59 100644
+--- a/hub/route/configs.go
++++ b/hub/route/configs.go
+@@ -7,7 +7,6 @@ import (
+ 	"github.com/metacubex/mihomo/adapter/inbound"
+ 	"github.com/metacubex/mihomo/component/dialer"
+ 	"github.com/metacubex/mihomo/component/process"
+-	"github.com/metacubex/mihomo/component/resolver"
+ 	"github.com/metacubex/mihomo/component/updater"
+ 	"github.com/metacubex/mihomo/config"
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -364,7 +363,11 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
+ 	listener.ReCreateRedir(pointerOrDefault(general.RedirPort, ports.RedirPort), tunnel.Tunnel)
+ 	listener.ReCreateTProxy(pointerOrDefault(general.TProxyPort, ports.TProxyPort), tunnel.Tunnel)
+ 	listener.ReCreateMixed(pointerOrDefault(general.MixedPort, ports.MixedPort), tunnel.Tunnel)
+-	listener.ReCreateTun(pointerOrDefaultTun(general.Tun, listener.LastTunConf), tunnel.Tunnel)
++	if general.IPv6 != nil {
++		executor.SetIPv6Enabled(*general.IPv6)
++	}
++	tunConfig := pointerOrDefaultTun(general.Tun, executor.ConfiguredTun())
++	executor.UpdateTun(&tunConfig)
+ 	listener.ReCreateShadowSocks(pointerOrDefault(general.ShadowSocksConfig, ports.ShadowSocksConfig), tunnel.Tunnel)
+ 	listener.ReCreateVmess(pointerOrDefault(general.VmessConfig, ports.VmessConfig), tunnel.Tunnel)
+ 	listener.ReCreateTuic(pointerOrDefaultTuicServer(general.TuicServer, listener.LastTuicConf), tunnel.Tunnel)
+@@ -381,10 +384,6 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
+ 		log.SetLevel(*general.LogLevel)
+ 	}
+ 
+-	if general.IPv6 != nil {
+-		resolver.DisableIPv6 = !*general.IPv6
+-	}
+-
+ 	render.NoContent(w, r)
+ }
+ 

@@ -1,0 +1,76 @@
+# Functions:
+# - DIRECT dual-stack DNS race timing
+# - Race-free runtime IPv6 availability gate
+#
+diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
+index e87a9103..c8555c3d 100644
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -7,6 +7,7 @@ import (
+ 	"net/netip"
+ 	"time"
+ 
++	"github.com/metacubex/mihomo/common/atomic"
+ 	"github.com/metacubex/mihomo/common/utils"
+ 	"github.com/metacubex/mihomo/component/trie"
+ 
+@@ -29,7 +30,11 @@ var (
+ 
+ 	// DisableIPv6 means don't resolve ipv6 host
+ 	// default value is true
+-	DisableIPv6 = true
++	// It is an atomic.Bool because the runtime IPv6 availability monitor in
++	// hub/executor flips it from a background goroutine while ordinary
++	// lookups read it concurrently from arbitrary connection-handling
++	// goroutines.
++	DisableIPv6 = atomic.NewBool(true)
+ 
+ 	// DefaultHosts aim to resolve hosts
+ 	DefaultHosts = NewHosts(trie.New[HostValue]())
+@@ -55,6 +60,23 @@ type Resolver interface {
+ 	ResetConnection()
+ }
+ 
++const defaultIPv6Timeout = 100 * time.Millisecond
++
++// IPv6Timeout returns the resolver's AAAA wait budget. Resolver
++// implementations that do not expose one retain LookupIP's historical 100ms
++// default.
++func IPv6Timeout(r Resolver) time.Duration {
++	type timeoutProvider interface {
++		IPv6Timeout() time.Duration
++	}
++	if provider, ok := r.(timeoutProvider); ok {
++		if timeout := provider.IPv6Timeout(); timeout > 0 {
++			return timeout
++		}
++	}
++	return defaultIPv6Timeout
++}
++
+ // LookupIPv4WithResolver same as LookupIPv4, but with a resolver
+ func LookupIPv4WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+ 	if node, ok := DefaultHosts.Search(host, false); ok {
+@@ -104,7 +126,7 @@ func ResolveIPv4(ctx context.Context, host string) (netip.Addr, error) {
+ 
+ // LookupIPv6WithResolver same as LookupIPv6, but with a resolver
+ func LookupIPv6WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+-	if DisableIPv6 {
++	if DisableIPv6.Load() {
+ 		return nil, ErrIPv6Disabled
+ 	}
+ 
+@@ -158,11 +180,11 @@ func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip
+ 	}
+ 
+ 	if r != nil && r.Invalid() {
+-		if DisableIPv6 {
++		if DisableIPv6.Load() {
+ 			return r.LookupIPv4(ctx, host)
+ 		}
+ 		return r.LookupIP(ctx, host)
+-	} else if DisableIPv6 {
++	} else if DisableIPv6.Load() {
+ 		return LookupIPv4WithResolver(ctx, host, r)
+ 	}
+ 

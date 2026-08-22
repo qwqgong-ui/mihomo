@@ -1,0 +1,30 @@
+# Functions:
+# - DNS upstream hostname IPv6 preference
+# - Physical-network DNS dialing
+#
+diff --git a/docs/config.yaml b/docs/config.yaml
+index b23a35f2..906dbd67 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -303,6 +303,7 @@ dns:
+ 
+   # DNS 主要域名配置
+   # 支持 UDP，TCP，DoT，DoH，DoQ
++  # 直连上游地址为域名时默认优先 IPv6；IPv6 不可用或慢于 IPv4 300ms 时自动回退
+   # 这部分为主要 DNS 配置，影响所有直连，确保使用对大陆解析精准的 DNS
+   nameserver:
+     - 114.114.114.114 # default value
+diff --git a/docs/config.yaml b/docs/config.yaml
+index dac50572..39fb99c5 100644
+--- a/docs/config.yaml
++++ b/docs/config.yaml
+@@ -313,6 +313,9 @@ dns:
+     - https://dns.alidns.com/dns-query#h3=true # 强制 HTTP/3，与 perfer-h3 无关，强制开启 DoH 的 HTTP/3 支持，若不支持将无法使用
+     - https://mozilla.cloudflare-dns.com/dns-query#DNS&h3=true # 指定策略组和使用 HTTP/3
+     - dhcp://en0 # dns from dhcp
++    # system 表示当前真实物理网络提供的 DNS；查询 socket 会绑定该物理接口并绕过 TUN
++    # Android 非 CMFA 构建应由外层从 LinkProperties.getDnsServers() 调用 UpdateSystemDNS 注入
++    - system://
+     - quic://dns.adguard.com:784 # DNS over QUIC
+     # - ts://tailscale # 使用指定 Tailscale 出站的 DNS 配置查询
+     # - '8.8.8.8#RULES' # 效果同respect-rules，但仅对该服务器生效
