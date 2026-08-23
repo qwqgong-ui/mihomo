@@ -10,10 +10,10 @@
 # - Physical-network DNS dialing
 #
 diff --git a/tunnel/connection.go b/tunnel/connection.go
-index 3a66a76e..1900738e 100644
+index 3a66a76e..151ce393 100644
 --- a/tunnel/connection.go
 +++ b/tunnel/connection.go
-@@ -5,23 +5,41 @@ import (
+@@ -5,23 +5,49 @@ import (
  	"errors"
  	"net"
  	"net/netip"
@@ -29,10 +29,17 @@ index 3a66a76e..1900738e 100644
  
 +type remoteDomainTarget struct {
 +	// origin is the local synthetic address (normally FakeIP) that the TUN
-+	// application used. ports contains the remote ports requested for this FQDN.
++	// application used. ports maps every remote port requested for this FQDN to
++	// the sequence number of the most recent request, so an IP-only reply can be
++	// attributed to the domain that asked for that port last.
 +	origin netip.Addr
-+	ports  map[uint16]struct{}
++	ports  map[uint16]uint64
 +}
++
++// maxLearnedTargets bounds the IP-learning table. A single association can fan
++// out to many trackers or DHT nodes; the cap keeps that bounded without
++// reintroducing the old "learn exactly one IP" restriction.
++const maxLearnedTargets = 512
 +
  type packetSender struct {
  	ctx    context.Context
@@ -54,12 +61,13 @@ index 3a66a76e..1900738e 100644
 +	originToTarget        map[string]M.Socksaddr
 +	targetToOrigin        map[netip.Addr]netip.Addr // exact locally-resolved IP -> origin
 +	remoteDomains         map[string]*remoteDomainTarget
-+	learnedTargetToOrigin map[netip.Addr]netip.Addr // HY2 real IP -> sole-domain origin
++	learnedTargetToOrigin map[netip.Addr]netip.Addr // HY2 real IP -> attributed origin
++	sendSeq               uint64                    // monotonic per-request counter
 +	mappingMutex          sync.RWMutex
  }
  
  // newPacketSender return a chan based C.PacketSender
-@@ -34,46 +52,188 @@ func newPacketSender() C.PacketSender {
+@@ -34,46 +60,211 @@ func newPacketSender() C.PacketSender {
  		cancel: cancel,
  		ch:     ch,
  
@@ -120,7 +128,7 @@ index 3a66a76e..1900738e 100644
 +	}
 +	if !originAddr.IsValid() || !target.IsValid() {
 +		return
-+	}
+ 	}
 +
 +	if target.IsFqdn() {
 +		// Preserve the canonical domain separately from originToTarget: the
@@ -131,52 +139,74 @@ index 3a66a76e..1900738e 100644
 +		if !loaded {
 +			remoteTarget = &remoteDomainTarget{
 +				origin: originAddr,
-+				ports:  make(map[uint16]struct{}),
++				ports:  make(map[uint16]uint64),
 +			}
 +			s.remoteDomains[domain] = remoteTarget
-+			if len(s.remoteDomains) > 1 || len(s.targetToOrigin) > 0 {
-+				// An IP-only reply is ambiguous as soon as more than one domain,
-+				// or a mixture of domain and IP targets, shares this
-+				// endpoint-independent association.
-+				s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
-+			}
 +		} else if remoteTarget.origin != originAddr {
-+			// A recycled Fake-IP must never inherit an older association.
-+			remoteTarget.origin = netip.Addr{}
-+			s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
++			// A recycled Fake-IP must never inherit an older association: forget
++			// what was learned for the superseded origin, then adopt the new one.
++			s.forgetLearnedForOriginLocked(remoteTarget.origin)
++			remoteTarget.origin = originAddr
 +		}
 +		if metadata.DstPort != 0 {
-+			remoteTarget.ports[metadata.DstPort] = struct{}{}
++			s.sendSeq++
++			remoteTarget.ports[metadata.DstPort] = s.sendSeq
 +		}
 +		return
- 	}
++	}
 +
 +	targetAddr := target.Addr.Unmap()
  	if addr := s.targetToOrigin[targetAddr]; !addr.IsValid() { // overwrite only if the record is illegal
  		s.targetToOrigin[targetAddr] = originAddr
  	}
-+	if len(s.remoteDomains) > 0 {
-+		// A later direct/resolved IP target makes any prior HY2 IP learning
-+		// ambiguous. Exact IP mappings remain available above.
-+		s.learnedTargetToOrigin = make(map[netip.Addr]netip.Addr)
-+	}
++	// An exact mapping supersedes anything guessed for the same IP.
++	delete(s.learnedTargetToOrigin, targetAddr)
 +}
 +
-+// singleRemoteOriginLocked returns the sole remote-domain origin when port
-+// matches one of its requested ports. The caller must hold mappingMutex.
-+func (s *packetSender) singleRemoteOriginLocked(port uint16) netip.Addr {
-+	if len(s.remoteDomains) != 1 || len(s.targetToOrigin) != 0 || port == 0 {
-+		return netip.Addr{}
++// forgetLearnedForOriginLocked drops every guessed mapping that points at a
++// superseded origin. The caller must hold mappingMutex.
++func (s *packetSender) forgetLearnedForOriginLocked(origin netip.Addr) {
++	if !origin.IsValid() {
++		return
 +	}
-+	for _, target := range s.remoteDomains {
-+		if _, loaded := target.ports[port]; loaded {
-+			return target.origin
++	for target, learned := range s.learnedTargetToOrigin {
++		if learned == origin {
++			delete(s.learnedTargetToOrigin, target)
 +		}
 +	}
-+	return netip.Addr{}
  }
  
 -func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
++// remoteOriginForPortLocked attributes an IP-only reply to a remote domain by
++// its port, preferring the domain that requested that port most recently.
++//
++// When several domains share one port the choice is a guess. That is deliberate:
++// a source port is one socket is one application flow, so a wrong guess only
++// costs that single packet — the application rejects it on its own source check,
++// exactly as it rejects the unrestored real IP today. Refusing to guess instead
++// breaks every destination after the first, which is fatal for any client that
++// fans out over one UDP port (BitTorrent trackers and DHT, HTTP/3 to several
++// origins). The caller must hold mappingMutex.
++func (s *packetSender) remoteOriginForPortLocked(port uint16) netip.Addr {
++	if port == 0 {
++		return netip.Addr{}
++	}
++	var (
++		origin netip.Addr
++		newest uint64
++	)
++	for _, target := range s.remoteDomains {
++		seq, loaded := target.ports[port]
++		if !loaded || !target.origin.IsValid() {
++			continue
++		}
++		if !origin.IsValid() || seq > newest {
++			origin, newest = target.origin, seq
++		}
++	}
++	return origin
++}
++
 +func (s *packetSender) RestoreReadFrom(addr net.Addr) netip.Addr {
 +	source := udpSocksaddrFromNet(addr)
 +	if source.IsFqdn() {
@@ -206,28 +236,29 @@ index 3a66a76e..1900738e 100644
 +		s.mappingMutex.RUnlock()
 +		return originAddr
 +	}
-+	originAddr := s.singleRemoteOriginLocked(source.Port)
-+	canLearn := originAddr.IsValid() && len(s.learnedTargetToOrigin) == 0
++	originAddr := s.remoteOriginForPortLocked(source.Port)
++	canLearn := originAddr.IsValid() && len(s.learnedTargetToOrigin) < maxLearnedTargets
 +	s.mappingMutex.RUnlock()
 +	if !canLearn {
 +		return sourceAddr
 +	}
 +
-+	// Standard Hysteria2 returns the resolved IP instead of the requested
-+	// FQDN. Bind only the first same-port reply of a single-domain EIM
-+	// association. Additional IPs remain visible for STUN alternate-address
-+	// behavior, and multiple domains are never guessed.
++	// Standard Hysteria2 returns the resolved IP instead of the requested FQDN.
++	// Bind each new (IP, port) reply to the domain that requested that port most
++	// recently, and keep the binding so later replies from the same IP stay
++	// stable. A domain with several A records therefore keeps working after the
++	// first reply, which the earlier single-entry table could not do.
 +	s.mappingMutex.Lock()
 +	defer s.mappingMutex.Unlock()
 +	if originAddr = s.targetToOrigin[sourceAddr]; originAddr.IsValid() {
++		return originAddr
++	}
++	if originAddr = s.learnedTargetToOrigin[sourceAddr]; originAddr.IsValid() {
  		return originAddr
  	}
 -	return addr
-+	if originAddr = s.learnedTargetToOrigin[sourceAddr]; originAddr.IsValid() {
-+		return originAddr
-+	}
-+	originAddr = s.singleRemoteOriginLocked(source.Port)
-+	if originAddr.IsValid() && len(s.learnedTargetToOrigin) == 0 {
++	originAddr = s.remoteOriginForPortLocked(source.Port)
++	if originAddr.IsValid() && len(s.learnedTargetToOrigin) < maxLearnedTargets {
 +		s.learnedTargetToOrigin[sourceAddr] = originAddr
 +		return originAddr
 +	}
@@ -260,7 +291,7 @@ index 3a66a76e..1900738e 100644
  	}
  
  	if addr == nil {
-@@ -91,12 +251,17 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
+@@ -91,12 +282,17 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
  			}
  		}
  
@@ -280,7 +311,7 @@ index 3a66a76e..1900738e 100644
  	}
  	_ = handleUDPToRemote(packet, pc, addr)
  }
-@@ -151,7 +316,7 @@ func (s *packetSender) Close() {
+@@ -151,7 +347,7 @@ func (s *packetSender) Close() {
  
  func (s *packetSender) DoSniff(metadata *C.Metadata) error { return nil }
  
@@ -289,7 +320,7 @@ index 3a66a76e..1900738e 100644
  	if addr == nil {
  		return errors.New("udp addr invalid")
  	}
-@@ -180,24 +345,46 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
+@@ -180,24 +376,46 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
  			return
  		}
  
@@ -353,10 +384,10 @@ index 3a66a76e..1900738e 100644
  		}
 diff --git a/tunnel/connection_test.go b/tunnel/connection_test.go
 new file mode 100644
-index 00000000..7e891a0e
+index 00000000..8816b96a
 --- /dev/null
 +++ b/tunnel/connection_test.go
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,282 @@
 +package tunnel
 +
 +import (
@@ -516,7 +547,7 @@ index 00000000..7e891a0e
 +	}
 +}
 +
-+func TestPacketSenderLearnsOneRemoteIPWithoutMaskingAlternates(t *testing.T) {
++func TestPacketSenderLearnsEveryRemoteIPOfOneDomain(t *testing.T) {
 +	sender := newMappingTestSender(t)
 +	origin := udpMetadata("198.18.0.8", "", 443)
 +	sender.AddMapping(origin, udpMetadata("", "video.example", 443))
@@ -534,51 +565,84 @@ index 00000000..7e891a0e
 +		t.Fatalf("cached primary reply = %s, want Fake-IP %s", got, origin.DstIP)
 +	}
 +
++	// A second A record of the same domain is not ambiguous and must restore
++	// too; the earlier single-entry table stopped after the first reply.
 +	alternate := udpAddr("203.0.113.11", 443)
-+	if got := sender.RestoreReadFrom(alternate); got != alternate.AddrPort().Addr() {
-+		t.Fatalf("alternate reply = %s, want actual source %s", got, alternate.IP)
++	if got := sender.RestoreReadFrom(alternate); got != origin.DstIP {
++		t.Fatalf("alternate reply = %s, want Fake-IP %s", got, origin.DstIP)
 +	}
 +}
 +
-+func TestPacketSenderDoesNotGuessAmbiguousRemoteIP(t *testing.T) {
++func TestPacketSenderRestoresEachDomainSharingOnePort(t *testing.T) {
++	// The BitTorrent shape: one source port, several tracker FQDNs on the same
++	// remote port, each answered before the next request goes out.
 +	sender := newMappingTestSender(t)
-+	firstOrigin := udpMetadata("198.18.0.9", "", 443)
-+	secondOrigin := udpMetadata("198.18.0.10", "", 443)
-+	sender.AddMapping(firstOrigin, udpMetadata("", "first.example", 443))
-+	sender.AddMapping(secondOrigin, udpMetadata("", "second.example", 443))
++	firstOrigin := udpMetadata("198.18.0.9", "", 1337)
++	secondOrigin := udpMetadata("198.18.0.10", "", 1337)
 +
-+	actual := udpAddr("203.0.113.12", 443)
-+	if got := sender.RestoreReadFrom(actual); got != actual.AddrPort().Addr() {
-+		t.Fatalf("ambiguous IP reply = %s, want actual source %s", got, actual.IP)
++	sender.AddMapping(firstOrigin, udpMetadata("", "first.example", 1337))
++	firstIP := udpAddr("203.0.113.12", 1337)
++	if got := sender.RestoreReadFrom(firstIP); got != firstOrigin.DstIP {
++		t.Fatalf("first tracker reply = %s, want Fake-IP %s", got, firstOrigin.DstIP)
 +	}
-+	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("first.example", 443)); got != firstOrigin.DstIP {
++
++	sender.AddMapping(secondOrigin, udpMetadata("", "second.example", 1337))
++	secondIP := udpAddr("203.0.113.13", 1337)
++	if got := sender.RestoreReadFrom(secondIP); got != secondOrigin.DstIP {
++		t.Fatalf("second tracker reply = %s, want Fake-IP %s", got, secondOrigin.DstIP)
++	}
++
++	// A later request must not steal an already-bound IP from its domain.
++	if got := sender.RestoreReadFrom(firstIP); got != firstOrigin.DstIP {
++		t.Fatalf("re-read first tracker reply = %s, want Fake-IP %s", got, firstOrigin.DstIP)
++	}
++
++	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("first.example", 1337)); got != firstOrigin.DstIP {
 +		t.Fatalf("first domain reply = %s, want %s", got, firstOrigin.DstIP)
 +	}
-+	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("second.example", 443)); got != secondOrigin.DstIP {
++	if got := sender.RestoreReadFrom(M.ParseSocksaddrHostPort("second.example", 1337)); got != secondOrigin.DstIP {
 +		t.Fatalf("second domain reply = %s, want %s", got, secondOrigin.DstIP)
 +	}
 +}
 +
-+func TestPacketSenderDoesNotGuessMixedDomainAndIP(t *testing.T) {
++func TestPacketSenderPrefersExactIPMappingOverGuess(t *testing.T) {
 +	sender := newMappingTestSender(t)
 +	domainOrigin := udpMetadata("198.18.0.12", "", 443)
 +	sender.AddMapping(domainOrigin, udpMetadata("", "domain.example", 443))
 +
-+	// The first reply is learnable while the association has one target.
 +	domainIP := udpAddr("203.0.113.14", 443)
 +	if got := sender.RestoreReadFrom(domainIP); got != domainOrigin.DstIP {
 +		t.Fatalf("single-domain reply = %s, want %s", got, domainOrigin.DstIP)
 +	}
 +
-+	// Adding a direct IP makes future IP-only replies ambiguous and must revoke
-+	// the learned fallback. The exact direct mapping still works.
++	// A direct IP target coexists with domain targets: its exact mapping wins,
++	// and it must not revoke what the domain already learned.
 +	direct := udpMetadata("203.0.113.15", "", 443)
 +	sender.AddMapping(direct, direct)
-+	if got := sender.RestoreReadFrom(domainIP); got != domainIP.AddrPort().Addr() {
-+		t.Fatalf("mixed-target reply = %s, want actual source %s", got, domainIP.IP)
-+	}
 +	if got := sender.RestoreReadFrom(udpAddr("203.0.113.15", 443)); got != direct.DstIP {
 +		t.Fatalf("direct reply = %s, want %s", got, direct.DstIP)
++	}
++	if got := sender.RestoreReadFrom(domainIP); got != domainOrigin.DstIP {
++		t.Fatalf("domain reply after direct target = %s, want %s", got, domainOrigin.DstIP)
++	}
++}
++
++func TestPacketSenderForgetsGuessesForRecycledFakeIP(t *testing.T) {
++	sender := newMappingTestSender(t)
++	oldOrigin := udpMetadata("198.18.0.20", "", 1337)
++	sender.AddMapping(oldOrigin, udpMetadata("", "recycled.example", 1337))
++
++	remote := udpAddr("203.0.113.20", 1337)
++	if got := sender.RestoreReadFrom(remote); got != oldOrigin.DstIP {
++		t.Fatalf("initial reply = %s, want %s", got, oldOrigin.DstIP)
++	}
++
++	// The Fake-IP pool handed the same domain a new address; the stale guess
++	// must not survive.
++	newOrigin := udpMetadata("198.18.0.21", "", 1337)
++	sender.AddMapping(newOrigin, udpMetadata("", "recycled.example", 1337))
++	if got := sender.RestoreReadFrom(remote); got != newOrigin.DstIP {
++		t.Fatalf("reply after recycle = %s, want %s", got, newOrigin.DstIP)
 +	}
 +}
 +
