@@ -1,14 +1,8 @@
-# Functions:
-# - Remote UDP destination identity
-# - Optional protocol build tags
-# - DIRECT dual-stack TCP/UDP race
-# - Fake-IP ICMP handling
-#
 diff --git a/adapter/outbound/anytls.go b/adapter/outbound/anytls.go
-index 2f5992a..c85fdf8 100644
+index 99786614..0177942d 100644
 --- a/adapter/outbound/anytls.go
 +++ b/adapter/outbound/anytls.go
-@@ -69,7 +69,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+@@ -70,7 +70,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
  	}
  
  	// create uot on tcp
@@ -17,7 +11,7 @@ index 2f5992a..c85fdf8 100644
  	return NewPacketConn(N.NewThreadSafePacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination})), t), nil
  }
  
-@@ -104,6 +104,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
+@@ -105,6 +105,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
  			Interface:    option.Interface,
  			RoutingMark:  option.RoutingMark,
  			Prefer:       option.IPVersion,
@@ -26,10 +20,18 @@ index 2f5992a..c85fdf8 100644
  		option: &option,
  	}
 diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
-index 01e0079..511235a 100644
+index 01e00798..efdb5682 100644
 --- a/adapter/outbound/base.go
 +++ b/adapter/outbound/base.go
-@@ -27,19 +27,20 @@ type ProxyAdapter interface {
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
++	"net/netip"
+ 	"runtime"
+ 	"sync"
+ 	"syscall"
+@@ -27,19 +28,20 @@ type ProxyAdapter interface {
  }
  
  type Base struct {
@@ -63,7 +65,7 @@ index 01e0079..511235a 100644
  }
  
  type BaseOption struct {
-@@ -54,22 +55,24 @@ type BaseOption struct {
+@@ -54,22 +56,24 @@ type BaseOption struct {
  	Interface    string
  	RoutingMark  int
  	Prefer       C.DNSPrefer
@@ -100,7 +102,7 @@ index 01e0079..511235a 100644
  	}
  }
  
-@@ -176,6 +179,23 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
+@@ -176,6 +180,23 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
  }
  
  func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
@@ -124,9 +126,42 @@ index 01e0079..511235a 100644
  	if !metadata.Resolved() {
  		ip, err := resolveIPWithResolver(ctx, metadata.Host, b.prefer, resolver.DefaultResolver)
  		if err != nil {
+@@ -340,11 +361,15 @@ func (c *packetConn) AddRef(ref any) {
+ }
+ 
+ func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
++	return newPacketConn(pc, a, a.ResolveUDP)
++}
++
++func newPacketConn(pc net.PacketConn, a ProxyAdapter, resolveUDP func(context.Context, *C.Metadata) error) C.PacketConn {
+ 	epc := N.NewEnhancePacketConn(pc)
+ 	if _, ok := pc.(syscall.Conn); !ok { // exclusion system conn like *net.UDPConn
+ 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
+ 	}
+-	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
++	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), resolveUDP}
+ 	cpc.AppendToChains(a)
+ 	return cpc
+ }
+@@ -359,6 +384,15 @@ type autoCloseProxyAdapter struct {
+ 	closeErr  error
+ }
+ 
++func (p *autoCloseProxyAdapter) ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error {
++	if controller, ok := p.ProxyAdapter.(interface {
++		ICMPControl(netip.Addr) func(string, string, syscall.RawConn) error
++	}); ok {
++		return controller.ICMPControl(destination)
++	}
++	return dialer.ICMPControl(destination)
++}
++
+ func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+ 	c, err := p.ProxyAdapter.DialContext(ctx, metadata)
+ 	if err != nil {
 diff --git a/adapter/outbound/base_udp_test.go b/adapter/outbound/base_udp_test.go
 new file mode 100644
-index 0000000..7fde884
+index 00000000..7fde8849
 --- /dev/null
 +++ b/adapter/outbound/base_udp_test.go
 @@ -0,0 +1,72 @@
@@ -202,924 +237,6 @@ index 0000000..7fde884
 +		t.Fatalf("ResolveUDP() unexpectedly changed remote-only target: %#v", metadata)
 +	}
 +}
-diff --git a/adapter/outbound/hysteria.go b/adapter/outbound/hysteria.go
-index 2603295..f945dae 100644
---- a/adapter/outbound/hysteria.go
-+++ b/adapter/outbound/hysteria.go
-@@ -252,6 +252,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:    &option,
- 		client:    client,
-@@ -281,7 +282,7 @@ func (c *hyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
- 		return
- 	}
- 	n = copy(p, b)
--	addr = M.ParseSocksaddr(addrStr).UDPAddr()
-+	addr = hysteriaPacketAddr(addrStr)
- 	return
- }
- 
-@@ -291,10 +292,18 @@ func (c *hyPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, e
- 		return
- 	}
- 	data = b
--	addr = M.ParseSocksaddr(addrStr).UDPAddr()
-+	addr = hysteriaPacketAddr(addrStr)
- 	return
- }
- 
-+func hysteriaPacketAddr(addr string) net.Addr {
-+	destination := M.ParseSocksaddr(addr)
-+	if destination.IsFqdn() {
-+		return destination
-+	}
-+	return destination.UDPAddr()
-+}
-+
- func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
- 	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
- 	if err != nil {
-diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
-index 4731611..6e3018c 100644
---- a/adapter/outbound/hysteria2.go
-+++ b/adapter/outbound/hysteria2.go
-@@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option: &option,
- 	}
-diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
-index 8fefe36..fc42ee3 100644
---- a/adapter/outbound/shadowquic.go
-+++ b/adapter/outbound/shadowquic.go
-@@ -167,6 +167,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:     &option,
- 		quicConfig: quicConfig,
-diff --git a/adapter/outbound/shadowsocks.go b/adapter/outbound/shadowsocks.go
-index 8c562a8..41e9fcd 100644
---- a/adapter/outbound/shadowsocks.go
-+++ b/adapter/outbound/shadowsocks.go
-@@ -260,7 +260,7 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
- 		if err = ss.ResolveUDP(ctx, metadata); err != nil {
- 			return nil, err
- 		}
--		destination := M.SocksaddrFromNet(metadata.UDPAddr())
-+		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
- 		if ss.option.UDPOverTCPVersion == uot.LegacyVersion {
- 			return NewPacketConn(N.NewThreadSafePacketConn(uot.NewConn(c, uot.Request{Destination: destination})), ss), nil
- 		} else {
-@@ -507,6 +507,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		method: method,
- 
-diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
-index fd386a8..31b7793 100644
---- a/adapter/outbound/shadowsocksr.go
-+++ b/adapter/outbound/shadowsocksr.go
-@@ -169,6 +169,7 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:   &option,
- 		cipher:   coreCiph,
-diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
-index c4142ec..4f523d2 100644
---- a/adapter/outbound/snell.go
-+++ b/adapter/outbound/snell.go
-@@ -272,6 +272,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:          &option,
- 		psk:             psk,
-diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
-index 7f3f111..dfde7f0 100644
---- a/adapter/outbound/socks5.go
-+++ b/adapter/outbound/socks5.go
-@@ -201,6 +201,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:         &option,
- 		user:           option.UserName,
-diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
-index 839be32..f328663 100644
---- a/adapter/outbound/sudoku.go
-+++ b/adapter/outbound/sudoku.go
-@@ -237,6 +237,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:   &option,
- 		baseConf: baseConf,
-diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
-index d581e80..28f1085 100644
---- a/adapter/outbound/trojan.go
-+++ b/adapter/outbound/trojan.go
-@@ -299,6 +299,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:      &option,
- 		hexPassword: trojan.Key(option.Password),
-diff --git a/adapter/outbound/tuic.go b/adapter/outbound/tuic.go
-index ed54d99..15d0efd 100644
---- a/adapter/outbound/tuic.go
-+++ b/adapter/outbound/tuic.go
-@@ -96,7 +96,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
- 
- 		// tuic uos use stream-oriented udp with a special address, so we need a net.UDPAddr
- 
--		destination := M.SocksaddrFromNet(metadata.UDPAddr())
-+		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
- 		if t.option.UDPOverStreamVersion == uot.LegacyVersion {
- 			return NewPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
- 		} else {
-@@ -249,6 +249,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		option:     &option,
- 		quicConfig: quicConfig,
-diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
-index 6b9edd3..3ae778e 100644
---- a/adapter/outbound/vless.go
-+++ b/adapter/outbound/vless.go
-@@ -285,6 +285,12 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
- 				Host:    packetaddr.SeqPacketMagicAddress,
- 				DstPort: 443,
- 			}
-+		} else if v.option.XUDP && metadata.Host != "" {
-+			metadata = &C.Metadata{
-+				NetWork: C.UDP,
-+				Host:    metadata.Host,
-+				DstPort: metadata.DstPort,
-+			}
- 		} else {
- 			metadata = &C.Metadata{ // a clear metadata only contains ip
- 				NetWork: C.UDP,
-@@ -391,7 +397,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
- 		return NewPacketConn(N.NewThreadSafePacketConn(
- 			vmessSing.NewXUDPConn(c,
- 				globalID,
--				M.SocksaddrFromNet(metadata.UDPAddr())),
-+				M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)),
- 		), v), nil
- 	} else if v.option.PacketAddr {
- 		return NewPacketConn(N.NewThreadSafePacketConn(
-@@ -501,6 +507,7 @@ func NewVless(option VlessOption) (*Vless, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    option.XUDP,
- 		}),
- 		client: client,
- 		option: &option,
-diff --git a/adapter/outbound/vless_test.go b/adapter/outbound/vless_test.go
-new file mode 100644
-index 0000000..4c83403
---- /dev/null
-+++ b/adapter/outbound/vless_test.go
-@@ -0,0 +1,28 @@
-+package outbound
-+
-+import (
-+	"context"
-+	"testing"
-+
-+	C "github.com/metacubex/mihomo/constant"
-+)
-+
-+func TestVlessXUDPLeavesDomainForRemoteResolution(t *testing.T) {
-+	v := &Vless{
-+		Base:   NewBase(BaseOption{RemoteDNS: true}),
-+		option: &VlessOption{XUDP: true},
-+	}
-+	metadata := &C.Metadata{
-+		NetWork: C.UDP,
-+		Host:    "quic.example",
-+		DstPort: 443,
-+		DNSMode: C.DNSFakeIP,
-+	}
-+
-+	if err := v.ResolveUDP(context.Background(), metadata); err != nil {
-+		t.Fatalf("ResolveUDP() error = %v", err)
-+	}
-+	if metadata.DstIP.IsValid() {
-+		t.Fatalf("ResolveUDP() unexpectedly resolved domain to %s", metadata.DstIP)
-+	}
-+}
-diff --git a/adapter/outbound/vmess.go b/adapter/outbound/vmess.go
-index aef7cce..811ea92 100644
---- a/adapter/outbound/vmess.go
-+++ b/adapter/outbound/vmess.go
-@@ -304,11 +304,11 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
- 			if useEarly {
- 				conn = v.client.DialEarlyXUDPPacketConn(c,
- 					globalID,
--					M.SocksaddrFromNet(metadata.UDPAddr()))
-+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
- 			} else {
- 				conn, err = v.client.DialXUDPPacketConn(c,
- 					globalID,
--					M.SocksaddrFromNet(metadata.UDPAddr()))
-+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
- 			}
- 		} else if v.option.PacketAddr {
- 			if useEarly {
-@@ -322,10 +322,10 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
- 		} else {
- 			if useEarly {
- 				conn = v.client.DialEarlyPacketConn(c,
--					M.SocksaddrFromNet(metadata.UDPAddr()))
-+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
- 			} else {
- 				conn, err = v.client.DialPacketConn(c,
--					M.SocksaddrFromNet(metadata.UDPAddr()))
-+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
- 			}
- 		}
- 	} else {
-@@ -435,7 +435,7 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
- 	if pc, ok := c.(net.PacketConn); ok {
- 		return NewPacketConn(N.NewThreadSafePacketConn(pc), v), nil
- 	}
--	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: metadata.UDPAddr()}, v), nil
-+	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)}, v), nil
- }
- 
- // ProxyInfo implements C.ProxyAdapter
-@@ -504,6 +504,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
- 			Interface:    option.Interface,
- 			RoutingMark:  option.RoutingMark,
- 			Prefer:       option.IPVersion,
-+			RemoteDNS:    true,
- 		}),
- 		client: client,
- 		option: &option,
-diff --git a/adapter/outbound/ipstack.go b/adapter/outbound/ipstack.go
-new file mode 100644
-index 0000000..1f24adf
---- /dev/null
-+++ b/adapter/outbound/ipstack.go
-@@ -0,0 +1,122 @@
-+package outbound
-+
-+import (
-+	"context"
-+	"errors"
-+	"fmt"
-+	"net"
-+	"net/netip"
-+	"strings"
-+	"time"
-+
-+	"github.com/metacubex/mihomo/component/dialer"
-+	"github.com/metacubex/mihomo/constant/features"
-+
-+	"github.com/metacubex/mipstack"
-+)
-+
-+const (
-+	ipStackAuto   = "auto"
-+	ipStackGVisor = "gvisor"
-+	ipStackMips   = "mips"
-+)
-+
-+type IPStackOption struct {
-+	Mode                 string `proxy:"mode,omitempty"`
-+	CongestionController string `proxy:"congestion-controller,omitempty"`
-+}
-+
-+func (o *IPStackOption) normalize() {
-+	o.Mode = strings.ToLower(o.Mode)
-+	if o.Mode == "" {
-+		o.Mode = ipStackAuto
-+	}
-+	o.CongestionController = strings.ToLower(o.CongestionController)
-+}
-+
-+func (o IPStackOption) validate() error {
-+	switch o.Mode {
-+	case ipStackAuto, ipStackMips:
-+	case ipStackGVisor:
-+		if !features.WithGVisor {
-+			return errors.New("gVisor IP stack requires the with_gvisor build tag")
-+		}
-+	default:
-+		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
-+	}
-+	switch mipstack.CongestionControl(o.CongestionController) {
-+	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
-+		return nil
-+	default:
-+		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
-+	}
-+}
-+
-+// ipStack is the mihomo IP stack's packet and socket surface.
-+type ipStack interface {
-+	Start() error
-+	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
-+	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
-+	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
-+	Read(buffers [][]byte, sizes []int, offset int) (int, error)
-+	Write(buffers [][]byte, offset int) (int, error)
-+	MTU() (int, error)
-+	Name() (string, error)
-+	BatchSize() int
-+	Close() error
-+}
-+
-+// newIPStack constructs the selected userspace IP stack.
-+func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
-+	mode := option.Mode
-+	if mode == ipStackAuto {
-+		if features.WithGVisor {
-+			mode = ipStackGVisor
-+		} else {
-+			mode = ipStackMips
-+		}
-+	}
-+	switch mode {
-+	case ipStackGVisor:
-+		return newGVisorIPStack(localAddresses, mtu)
-+	case ipStackMips:
-+		return mipstack.New(mipstack.Config{
-+			LocalAddresses: localAddresses,
-+			MTU:            mtu,
-+			TCP: mipstack.TCPSocketDefaults{
-+				CongestionControl: mipstack.CongestionControl(option.CongestionController),
-+				// Align with sing-wireguard: enable keepalive with 15-second
-+				// idle/interval timing and gVisor's default probe count.
-+				KeepAlive: true,
-+				KeepAliveConfig: mipstack.KeepAliveConfig{
-+					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
-+				},
-+			},
-+		})
-+	default:
-+		return nil, errors.New("invalid IP stack mode")
-+	}
-+}
-+
-+var _ ipStack = (*mipstack.Stack)(nil)
-+
-+type ipStackNetDialer struct {
-+	stack ipStack
-+}
-+
-+var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
-+
-+func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-+	dst, err := netip.ParseAddrPort(address)
-+	if err != nil {
-+		return nil, fmt.Errorf("invalid address %q: %w", address, err)
-+	}
-+	switch {
-+	case strings.HasPrefix(network, "tcp"):
-+		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
-+	case strings.HasPrefix(network, "udp"):
-+		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
-+	default:
-+		return nil, fmt.Errorf("invalid network %q", network)
-+	}
-+}
-diff --git a/adapter/outbound/ipstack_gvisor.go b/adapter/outbound/ipstack_gvisor.go
-new file mode 100644
-index 0000000..36f00af
---- /dev/null
-+++ b/adapter/outbound/ipstack_gvisor.go
-@@ -0,0 +1,15 @@
-+//go:build with_gvisor
-+
-+package outbound
-+
-+import (
-+	"net/netip"
-+
-+	wireguard "github.com/metacubex/sing-wireguard"
-+)
-+
-+func newGVisorIPStack(localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
-+	return wireguard.NewStackDevice(localAddresses, mtu)
-+}
-+
-+var _ ipStack = (wireguard.Device)(nil)
-diff --git a/adapter/outbound/ipstack_gvisor_stub.go b/adapter/outbound/ipstack_gvisor_stub.go
-new file mode 100644
-index 0000000..eaec154
---- /dev/null
-+++ b/adapter/outbound/ipstack_gvisor_stub.go
-@@ -0,0 +1,12 @@
-+//go:build !with_gvisor
-+
-+package outbound
-+
-+import (
-+	"errors"
-+	"net/netip"
-+)
-+
-+func newGVisorIPStack([]netip.Prefix, uint32) (ipStack, error) {
-+	return nil, errors.New("gVisor IP stack requires the with_gvisor build tag")
-+}
-diff --git a/adapter/outbound/mieru.go b/adapter/outbound/mieru.go
-index 9f4e82d..11fe580 100644
---- a/adapter/outbound/mieru.go
-+++ b/adapter/outbound/mieru.go
-@@ -1,3 +1,5 @@
-+//go:build !no_mieru
-+
- package outbound
- 
- import (
-diff --git a/adapter/outbound/mieru_stub.go b/adapter/outbound/mieru_stub.go
-new file mode 100644
-index 0000000..46e6fd3
---- /dev/null
-+++ b/adapter/outbound/mieru_stub.go
-@@ -0,0 +1,28 @@
-+//go:build no_mieru
-+
-+package outbound
-+
-+import "fmt"
-+
-+type Mieru struct {
-+	*Base
-+}
-+
-+type MieruOption struct {
-+	BasicOption
-+	Name           string `proxy:"name"`
-+	Server         string `proxy:"server"`
-+	Port           int    `proxy:"port,omitempty"`
-+	PortRange      string `proxy:"port-range,omitempty"`
-+	Transport      string `proxy:"transport"`
-+	UDP            bool   `proxy:"udp,omitempty"`
-+	UserName       string `proxy:"username"`
-+	Password       string `proxy:"password"`
-+	Multiplexing   string `proxy:"multiplexing,omitempty"`
-+	HandshakeMode  string `proxy:"handshake-mode,omitempty"`
-+	TrafficPattern string `proxy:"traffic-pattern,omitempty"`
-+}
-+
-+func NewMieru(MieruOption) (*Mieru, error) {
-+	return nil, fmt.Errorf("mieru support is disabled by \"no_mieru\" build tag")
-+}
-diff --git a/adapter/outbound/mieru_test.go b/adapter/outbound/mieru_test.go
-index f47cf99..661c1dc 100644
---- a/adapter/outbound/mieru_test.go
-+++ b/adapter/outbound/mieru_test.go
-@@ -1,3 +1,5 @@
-+//go:build !no_mieru
-+
- package outbound
- 
- import "testing"
-diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
-index 65c2798..00369ab 100644
---- a/adapter/outbound/openvpn.go
-+++ b/adapter/outbound/openvpn.go
-@@ -1,3 +1,5 @@
-+//go:build !no_openvpn
-+
- package outbound
- 
- import (
-diff --git a/adapter/outbound/openvpn_stub.go b/adapter/outbound/openvpn_stub.go
-new file mode 100644
-index 0000000..368bf67
---- /dev/null
-+++ b/adapter/outbound/openvpn_stub.go
-@@ -0,0 +1,47 @@
-+//go:build no_openvpn
-+
-+package outbound
-+
-+import "fmt"
-+
-+type OpenVPN struct {
-+	*Base
-+}
-+
-+type OpenVPNOption struct {
-+	BasicOption
-+	Name               string            `proxy:"name"`
-+	Server             string            `proxy:"server"`
-+	Port               int               `proxy:"port"`
-+	Proto              string            `proxy:"proto,omitempty"`
-+	Dev                string            `proxy:"dev,omitempty"`
-+	Cipher             string            `proxy:"cipher,omitempty"`
-+	DataCiphers        []string          `proxy:"data-ciphers,omitempty"`
-+	DataCipherFallback string            `proxy:"data-ciphers-fallback,omitempty"`
-+	Auth               string            `proxy:"auth,omitempty"`
-+	CompLZO            string            `proxy:"comp-lzo,omitempty"`
-+	CA                 string            `proxy:"ca"`
-+	Cert               string            `proxy:"cert,omitempty"`
-+	Key                string            `proxy:"key,omitempty"`
-+	TLSAuth            string            `proxy:"tls-auth,omitempty"`
-+	KeyDirection       string            `proxy:"key-direction,omitempty"`
-+	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
-+	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
-+	Username           string            `proxy:"username,omitempty"`
-+	Password           string            `proxy:"password,omitempty"`
-+	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
-+	Ping               int               `proxy:"ping,omitempty"`
-+	PingRestart        int               `proxy:"ping-restart,omitempty"`
-+	HandshakeTimeout   int               `proxy:"handshake-timeout,omitempty"`
-+	MTU                int               `proxy:"mtu,omitempty"`
-+	UDP                bool              `proxy:"udp,omitempty"`
-+
-+	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
-+
-+	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
-+	Dns              []string `proxy:"dns,omitempty"`
-+}
-+
-+func NewOpenVPN(OpenVPNOption) (*OpenVPN, error) {
-+	return nil, fmt.Errorf("openvpn support is disabled by \"no_openvpn\" build tag")
-+}
-diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
-index f328663..6b192ba 100644
---- a/adapter/outbound/sudoku.go
-+++ b/adapter/outbound/sudoku.go
-@@ -1,3 +1,5 @@
-+//go:build !no_sudoku
-+
- package outbound
- 
- import (
-diff --git a/adapter/outbound/sudoku_stub.go b/adapter/outbound/sudoku_stub.go
-new file mode 100644
-index 0000000..149d44c
---- /dev/null
-+++ b/adapter/outbound/sudoku_stub.go
-@@ -0,0 +1,45 @@
-+//go:build no_sudoku
-+
-+package outbound
-+
-+import "fmt"
-+
-+type Sudoku struct {
-+	*Base
-+}
-+
-+type SudokuOption struct {
-+	BasicOption
-+	Name               string                 `proxy:"name"`
-+	Server             string                 `proxy:"server"`
-+	Port               int                    `proxy:"port"`
-+	Key                string                 `proxy:"key"`
-+	AEADMethod         string                 `proxy:"aead-method,omitempty"`
-+	PaddingMin         *int                   `proxy:"padding-min,omitempty"`
-+	PaddingMax         *int                   `proxy:"padding-max,omitempty"`
-+	TableType          string                 `proxy:"table-type,omitempty"`
-+	EnablePureDownlink *bool                  `proxy:"enable-pure-downlink,omitempty"`
-+	HTTPMask           *bool                  `proxy:"http-mask,omitempty"`
-+	HTTPMaskMode       string                 `proxy:"http-mask-mode,omitempty"`
-+	HTTPMaskTLS        bool                   `proxy:"http-mask-tls,omitempty"`
-+	HTTPMaskHost       string                 `proxy:"http-mask-host,omitempty"`
-+	PathRoot           string                 `proxy:"path-root,omitempty"`
-+	Multiplex          string                 `proxy:"multiplex,omitempty"`
-+	HTTPMaskMultiplex  string                 `proxy:"http-mask-multiplex,omitempty"`
-+	HTTPMaskOptions    *SudokuHTTPMaskOptions `proxy:"httpmask,omitempty"`
-+	CustomTable        string                 `proxy:"custom-table,omitempty"`
-+	CustomTables       []string               `proxy:"custom-tables,omitempty"`
-+}
-+
-+type SudokuHTTPMaskOptions struct {
-+	Disable   bool   `proxy:"disable,omitempty"`
-+	Mode      string `proxy:"mode,omitempty"`
-+	TLS       bool   `proxy:"tls,omitempty"`
-+	Host      string `proxy:"host,omitempty"`
-+	PathRoot  string `proxy:"path-root,omitempty"`
-+	Multiplex string `proxy:"multiplex,omitempty"`
-+}
-+
-+func NewSudoku(SudokuOption) (*Sudoku, error) {
-+	return nil, fmt.Errorf("sudoku support is disabled by \"no_sudoku\" build tag")
-+}
-diff --git a/adapter/outbound/wireguard.go b/adapter/outbound/wireguard.go
-index aace86f..f1845d2 100644
---- a/adapter/outbound/wireguard.go
-+++ b/adapter/outbound/wireguard.go
-@@ -1,10 +1,11 @@
-+//go:build !no_wireguard
-+
- package outbound
- 
- import (
- 	"context"
- 	"encoding/base64"
- 	"encoding/hex"
--	"errors"
- 	"fmt"
- 	"net"
- 	"net/netip"
-@@ -20,13 +21,11 @@ import (
- 	"github.com/metacubex/mihomo/component/resolver"
- 	"github.com/metacubex/mihomo/component/slowdown"
- 	C "github.com/metacubex/mihomo/constant"
--	"github.com/metacubex/mihomo/constant/features"
- 	"github.com/metacubex/mihomo/dns"
- 	"github.com/metacubex/mihomo/log"
- 
- 	amneziav3 "github.com/metacubex/amneziawg-go/device"
- 	amnezia "github.com/metacubex/amneziawg-go/device_v1"
--	"github.com/metacubex/mipstack"
- 	wireguard "github.com/metacubex/sing-wireguard"
- 	"github.com/metacubex/wireguard-go/device"
- 	"github.com/metacubex/wireguard-go/tun"
-@@ -36,12 +35,6 @@ import (
- 	M "github.com/metacubex/sing/common/metadata"
- )
- 
--const (
--	ipStackAuto   = "auto"
--	ipStackGVisor = "gvisor"
--	ipStackMips   = "mips"
--)
--
- type wireguardGoDevice interface {
- 	Close()
- 	IpcSet(uapiConf string) error
-@@ -138,110 +131,8 @@ type AmneziaWGOption struct {
- 	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
- 	RandomTrailers         bool   `proxy:"random-trailers,omitempty"` // AmneziaWG v3.1+
- 	DisableCookies         bool   `proxy:"disable-cookies,omitempty"` // AmneziaWG v3.1+
- }
- 
--type IPStackOption struct {
--	Mode                 string `proxy:"mode,omitempty"`
--	CongestionController string `proxy:"congestion-controller,omitempty"`
--}
--
--func (o *IPStackOption) normalize() {
--	o.Mode = strings.ToLower(o.Mode)
--	if o.Mode == "" {
--		o.Mode = ipStackAuto
--	}
--	o.CongestionController = strings.ToLower(o.CongestionController)
--}
--
--func (o IPStackOption) validate() error {
--	switch o.Mode {
--	case ipStackAuto, ipStackMips:
--	case ipStackGVisor:
--		if !features.WithGVisor {
--			return errors.New("gVisor IP stack requires the with_gvisor build tag")
--		}
--	default:
--		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
--	}
--	switch mipstack.CongestionControl(o.CongestionController) {
--	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
--		return nil
--	default:
--		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
--	}
--}
--
--// ipStack is the mihomo IP stack's packet and socket surface, adapted from
--// sing-wireguard only for gVisor.
--type ipStack interface {
--	Start() error
--	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
--	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
--	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
--	Read(buffers [][]byte, sizes []int, offset int) (int, error)
--	Write(buffers [][]byte, offset int) (int, error)
--	MTU() (int, error)
--	Name() (string, error)
--	BatchSize() int
--	Close() error
--}
--
--// newIPStack constructs the selected userspace IP stack.
--func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
--	mode := option.Mode
--	if mode == ipStackAuto {
--		if features.WithGVisor {
--			mode = ipStackGVisor
--		} else {
--			mode = ipStackMips
--		}
--	}
--	switch mode {
--	case ipStackGVisor:
--		return wireguard.NewStackDevice(localAddresses, mtu)
--	case ipStackMips:
--		return mipstack.New(mipstack.Config{
--			LocalAddresses: localAddresses,
--			MTU:            mtu,
--			TCP: mipstack.TCPSocketDefaults{
--				CongestionControl: mipstack.CongestionControl(option.CongestionController),
--				// Align with sing-wireguard: enable keepalive with 15-second
--				// idle/interval timing and gVisor's default probe count.
--				KeepAlive: true,
--				KeepAliveConfig: mipstack.KeepAliveConfig{
--					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
--				},
--			},
--		})
--	default:
--		return nil, errors.New("invalid IP stack mode")
--	}
--}
--
--var _ ipStack = (*mipstack.Stack)(nil)
--var _ ipStack = (wireguard.Device)(nil)
--
--type ipStackNetDialer struct {
--	stack ipStack
--}
--
--var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
--
--func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
--	dst, err := netip.ParseAddrPort(address)
--	if err != nil {
--		return nil, fmt.Errorf("invalid address %q: %w", address, err)
--	}
--	switch {
--	case strings.HasPrefix(network, "tcp"):
--		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
--	case strings.HasPrefix(network, "udp"):
--		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
--	default:
--		return nil, fmt.Errorf("invalid network %q", network)
--	}
--}
--
- type wireguardDevice interface {
- 	ipStack
- 	tun.Device
-diff --git a/adapter/outbound/wireguard_stub.go b/adapter/outbound/wireguard_stub.go
-new file mode 100644
-index 0000000..b82519a
---- /dev/null
-+++ b/adapter/outbound/wireguard_stub.go
-@@ -0,0 +1,84 @@
-+//go:build no_wireguard
-+
-+package outbound
-+
-+import "fmt"
-+
-+type WireGuard struct {
-+	*Base
-+}
-+
-+type WireGuardOption struct {
-+	BasicOption
-+	WireGuardPeerOption
-+	Name                string `proxy:"name"`
-+	Ip                  string `proxy:"ip,omitempty"`
-+	Ipv6                string `proxy:"ipv6,omitempty"`
-+	PrivateKey          string `proxy:"private-key"`
-+	Workers             int    `proxy:"workers,omitempty"`
-+	MTU                 int    `proxy:"mtu,omitempty"`
-+	UDP                 bool   `proxy:"udp,omitempty"`
-+	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
-+
-+	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
-+
-+	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
-+
-+	Peers []WireGuardPeerOption `proxy:"peers,omitempty"`
-+
-+	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
-+	Dns              []string `proxy:"dns,omitempty"`
-+
-+	RefreshServerIPInterval int `proxy:"refresh-server-ip-interval,omitempty"`
-+}
-+
-+type WireGuardPeerOption struct {
-+	Server       string   `proxy:"server,omitempty"`
-+	Port         int      `proxy:"port,omitempty"`
-+	PublicKey    string   `proxy:"public-key,omitempty"`
-+	PreSharedKey string   `proxy:"pre-shared-key,omitempty"`
-+	Reserved     []uint8  `proxy:"reserved,omitempty"`
-+	AllowedIPs   []string `proxy:"allowed-ips,omitempty"`
-+}
-+
-+type AmneziaWGOption struct {
-+	Version int `proxy:"version,omitempty"`
-+
-+	JC   int `proxy:"jc,omitempty"`
-+	JMin int `proxy:"jmin,omitempty"`
-+	JMax int `proxy:"jmax,omitempty"`
-+	S1   int `proxy:"s1,omitempty"`
-+	S2   int `proxy:"s2,omitempty"`
-+	S3   int `proxy:"s3,omitempty"`
-+	S4   int `proxy:"s4,omitempty"`
-+
-+	H1 string `proxy:"h1,omitempty"`
-+	H2 string `proxy:"h2,omitempty"`
-+	H3 string `proxy:"h3,omitempty"`
-+	H4 string `proxy:"h4,omitempty"`
-+
-+	I1 string `proxy:"i1,omitempty"`
-+	I2 string `proxy:"i2,omitempty"`
-+	I3 string `proxy:"i3,omitempty"`
-+	I4 string `proxy:"i4,omitempty"`
-+	I5 string `proxy:"i5,omitempty"`
-+
-+	J1    string `proxy:"j1,omitempty"`
-+	J2    string `proxy:"j2,omitempty"`
-+	J3    string `proxy:"j3,omitempty"`
-+	Itime int64  `proxy:"itime,omitempty"`
-+
-+	HeaderProtectionKey    string `proxy:"header-protection-key,omitempty"`
-+	ContentPaddingAddition string `proxy:"content-padding-addition,omitempty"`
-+	RekeyAfterTime         string `proxy:"rekey-after-time,omitempty"`
-+	RekeyTimeout           string `proxy:"rekey-timeout,omitempty"`
-+	RejectAfterTime        string `proxy:"reject-after-time,omitempty"`
-+	KeepaliveTimeout       string `proxy:"keepalive-timeout,omitempty"`
-+	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
-+	RandomTrailers         bool   `proxy:"random-trailers,omitempty"`
-+	DisableCookies         bool   `proxy:"disable-cookies,omitempty"`
-+}
-+
-+func NewWireGuard(WireGuardOption) (*WireGuard, error) {
-+	return nil, fmt.Errorf("wireguard support is disabled by \"no_wireguard\" build tag")
-+}
-diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
-index 511235a5..efdb5682 100644
---- a/adapter/outbound/base.go
-+++ b/adapter/outbound/base.go
-@@ -5,6 +5,7 @@ import (
- 	"encoding/json"
- 	"fmt"
- 	"net"
-+	"net/netip"
- 	"runtime"
- 	"sync"
- 	"syscall"
-@@ -360,11 +361,15 @@ func (c *packetConn) AddRef(ref any) {
- }
- 
- func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
-+	return newPacketConn(pc, a, a.ResolveUDP)
-+}
-+
-+func newPacketConn(pc net.PacketConn, a ProxyAdapter, resolveUDP func(context.Context, *C.Metadata) error) C.PacketConn {
- 	epc := N.NewEnhancePacketConn(pc)
- 	if _, ok := pc.(syscall.Conn); !ok { // exclusion system conn like *net.UDPConn
- 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
- 	}
--	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
-+	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), resolveUDP}
- 	cpc.AppendToChains(a)
- 	return cpc
- }
-@@ -379,6 +384,15 @@ type autoCloseProxyAdapter struct {
- 	closeErr  error
- }
- 
-+func (p *autoCloseProxyAdapter) ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error {
-+	if controller, ok := p.ProxyAdapter.(interface {
-+		ICMPControl(netip.Addr) func(string, string, syscall.RawConn) error
-+	}); ok {
-+		return controller.ICMPControl(destination)
-+	}
-+	return dialer.ICMPControl(destination)
-+}
-+
- func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
- 	c, err := p.ProxyAdapter.DialContext(ctx, metadata)
- 	if err != nil {
 diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
 index 1e2b2ef7..d6d2f2ae 100644
 --- a/adapter/outbound/direct.go
@@ -1153,7 +270,7 @@ index 1e2b2ef7..d6d2f2ae 100644
  	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
  	if err != nil {
  		return nil, err
-@@ -39,6 +45,9 @@ func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata) {
+@@ -39,6 +45,9 @@ func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
  	if err := d.loopBack.CheckPacketConn(metadata); err != nil {
  		return nil, err
  	}
@@ -2106,3 +1223,870 @@ index 00000000..3bb768f9
 +type testDirectUDPConnectionRefusedError struct{}
 +
 +func (testDirectUDPConnectionRefusedError) Error() string { return "connection refused" }
+diff --git a/adapter/outbound/hysteria.go b/adapter/outbound/hysteria.go
+index 26032953..f945daed 100644
+--- a/adapter/outbound/hysteria.go
++++ b/adapter/outbound/hysteria.go
+@@ -252,6 +252,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:    &option,
+ 		client:    client,
+@@ -281,7 +282,7 @@ func (c *hyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+ 		return
+ 	}
+ 	n = copy(p, b)
+-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
++	addr = hysteriaPacketAddr(addrStr)
+ 	return
+ }
+ 
+@@ -291,10 +292,18 @@ func (c *hyPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, e
+ 		return
+ 	}
+ 	data = b
+-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
++	addr = hysteriaPacketAddr(addrStr)
+ 	return
+ }
+ 
++func hysteriaPacketAddr(addr string) net.Addr {
++	destination := M.ParseSocksaddr(addr)
++	if destination.IsFqdn() {
++		return destination
++	}
++	return destination.UDPAddr()
++}
++
+ func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+ 	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
+ 	if err != nil {
+diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
+index 4731611f..6e3018cd 100644
+--- a/adapter/outbound/hysteria2.go
++++ b/adapter/outbound/hysteria2.go
+@@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option: &option,
+ 	}
+diff --git a/adapter/outbound/ipstack.go b/adapter/outbound/ipstack.go
+new file mode 100644
+index 00000000..3b10bfd2
+--- /dev/null
++++ b/adapter/outbound/ipstack.go
+@@ -0,0 +1,122 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"strings"
++	"time"
++
++	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/constant/features"
++
++	"github.com/metacubex/mipstack"
++)
++
++const (
++	ipStackAuto   = "auto"
++	ipStackGVisor = "gvisor"
++	ipStackMips   = "mips"
++)
++
++type IPStackOption struct {
++	Mode                 string `proxy:"mode,omitempty"`
++	CongestionController string `proxy:"congestion-controller,omitempty"`
++}
++
++func (o *IPStackOption) normalize() {
++	o.Mode = strings.ToLower(o.Mode)
++	if o.Mode == "" {
++		o.Mode = ipStackAuto
++	}
++	o.CongestionController = strings.ToLower(o.CongestionController)
++}
++
++func (o IPStackOption) validate() error {
++	switch o.Mode {
++	case ipStackAuto, ipStackMips:
++	case ipStackGVisor:
++		if !features.WithGVisor {
++			return errors.New("gVisor IP stack requires the with_gvisor build tag")
++		}
++	default:
++		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
++	}
++	switch o.CongestionController {
++	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
++		return nil
++	default:
++		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
++	}
++}
++
++// ipStack is the mihomo IP stack's packet and socket surface.
++type ipStack interface {
++	Start() error
++	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
++	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
++	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
++	Read(buffers [][]byte, sizes []int, offset int) (int, error)
++	Write(buffers [][]byte, offset int) (int, error)
++	MTU() (int, error)
++	Name() (string, error)
++	BatchSize() int
++	Close() error
++}
++
++// newIPStack constructs the selected userspace IP stack.
++func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
++	mode := option.Mode
++	if mode == ipStackAuto {
++		if features.WithGVisor {
++			mode = ipStackGVisor
++		} else {
++			mode = ipStackMips
++		}
++	}
++	switch mode {
++	case ipStackGVisor:
++		return newGVisorIPStack(localAddresses, mtu)
++	case ipStackMips:
++		return mipstack.New(mipstack.Config{
++			LocalAddresses: localAddresses,
++			MTU:            mtu,
++			TCP: mipstack.TCPSocketDefaults{
++				CongestionControl: option.CongestionController,
++				// Align with sing-wireguard: enable keepalive with 15-second
++				// idle/interval timing and gVisor's default probe count.
++				KeepAlive: true,
++				KeepAliveConfig: mipstack.KeepAliveConfig{
++					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
++				},
++			},
++		})
++	default:
++		return nil, errors.New("invalid IP stack mode")
++	}
++}
++
++var _ ipStack = (*mipstack.Stack)(nil)
++
++type ipStackNetDialer struct {
++	stack ipStack
++}
++
++var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
++
++func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	dst, err := netip.ParseAddrPort(address)
++	if err != nil {
++		return nil, fmt.Errorf("invalid address %q: %w", address, err)
++	}
++	switch {
++	case strings.HasPrefix(network, "tcp"):
++		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
++	case strings.HasPrefix(network, "udp"):
++		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
++	default:
++		return nil, fmt.Errorf("invalid network %q", network)
++	}
++}
+diff --git a/adapter/outbound/ipstack_gvisor.go b/adapter/outbound/ipstack_gvisor.go
+new file mode 100644
+index 00000000..36f00af5
+--- /dev/null
++++ b/adapter/outbound/ipstack_gvisor.go
+@@ -0,0 +1,15 @@
++//go:build with_gvisor
++
++package outbound
++
++import (
++	"net/netip"
++
++	wireguard "github.com/metacubex/sing-wireguard"
++)
++
++func newGVisorIPStack(localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
++	return wireguard.NewStackDevice(localAddresses, mtu)
++}
++
++var _ ipStack = (wireguard.Device)(nil)
+diff --git a/adapter/outbound/ipstack_gvisor_stub.go b/adapter/outbound/ipstack_gvisor_stub.go
+new file mode 100644
+index 00000000..eaec1541
+--- /dev/null
++++ b/adapter/outbound/ipstack_gvisor_stub.go
+@@ -0,0 +1,12 @@
++//go:build !with_gvisor
++
++package outbound
++
++import (
++	"errors"
++	"net/netip"
++)
++
++func newGVisorIPStack([]netip.Prefix, uint32) (ipStack, error) {
++	return nil, errors.New("gVisor IP stack requires the with_gvisor build tag")
++}
+diff --git a/adapter/outbound/mieru.go b/adapter/outbound/mieru.go
+index 9f4e82d6..11fe5802 100644
+--- a/adapter/outbound/mieru.go
++++ b/adapter/outbound/mieru.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/mieru_stub.go b/adapter/outbound/mieru_stub.go
+new file mode 100644
+index 00000000..46e6fd38
+--- /dev/null
++++ b/adapter/outbound/mieru_stub.go
+@@ -0,0 +1,28 @@
++//go:build no_mieru
++
++package outbound
++
++import "fmt"
++
++type Mieru struct {
++	*Base
++}
++
++type MieruOption struct {
++	BasicOption
++	Name           string `proxy:"name"`
++	Server         string `proxy:"server"`
++	Port           int    `proxy:"port,omitempty"`
++	PortRange      string `proxy:"port-range,omitempty"`
++	Transport      string `proxy:"transport"`
++	UDP            bool   `proxy:"udp,omitempty"`
++	UserName       string `proxy:"username"`
++	Password       string `proxy:"password"`
++	Multiplexing   string `proxy:"multiplexing,omitempty"`
++	HandshakeMode  string `proxy:"handshake-mode,omitempty"`
++	TrafficPattern string `proxy:"traffic-pattern,omitempty"`
++}
++
++func NewMieru(MieruOption) (*Mieru, error) {
++	return nil, fmt.Errorf("mieru support is disabled by \"no_mieru\" build tag")
++}
+diff --git a/adapter/outbound/mieru_test.go b/adapter/outbound/mieru_test.go
+index f47cf998..661c1dcb 100644
+--- a/adapter/outbound/mieru_test.go
++++ b/adapter/outbound/mieru_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package outbound
+ 
+ import "testing"
+diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
+index 3c7b1e63..a30187b4 100644
+--- a/adapter/outbound/openvpn.go
++++ b/adapter/outbound/openvpn.go
+@@ -1,3 +1,5 @@
++//go:build !no_openvpn
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/openvpn_stub.go b/adapter/outbound/openvpn_stub.go
+new file mode 100644
+index 00000000..368bf673
+--- /dev/null
++++ b/adapter/outbound/openvpn_stub.go
+@@ -0,0 +1,47 @@
++//go:build no_openvpn
++
++package outbound
++
++import "fmt"
++
++type OpenVPN struct {
++	*Base
++}
++
++type OpenVPNOption struct {
++	BasicOption
++	Name               string            `proxy:"name"`
++	Server             string            `proxy:"server"`
++	Port               int               `proxy:"port"`
++	Proto              string            `proxy:"proto,omitempty"`
++	Dev                string            `proxy:"dev,omitempty"`
++	Cipher             string            `proxy:"cipher,omitempty"`
++	DataCiphers        []string          `proxy:"data-ciphers,omitempty"`
++	DataCipherFallback string            `proxy:"data-ciphers-fallback,omitempty"`
++	Auth               string            `proxy:"auth,omitempty"`
++	CompLZO            string            `proxy:"comp-lzo,omitempty"`
++	CA                 string            `proxy:"ca"`
++	Cert               string            `proxy:"cert,omitempty"`
++	Key                string            `proxy:"key,omitempty"`
++	TLSAuth            string            `proxy:"tls-auth,omitempty"`
++	KeyDirection       string            `proxy:"key-direction,omitempty"`
++	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
++	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
++	Username           string            `proxy:"username,omitempty"`
++	Password           string            `proxy:"password,omitempty"`
++	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
++	Ping               int               `proxy:"ping,omitempty"`
++	PingRestart        int               `proxy:"ping-restart,omitempty"`
++	HandshakeTimeout   int               `proxy:"handshake-timeout,omitempty"`
++	MTU                int               `proxy:"mtu,omitempty"`
++	UDP                bool              `proxy:"udp,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++}
++
++func NewOpenVPN(OpenVPNOption) (*OpenVPN, error) {
++	return nil, fmt.Errorf("openvpn support is disabled by \"no_openvpn\" build tag")
++}
+diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
+index 8fefe367..fc42ee35 100644
+--- a/adapter/outbound/shadowquic.go
++++ b/adapter/outbound/shadowquic.go
+@@ -167,6 +167,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:     &option,
+ 		quicConfig: quicConfig,
+diff --git a/adapter/outbound/shadowsocks.go b/adapter/outbound/shadowsocks.go
+index 8c562a8d..41e9fcde 100644
+--- a/adapter/outbound/shadowsocks.go
++++ b/adapter/outbound/shadowsocks.go
+@@ -260,7 +260,7 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
+ 		if err = ss.ResolveUDP(ctx, metadata); err != nil {
+ 			return nil, err
+ 		}
+-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
++		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 		if ss.option.UDPOverTCPVersion == uot.LegacyVersion {
+ 			return NewPacketConn(N.NewThreadSafePacketConn(uot.NewConn(c, uot.Request{Destination: destination})), ss), nil
+ 		} else {
+@@ -507,6 +507,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		method: method,
+ 
+diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
+index fd386a8a..31b7793f 100644
+--- a/adapter/outbound/shadowsocksr.go
++++ b/adapter/outbound/shadowsocksr.go
+@@ -169,6 +169,7 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:   &option,
+ 		cipher:   coreCiph,
+diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
+index c4142ec4..4f523d2d 100644
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -272,6 +272,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:          &option,
+ 		psk:             psk,
+diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
+index 7f3f111f..dfde7f09 100644
+--- a/adapter/outbound/socks5.go
++++ b/adapter/outbound/socks5.go
+@@ -201,6 +201,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:         &option,
+ 		user:           option.UserName,
+diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
+index 839be32e..6b192ba5 100644
+--- a/adapter/outbound/sudoku.go
++++ b/adapter/outbound/sudoku.go
+@@ -1,3 +1,5 @@
++//go:build !no_sudoku
++
+ package outbound
+ 
+ import (
+@@ -237,6 +239,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:   &option,
+ 		baseConf: baseConf,
+diff --git a/adapter/outbound/sudoku_stub.go b/adapter/outbound/sudoku_stub.go
+new file mode 100644
+index 00000000..149d44cd
+--- /dev/null
++++ b/adapter/outbound/sudoku_stub.go
+@@ -0,0 +1,45 @@
++//go:build no_sudoku
++
++package outbound
++
++import "fmt"
++
++type Sudoku struct {
++	*Base
++}
++
++type SudokuOption struct {
++	BasicOption
++	Name               string                 `proxy:"name"`
++	Server             string                 `proxy:"server"`
++	Port               int                    `proxy:"port"`
++	Key                string                 `proxy:"key"`
++	AEADMethod         string                 `proxy:"aead-method,omitempty"`
++	PaddingMin         *int                   `proxy:"padding-min,omitempty"`
++	PaddingMax         *int                   `proxy:"padding-max,omitempty"`
++	TableType          string                 `proxy:"table-type,omitempty"`
++	EnablePureDownlink *bool                  `proxy:"enable-pure-downlink,omitempty"`
++	HTTPMask           *bool                  `proxy:"http-mask,omitempty"`
++	HTTPMaskMode       string                 `proxy:"http-mask-mode,omitempty"`
++	HTTPMaskTLS        bool                   `proxy:"http-mask-tls,omitempty"`
++	HTTPMaskHost       string                 `proxy:"http-mask-host,omitempty"`
++	PathRoot           string                 `proxy:"path-root,omitempty"`
++	Multiplex          string                 `proxy:"multiplex,omitempty"`
++	HTTPMaskMultiplex  string                 `proxy:"http-mask-multiplex,omitempty"`
++	HTTPMaskOptions    *SudokuHTTPMaskOptions `proxy:"httpmask,omitempty"`
++	CustomTable        string                 `proxy:"custom-table,omitempty"`
++	CustomTables       []string               `proxy:"custom-tables,omitempty"`
++}
++
++type SudokuHTTPMaskOptions struct {
++	Disable   bool   `proxy:"disable,omitempty"`
++	Mode      string `proxy:"mode,omitempty"`
++	TLS       bool   `proxy:"tls,omitempty"`
++	Host      string `proxy:"host,omitempty"`
++	PathRoot  string `proxy:"path-root,omitempty"`
++	Multiplex string `proxy:"multiplex,omitempty"`
++}
++
++func NewSudoku(SudokuOption) (*Sudoku, error) {
++	return nil, fmt.Errorf("sudoku support is disabled by \"no_sudoku\" build tag")
++}
+diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
+index d581e80a..28f10856 100644
+--- a/adapter/outbound/trojan.go
++++ b/adapter/outbound/trojan.go
+@@ -299,6 +299,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:      &option,
+ 		hexPassword: trojan.Key(option.Password),
+diff --git a/adapter/outbound/tuic.go b/adapter/outbound/tuic.go
+index ed54d99f..15d0efde 100644
+--- a/adapter/outbound/tuic.go
++++ b/adapter/outbound/tuic.go
+@@ -96,7 +96,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
+ 
+ 		// tuic uos use stream-oriented udp with a special address, so we need a net.UDPAddr
+ 
+-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
++		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 		if t.option.UDPOverStreamVersion == uot.LegacyVersion {
+ 			return NewPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
+ 		} else {
+@@ -249,6 +249,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:     &option,
+ 		quicConfig: quicConfig,
+diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
+index 6b9edd38..3ae778e9 100644
+--- a/adapter/outbound/vless.go
++++ b/adapter/outbound/vless.go
+@@ -285,6 +285,12 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 				Host:    packetaddr.SeqPacketMagicAddress,
+ 				DstPort: 443,
+ 			}
++		} else if v.option.XUDP && metadata.Host != "" {
++			metadata = &C.Metadata{
++				NetWork: C.UDP,
++				Host:    metadata.Host,
++				DstPort: metadata.DstPort,
++			}
+ 		} else {
+ 			metadata = &C.Metadata{ // a clear metadata only contains ip
+ 				NetWork: C.UDP,
+@@ -391,7 +397,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
+ 		return NewPacketConn(N.NewThreadSafePacketConn(
+ 			vmessSing.NewXUDPConn(c,
+ 				globalID,
+-				M.SocksaddrFromNet(metadata.UDPAddr())),
++				M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)),
+ 		), v), nil
+ 	} else if v.option.PacketAddr {
+ 		return NewPacketConn(N.NewThreadSafePacketConn(
+@@ -501,6 +507,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    option.XUDP,
+ 		}),
+ 		client: client,
+ 		option: &option,
+diff --git a/adapter/outbound/vless_test.go b/adapter/outbound/vless_test.go
+new file mode 100644
+index 00000000..4c83403c
+--- /dev/null
++++ b/adapter/outbound/vless_test.go
+@@ -0,0 +1,28 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestVlessXUDPLeavesDomainForRemoteResolution(t *testing.T) {
++	v := &Vless{
++		Base:   NewBase(BaseOption{RemoteDNS: true}),
++		option: &VlessOption{XUDP: true},
++	}
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    "quic.example",
++		DstPort: 443,
++		DNSMode: C.DNSFakeIP,
++	}
++
++	if err := v.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.DstIP.IsValid() {
++		t.Fatalf("ResolveUDP() unexpectedly resolved domain to %s", metadata.DstIP)
++	}
++}
+diff --git a/adapter/outbound/vmess.go b/adapter/outbound/vmess.go
+index aef7cce8..811ea92c 100644
+--- a/adapter/outbound/vmess.go
++++ b/adapter/outbound/vmess.go
+@@ -304,11 +304,11 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 			if useEarly {
+ 				conn = v.client.DialEarlyXUDPPacketConn(c,
+ 					globalID,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			} else {
+ 				conn, err = v.client.DialXUDPPacketConn(c,
+ 					globalID,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			}
+ 		} else if v.option.PacketAddr {
+ 			if useEarly {
+@@ -322,10 +322,10 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 		} else {
+ 			if useEarly {
+ 				conn = v.client.DialEarlyPacketConn(c,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			} else {
+ 				conn, err = v.client.DialPacketConn(c,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			}
+ 		}
+ 	} else {
+@@ -435,7 +435,7 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
+ 	if pc, ok := c.(net.PacketConn); ok {
+ 		return NewPacketConn(N.NewThreadSafePacketConn(pc), v), nil
+ 	}
+-	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: metadata.UDPAddr()}, v), nil
++	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)}, v), nil
+ }
+ 
+ // ProxyInfo implements C.ProxyAdapter
+@@ -504,6 +504,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		client: client,
+ 		option: &option,
+diff --git a/adapter/outbound/wireguard.go b/adapter/outbound/wireguard.go
+index 8b5abcec..81ab6fc5 100644
+--- a/adapter/outbound/wireguard.go
++++ b/adapter/outbound/wireguard.go
+@@ -1,10 +1,11 @@
++//go:build !no_wireguard
++
+ package outbound
+ 
+ import (
+ 	"context"
+ 	"encoding/base64"
+ 	"encoding/hex"
+-	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -20,13 +21,11 @@ import (
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	"github.com/metacubex/mihomo/component/slowdown"
+ 	C "github.com/metacubex/mihomo/constant"
+-	"github.com/metacubex/mihomo/constant/features"
+ 	"github.com/metacubex/mihomo/dns"
+ 	"github.com/metacubex/mihomo/log"
+ 
+ 	amneziav3 "github.com/metacubex/amneziawg-go/device"
+ 	amnezia "github.com/metacubex/amneziawg-go/device_v1"
+-	"github.com/metacubex/mipstack"
+ 	wireguard "github.com/metacubex/sing-wireguard"
+ 	"github.com/metacubex/wireguard-go/device"
+ 	"github.com/metacubex/wireguard-go/tun"
+@@ -36,12 +35,6 @@ import (
+ 	M "github.com/metacubex/sing/common/metadata"
+ )
+ 
+-const (
+-	ipStackAuto   = "auto"
+-	ipStackGVisor = "gvisor"
+-	ipStackMips   = "mips"
+-)
+-
+ type wireguardGoDevice interface {
+ 	Close()
+ 	IpcSet(uapiConf string) error
+@@ -140,108 +133,6 @@ type AmneziaWGOption struct {
+ 	DisableCookies         bool   `proxy:"disable-cookies,omitempty"` // AmneziaWG v3.1+
+ }
+ 
+-type IPStackOption struct {
+-	Mode                 string `proxy:"mode,omitempty"`
+-	CongestionController string `proxy:"congestion-controller,omitempty"`
+-}
+-
+-func (o *IPStackOption) normalize() {
+-	o.Mode = strings.ToLower(o.Mode)
+-	if o.Mode == "" {
+-		o.Mode = ipStackAuto
+-	}
+-	o.CongestionController = strings.ToLower(o.CongestionController)
+-}
+-
+-func (o IPStackOption) validate() error {
+-	switch o.Mode {
+-	case ipStackAuto, ipStackMips:
+-	case ipStackGVisor:
+-		if !features.WithGVisor {
+-			return errors.New("gVisor IP stack requires the with_gvisor build tag")
+-		}
+-	default:
+-		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
+-	}
+-	switch o.CongestionController {
+-	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
+-		return nil
+-	default:
+-		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
+-	}
+-}
+-
+-// ipStack is the mihomo IP stack's packet and socket surface, adapted from
+-// sing-wireguard only for gVisor.
+-type ipStack interface {
+-	Start() error
+-	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+-	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+-	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
+-	Read(buffers [][]byte, sizes []int, offset int) (int, error)
+-	Write(buffers [][]byte, offset int) (int, error)
+-	MTU() (int, error)
+-	Name() (string, error)
+-	BatchSize() int
+-	Close() error
+-}
+-
+-// newIPStack constructs the selected userspace IP stack.
+-func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
+-	mode := option.Mode
+-	if mode == ipStackAuto {
+-		if features.WithGVisor {
+-			mode = ipStackGVisor
+-		} else {
+-			mode = ipStackMips
+-		}
+-	}
+-	switch mode {
+-	case ipStackGVisor:
+-		return wireguard.NewStackDevice(localAddresses, mtu)
+-	case ipStackMips:
+-		return mipstack.New(mipstack.Config{
+-			LocalAddresses: localAddresses,
+-			MTU:            mtu,
+-			TCP: mipstack.TCPSocketDefaults{
+-				CongestionControl: option.CongestionController,
+-				// Align with sing-wireguard: enable keepalive with 15-second
+-				// idle/interval timing and gVisor's default probe count.
+-				KeepAlive: true,
+-				KeepAliveConfig: mipstack.KeepAliveConfig{
+-					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
+-				},
+-			},
+-		})
+-	default:
+-		return nil, errors.New("invalid IP stack mode")
+-	}
+-}
+-
+-var _ ipStack = (*mipstack.Stack)(nil)
+-var _ ipStack = (wireguard.Device)(nil)
+-
+-type ipStackNetDialer struct {
+-	stack ipStack
+-}
+-
+-var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
+-
+-func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+-	dst, err := netip.ParseAddrPort(address)
+-	if err != nil {
+-		return nil, fmt.Errorf("invalid address %q: %w", address, err)
+-	}
+-	switch {
+-	case strings.HasPrefix(network, "tcp"):
+-		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
+-	case strings.HasPrefix(network, "udp"):
+-		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
+-	default:
+-		return nil, fmt.Errorf("invalid network %q", network)
+-	}
+-}
+-
+ type wireguardDevice interface {
+ 	ipStack
+ 	tun.Device
+diff --git a/adapter/outbound/wireguard_stub.go b/adapter/outbound/wireguard_stub.go
+new file mode 100644
+index 00000000..847279f4
+--- /dev/null
++++ b/adapter/outbound/wireguard_stub.go
+@@ -0,0 +1,84 @@
++//go:build no_wireguard
++
++package outbound
++
++import "fmt"
++
++type WireGuard struct {
++	*Base
++}
++
++type WireGuardOption struct {
++	BasicOption
++	WireGuardPeerOption
++	Name                string `proxy:"name"`
++	Ip                  string `proxy:"ip,omitempty"`
++	Ipv6                string `proxy:"ipv6,omitempty"`
++	PrivateKey          string `proxy:"private-key"`
++	Workers             int    `proxy:"workers,omitempty"`
++	MTU                 int    `proxy:"mtu,omitempty"`
++	UDP                 bool   `proxy:"udp,omitempty"`
++	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
++
++	Peers []WireGuardPeerOption `proxy:"peers,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++
++	RefreshServerIPInterval int `proxy:"refresh-server-ip-interval,omitempty"`
++}
++
++type WireGuardPeerOption struct {
++	Server       string   `proxy:"server,omitempty"`
++	Port         int      `proxy:"port,omitempty"`
++	PublicKey    string   `proxy:"public-key,omitempty"`
++	PreSharedKey string   `proxy:"pre-shared-key,omitempty"`
++	Reserved     []uint8  `proxy:"reserved,omitempty"`
++	AllowedIPs   []string `proxy:"allowed-ips,omitempty"`
++}
++
++type AmneziaWGOption struct {
++	Version int `proxy:"version,omitempty"`
++
++	JC   int `proxy:"jc,omitempty"`
++	JMin int `proxy:"jmin,omitempty"`
++	JMax int `proxy:"jmax,omitempty"`
++	S1   int `proxy:"s1,omitempty"`
++	S2   int `proxy:"s2,omitempty"`
++	S3   int `proxy:"s3,omitempty"`
++	S4   int `proxy:"s4,omitempty"`
++
++	H1 string `proxy:"h1,omitempty"`
++	H2 string `proxy:"h2,omitempty"`
++	H3 string `proxy:"h3,omitempty"`
++	H4 string `proxy:"h4,omitempty"`
++
++	I1 string `proxy:"i1,omitempty"`
++	I2 string `proxy:"i2,omitempty"`
++	I3 string `proxy:"i3,omitempty"`
++	I4 string `proxy:"i4,omitempty"`
++	I5 string `proxy:"i5,omitempty"`
++
++	J1    string `proxy:"j1,omitempty"`
++	J2    string `proxy:"j2,omitempty"`
++	J3    string `proxy:"j3,omitempty"`
++	Itime int64  `proxy:"itime,omitempty"`
++
++	HeaderProtectionKey    string `proxy:"header-protection-key,omitempty"`
++	ContentPaddingAddition string `proxy:"content-padding-addition,omitempty"`
++	RekeyAfterTime         string `proxy:"rekey-after-time,omitempty"`
++	RekeyTimeout           string `proxy:"rekey-timeout,omitempty"`
++	RejectAfterTime        string `proxy:"reject-after-time,omitempty"`
++	KeepaliveTimeout       string `proxy:"keepalive-timeout,omitempty"`
++	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
++	RandomTrailers         bool   `proxy:"random-trailers,omitempty"`
++	DisableCookies         bool   `proxy:"disable-cookies,omitempty"`
++}
++
++func NewWireGuard(WireGuardOption) (*WireGuard, error) {
++	return nil, fmt.Errorf("wireguard support is disabled by \"no_wireguard\" build tag")
++}
