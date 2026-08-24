@@ -100,7 +100,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 			logMetadataErr(metadata, rule, proxyAdapter, err)
 			return nil, err
 		}
-		logMetadata(metadata, rule, conn)
+		logMetadata(metadata, rule, conn.Chains())
 
 		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
@@ -119,7 +119,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 			logMetadataErr(metadata, rule, proxyAdapter, err)
 			return nil, err
 		}
-		logMetadata(metadata, rule, packetConn)
+		logMetadata(metadata, rule, packetConn.Chains())
 
 		packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
@@ -181,7 +181,7 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 		logMetadataErr(metadata, rule, proxyAdapter, err)
 		return nil, err
 	}
-	logMetadata(metadata, rule, packetConn)
+	logMetadata(metadata, rule, packetConn.Chains())
 
 	packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
