@@ -463,19 +463,6 @@ func handleUDPConn(packet C.PacketAdapter) {
 				return nil, nil, err
 			}
 
-			// Fast path for reject rules: absorb the whole session in the nat
-			// table so every following packet is dropped by sender.Send()
-			// without rematching rules, dialing or spawning a read loop.
-			if _, chains, isReject := rejectAdapter(proxy, metadata); isReject {
-				logMetadata(metadata, rule, chains)
-				sender.Close() // a closed sender drops everything handed to it
-				defaultDropParker.Park(udpTimeout, func() {
-					closeAllLocalCoon(key)
-					natTable.Delete(key)
-				})
-				return nil, nil, errRejectAbsorbed
-			}
-
 			dialMetadata := metadata.Pure()
 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 			defer cancel()
@@ -487,7 +474,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			if err != nil {
 				return nil, nil, err
 			}
-			logMetadata(metadata, rule, rawPc.Chains())
+			logMetadata(metadata, rule, rawPc)
 
 			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
 
@@ -502,10 +489,8 @@ func handleUDPConn(packet C.PacketAdapter) {
 		go func() {
 			pc, proxy, err := dial()
 			if err != nil {
-				if !errors.Is(err, errRejectAbsorbed) { // the parker owns the entry now
-					sender.Close()
-					natTable.Delete(key)
-				}
+				sender.Close()
+				natTable.Delete(key)
 				return
 			}
 			sender.Process(pc, proxy)
@@ -520,11 +505,8 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
-	parked := false
 	defer func(conn net.Conn) {
-		if !parked { // ownership was handed over to the drop parker
-			_ = conn.Close()
-		}
+		_ = conn.Close()
 	}(connCtx.Conn())
 
 	metadata := connCtx.Metadata()
@@ -572,23 +554,6 @@ func handleTCPConn(connCtx C.ConnContext) {
 	proxy, rule, err := resolveMetadata(metadata)
 	if err != nil {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
-		return
-	}
-
-	// Fast path for reject rules: there is nothing to dial, so skip the
-	// outbound, the traffic tracker and the relay loop entirely.
-	if rejectProxy, chains, isReject := rejectAdapter(proxy, metadata); isReject {
-		logMetadata(metadata, rule, chains)
-		_ = conn.SetReadDeadline(time.Now()) // stop unfinished peek
-		peekMutex.Lock()
-		defer peekMutex.Unlock()
-		_ = conn.SetReadDeadline(time.Time{}) // reset
-		if rejectProxy.Type() == C.RejectDrop {
-			// Keep the client hanging like a dropped packet would, but park
-			// the connection instead of holding a goroutine and a timer on it.
-			parked = true
-			defaultDropParker.Park(C.DefaultDropTime, func() { _ = conn.Close() })
-		}
 		return
 	}
 
@@ -645,7 +610,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if err != nil {
 		return
 	}
-	logMetadata(metadata, rule, remoteConn.Chains())
+	logMetadata(metadata, rule, remoteConn)
 
 	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, int64(peekLen), 0, true)
 	defer func(remoteConn C.Conn) {
@@ -667,22 +632,22 @@ func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err
 	}
 }
 
-func logMetadata(metadata *C.Metadata, rule C.Rule, chains C.Chain) {
+func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 	switch {
 	case metadata.SpecialProxy != "":
-		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), chains.String())
+		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
 	case rule != nil:
 		if rule.Payload() != "" {
-			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), chains.String())
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), remoteConn.Chains().String())
 		} else {
-			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), chains.String())
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
 	case mode == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	case mode == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
-		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), chains.String())
+		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
 	}
 }
 
