@@ -25,13 +25,8 @@ jobs:
           - 'windows-11-arm' # arm64 windows
           - 'macos-26-intel' # amd64 macos
         go-version:
+          - '1.27'
           - '1.26'
-          - '1.25'
-          - '1.24'
-          - '1.23'
-          - '1.22'
-          - '1.21'
-          - '1.20'
       fail-fast: false
     runs-on: ${{ matrix.os }}
     defaults:
@@ -50,7 +45,6 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
         with:
-          go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
           go-version: ${{ matrix.go-version }}
 
       - name: Verify Go installation
