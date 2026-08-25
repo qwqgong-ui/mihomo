@@ -6,7 +6,7 @@
 # - Runtime IPv6 gate test integration
 #
 diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
-index c4e9c5ce..d16dc13f 100644
+index c4e9c5ce..1a3f5d2e 100644
 --- a/component/dialer/dialer.go
 +++ b/component/dialer/dialer.go
 @@ -13,6 +13,7 @@ import (
@@ -17,7 +17,7 @@ index c4e9c5ce..d16dc13f 100644
  	"github.com/metacubex/mihomo/component/keepalive"
  	"github.com/metacubex/mihomo/component/mptcp"
  	"github.com/metacubex/mihomo/component/resolver"
-@@ -50,32 +51,414 @@ func DialContext(ctx context.Context, network, address string, options ...Option
+@@ -50,32 +51,432 @@ func DialContext(ctx context.Context, network, address string, options ...Option
  		network = fmt.Sprintf("%s%d", network, opt.network)
  	}
  
@@ -346,6 +346,7 @@ index c4e9c5ce..d16dc13f 100644
 +
 +	timer := time.NewTimer(resolver.IPv6Timeout(opt.resolver))
 +	defer timer.Stop()
++	timeout := timer.C
 +	for {
 +		select {
 +		case <-ctx.Done():
@@ -366,8 +367,16 @@ index c4e9c5ce..d16dc13f 100644
 +			}
 +			pending += startDirectConnects(raceCtx, network, port, opt, result.ips, true, connects)
 +			return waitDirectConnects(ctx, connects, pending, errs)
-+		case <-timer.C:
-+			return waitDirectConnects(ctx, connects, pending, errs)
++		case <-timeout:
++			if pending > 0 {
++				return waitDirectConnects(ctx, connects, pending, errs)
++			}
++			// The wait budget only decides how long AAAA may delay a live
++			// IPv4 race. With every IPv4 attempt already failed there is
++			// nothing left to protect, and returning here would fail a
++			// connection the outstanding AAAA answer can still complete, so
++			// keep waiting for that answer instead (ctx still bounds it).
++			timeout = nil
 +		}
 +	}
 +}
@@ -403,11 +412,20 @@ index c4e9c5ce..d16dc13f 100644
 +}
 +
 +func directIPv4Fallback(ctx, raceCtx context.Context, network, port string, opt option, connects chan dialResult, pending int, lookups <-chan lookupResult, ipv4 lookupResult, errs []error) (net.Conn, error) {
-+	if lookups != nil {
++	for lookups != nil {
 +		select {
 +		case <-ctx.Done():
 +			return nil, ctx.Err()
++		case result := <-connects:
++			// A still-pending IPv6 attempt can win while the A answer is
++			// outstanding. Blocking only on the lookup would hold a ready
++			// connection hostage to a slow or dead A query, for up to the
++			// whole DNS timeout.
++			if conn := receiveDirectConnect(result, &pending, &errs); conn != nil {
++				return conn, nil
++			}
 +		case ipv4 = <-lookups:
++			lookups = nil
 +		}
 +	}
 +	if ipv4.err != nil || len(ipv4.ips) == 0 {
@@ -438,7 +456,7 @@ index c4e9c5ce..d16dc13f 100644
  func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort, options ...Option) (net.PacketConn, error) {
  	opt := applyOptions(options...)
  
-@@ -120,6 +503,18 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
+@@ -120,6 +521,18 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
  	return lc.ListenPacket(ctx, network, address)
  }
  
@@ -457,7 +475,7 @@ index c4e9c5ce..d16dc13f 100644
  func dialContext(ctx context.Context, network string, destination netip.Addr, port string, opt option) (net.Conn, error) {
  	var address string
  	destination, port = resolver.LookupIP4P(destination, port)
-@@ -175,12 +570,20 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+@@ -175,12 +588,20 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
  }
  
  func ICMPControl(destination netip.Addr) func(network, address string, conn syscall.RawConn) error {
@@ -479,7 +497,7 @@ index c4e9c5ce..d16dc13f 100644
  		if interfaceName == "" {
  			if finder := DefaultInterfaceFinder.Load(); finder != nil {
  				interfaceName = finder.FindInterfaceName(destination)
-@@ -191,7 +594,10 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
+@@ -191,7 +612,10 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
  				return err
  			}
  		}
@@ -491,7 +509,7 @@ index c4e9c5ce..d16dc13f 100644
  		if routingMark != 0 {
  			bindMarkToDialer(routingMark, dialer, network, destination)
  		}
-@@ -202,12 +608,12 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
+@@ -202,12 +626,12 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
  	}
  }
  
@@ -507,7 +525,7 @@ index c4e9c5ce..d16dc13f 100644
  	}
  	if len(ipv4s) == 0 && len(ipv6s) != 0 {
  		return dialFn(ctx, network, ipv6s, port, opt)
-@@ -228,7 +634,8 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
+@@ -228,7 +652,8 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
  
  	racer := func(ips []netip.Addr, isPrimary bool) {
  		defer wg.Done()
@@ -517,7 +535,7 @@ index c4e9c5ce..d16dc13f 100644
  		defer func() {
  			select {
  			case results <- result:
-@@ -238,7 +645,6 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
+@@ -238,7 +663,6 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
  				}
  			}
  		}()
@@ -525,7 +543,7 @@ index c4e9c5ce..d16dc13f 100644
  	}
  
  	if len(ipv4s) != 0 {
-@@ -264,7 +670,7 @@ loop:
+@@ -264,7 +688,7 @@ loop:
  		select {
  		case <-fallbackTicker.C:
  			if fallback.error == nil && fallback.Conn != nil {
@@ -534,7 +552,7 @@ index c4e9c5ce..d16dc13f 100644
  			}
  		case res, ok := <-results:
  			if !ok {
-@@ -277,7 +683,7 @@ loop:
+@@ -277,7 +701,7 @@ loop:
  							_ = fallback.Conn.Close()
  						}()
  					}
@@ -543,7 +561,7 @@ index c4e9c5ce..d16dc13f 100644
  				}
  				fallback = res
  			} else {
-@@ -291,22 +697,43 @@ loop:
+@@ -291,22 +715,43 @@ loop:
  	}
  
  	if fallback.error == nil && fallback.Conn != nil {
@@ -592,7 +610,7 @@ index c4e9c5ce..d16dc13f 100644
  		result := dialResult{isPrimary: true, ip: ip}
  		defer func() {
  			select {
-@@ -317,7 +744,8 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
+@@ -317,7 +762,8 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
  				}
  			}
  		}()
@@ -602,7 +620,7 @@ index c4e9c5ce..d16dc13f 100644
  	}
  
  	for _, ip := range ips {
-@@ -327,30 +755,30 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
+@@ -327,30 +773,30 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
  	for i := 0; i < len(ips); i++ {
  		res := <-results
  		if res.error == nil {
@@ -640,7 +658,7 @@ index c4e9c5ce..d16dc13f 100644
  }
  
  type dialResult struct {
-@@ -358,6 +786,12 @@ type dialResult struct {
+@@ -358,6 +804,12 @@ type dialResult struct {
  	net.Conn
  	error
  	isPrimary bool
@@ -655,10 +673,10 @@ index c4e9c5ce..d16dc13f 100644
  func parseAddr(ctx context.Context, network, address string, preferResolver resolver.Resolver) ([]netip.Addr, string, error) {
 diff --git a/component/dialer/direct_dualstack_test.go b/component/dialer/direct_dualstack_test.go
 new file mode 100644
-index 00000000..b98b9dc7
+index 00000000..55ffd87f
 --- /dev/null
 +++ b/component/dialer/direct_dualstack_test.go
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,514 @@
 +package dialer
 +
 +import (
@@ -1112,6 +1130,66 @@ index 00000000..b98b9dc7
 +	if len(unchanged) != 1 || unchanged[0] != first {
 +		t.Fatalf("stale winner changed RRset: %v", unchanged)
 +	}
++}
++
++func TestDirectDualStackIPv6WinnerNotHeldBySlowA(t *testing.T) {
++	v6Winner := make(chan struct{})
++	never := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	waitBudget := 30 * time.Millisecond
++	lookup := &controlledLookup{
++		v4Gate: never, v6Gate: closedGate(),
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: waitBudget,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: never},
++			v6: {gate: v6Winner},
++		},
++	}
++	result := runDirectRace(t, lookup, dial)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("first attempt = %s, want IPv6 %s", got, v6)
++	}
++	// Let the ipv6-timeout expire while the A query is still outstanding,
++	// then complete the IPv6 handshake: the winner must not wait for DNS.
++	time.Sleep(waitBudget * 2)
++	close(v6Winner)
++	requireRaceSuccess(t, result)
++}
++
++func TestDirectDualStackFailedIPv4WaitsForPendingAAAA(t *testing.T) {
++	v6Lookup := make(chan struct{})
++	v4Failure := make(chan struct{})
++	v4 := netip.MustParseAddr("192.0.2.1")
++	v6 := netip.MustParseAddr("2001:db8::1")
++	waitBudget := 30 * time.Millisecond
++	lookup := &controlledLookup{
++		v4Gate: closedGate(), v6Gate: v6Lookup,
++		v4: []netip.Addr{v4}, v6: []netip.Addr{v6}, timeout: waitBudget,
++	}
++	dial := &controlledDialer{
++		attempts: make(chan netip.Addr, 4),
++		behaviors: map[netip.Addr]connectBehavior{
++			v4: {gate: v4Failure, err: errors.New("unreachable")},
++			v6: {gate: closedGate()},
++		},
++	}
++	result := runDirectRace(t, lookup, dial)
++	if got := receiveAttempt(t, dial.attempts); got != v4 {
++		t.Fatalf("first attempt = %s, want IPv4 %s", got, v4)
++	}
++	close(v4Failure)
++	// Every IPv4 candidate is gone before the AAAA answer arrives; the race
++	// must still use it instead of failing when the wait budget expires.
++	time.Sleep(waitBudget * 2)
++	close(v6Lookup)
++	if got := receiveAttempt(t, dial.attempts); got != v6 {
++		t.Fatalf("fallback attempt = %s, want IPv6 %s", got, v6)
++	}
++	requireRaceSuccess(t, result)
 +}
 diff --git a/component/dialer/options.go b/component/dialer/options.go
 index c1c622dd..78d43cf4 100644
