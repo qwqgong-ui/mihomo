@@ -1,0 +1,583 @@
+# Functions:
+# - Fake-IP ICMP DIRECT race
+# - Physical-network DNS TUN bypass
+# - Direct-nameserver auto ECS
+#
+diff --git a/listener/sing_tun/fakeip_icmp.go b/listener/sing_tun/fakeip_icmp.go
+new file mode 100644
+index 00000000..61a8c909
+--- /dev/null
++++ b/listener/sing_tun/fakeip_icmp.go
+@@ -0,0 +1,274 @@
++package sing_tun
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"github.com/metacubex/mihomo/component/directrace"
++	"github.com/metacubex/mihomo/component/resolver"
++	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/mihomo/log"
++
++	tun "github.com/metacubex/sing-tun"
++	"github.com/metacubex/sing-tun/ping"
++	"github.com/metacubex/sing/common/buf"
++	M "github.com/metacubex/sing/common/metadata"
++)
++
++const (
++	maxFakeIPICMPCandidates = 8
++	maxFakeIPICMPRequests   = 1024
++)
++
++type icmpDirectResolver interface {
++	ResolveICMPDirect(metadata *C.Metadata) C.ProxyAdapter
++}
++
++type icmpDirectController interface {
++	Name() string
++	ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error
++}
++
++type fakeIPICMPRequest struct {
++	identifier uint16
++	sequence   uint16
++}
++
++type fakeIPICMPRace struct {
++	mu           sync.Mutex
++	closed       atomic.Bool
++	fakeIP       netip.Addr
++	host         string
++	adapter      string
++	backWriter   tun.DirectRouteContext
++	destinations map[netip.Addr]tun.DirectRouteDestination
++	winners      map[uint16]netip.Addr
++	requests     map[fakeIPICMPRequest][]byte
++}
++
++type fakeIPICMPCandidateContext struct {
++	race      *fakeIPICMPRace
++	candidate netip.Addr
++}
++
++func (h *ListenerHandler) prepareFakeIPICMPRace(source, destination M.Socksaddr, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
++	host, loaded := resolver.FindHostByIP(destination.Addr)
++	if !loaded || host == "" {
++		log.Infoln("[ICMP] fake IP %s has no host mapping, using fake ping echo", destination.Addr)
++		return nil, nil
++	}
++	routeResolver, ok := h.Tunnel.(icmpDirectResolver)
++	if !ok {
++		return nil, nil
++	}
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Type:    C.TUN,
++		SrcIP:   source.Addr,
++		Host:    host,
++	}
++	adapter := routeResolver.ResolveICMPDirect(metadata)
++	controller, ok := adapter.(icmpDirectController)
++	if !ok || adapter.Type() != C.Direct {
++		log.Debugln("[ICMP] fake IP %s (%s) is not routed to DIRECT, using fake ping echo", destination.Addr, host)
++		return nil, nil
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
++	var candidates []netip.Addr
++	var err error
++	if destination.Addr.Is6() {
++		candidates, err = resolver.LookupIPv6WithResolver(ctx, host, resolver.DirectHostResolver)
++	} else {
++		candidates, err = resolver.LookupIPv4WithResolver(ctx, host, resolver.DirectHostResolver)
++	}
++	if err != nil || len(candidates) == 0 {
++		log.Debugln("[ICMP] resolve fake IP %s (%s) failed: %v", destination.Addr, host, err)
++		return nil, nil
++	}
++	candidates = uniqueFakeIPICMPCandidates(candidates)
++	if len(candidates) > maxFakeIPICMPCandidates {
++		candidates = candidates[:maxFakeIPICMPCandidates]
++	}
++
++	race := &fakeIPICMPRace{
++		fakeIP:       destination.Addr,
++		host:         host,
++		adapter:      controller.Name(),
++		backWriter:   ping.NewContextDestinationWriter(routeContext, destination.Addr),
++		destinations: make(map[netip.Addr]tun.DirectRouteDestination, len(candidates)),
++		winners:      make(map[uint16]netip.Addr),
++		requests:     make(map[fakeIPICMPRequest][]byte),
++	}
++	var connectErrs []error
++	for _, candidate := range candidates {
++		candidate = candidate.Unmap()
++		candidateContext := &fakeIPICMPCandidateContext{race: race, candidate: candidate}
++		destination, connectErr := ping.ConnectDestination(context.Background(), log.SingLogger, controller.ICMPControl(candidate), candidate, candidateContext, timeout)
++		if connectErr != nil {
++			connectErrs = append(connectErrs, connectErr)
++			continue
++		}
++		race.destinations[candidate] = ping.NewDestinationWriter(destination, candidate)
++	}
++	if len(race.destinations) == 0 {
++		return nil, errors.Join(connectErrs...)
++	}
++	log.Infoln("[ICMP] %s %s --> %s (%s) racing %d DIRECT candidates", "icmp", source, destination.Addr, host, len(race.destinations))
++	return race, nil
++}
++
++func uniqueFakeIPICMPCandidates(candidates []netip.Addr) []netip.Addr {
++	seen := make(map[netip.Addr]struct{}, len(candidates))
++	unique := make([]netip.Addr, 0, len(candidates))
++	for _, candidate := range candidates {
++		candidate = candidate.Unmap()
++		if !candidate.IsValid() {
++			continue
++		}
++		if _, loaded := seen[candidate]; loaded {
++			continue
++		}
++		seen[candidate] = struct{}{}
++		unique = append(unique, candidate)
++	}
++	return unique
++}
++
++func (r *fakeIPICMPRace) WritePacket(packet *buf.Buffer) error {
++	identifier, sequence, payload, ok := parseFakeIPICMPPacket(packet.Bytes(), false, r.fakeIP.Is6())
++	if !ok {
++		packet.Release()
++		return errors.New("invalid ICMP echo request")
++	}
++	request := fakeIPICMPRequest{identifier: identifier, sequence: sequence}
++
++	r.mu.Lock()
++	if len(r.requests) >= maxFakeIPICMPRequests {
++		for oldRequest := range r.requests {
++			delete(r.requests, oldRequest)
++			break
++		}
++	}
++	r.requests[request] = bytes.Clone(payload)
++	winner := r.winners[identifier]
++	var destinations []tun.DirectRouteDestination
++	if winner.IsValid() {
++		if destination := r.destinations[winner]; destination != nil {
++			destinations = append(destinations, destination)
++		}
++	} else {
++		for _, destination := range r.destinations {
++			destinations = append(destinations, destination)
++		}
++	}
++	r.mu.Unlock()
++
++	if len(destinations) == 0 {
++		packet.Release()
++		return errors.New("ICMP race has no live destination")
++	}
++	var errs []error
++	for index, destination := range destinations {
++		outboundPacket := packet
++		if index != len(destinations)-1 {
++			outboundPacket = packet.ToOwned()
++		}
++		if err := destination.WritePacket(outboundPacket); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	return errors.Join(errs...)
++}
++
++func (c *fakeIPICMPCandidateContext) WritePacket(packet []byte) error {
++	return c.race.handleReply(c.candidate, packet)
++}
++
++func (r *fakeIPICMPRace) handleReply(candidate netip.Addr, packet []byte) error {
++	identifier, sequence, payload, ok := parseFakeIPICMPPacket(packet, true, r.fakeIP.Is6())
++	if !ok {
++		return nil
++	}
++	request := fakeIPICMPRequest{identifier: identifier, sequence: sequence}
++	r.mu.Lock()
++	expectedPayload, loaded := r.requests[request]
++	if !loaded || !bytes.Equal(payload, expectedPayload) {
++		r.mu.Unlock()
++		return nil
++	}
++	winner := r.winners[identifier]
++	if winner.IsValid() && winner != candidate {
++		r.mu.Unlock()
++		return nil
++	}
++	if !winner.IsValid() {
++		r.winners[identifier] = candidate
++		directrace.Store(r.host, r.adapter, candidate)
++		log.Debugln("[ICMP] fake IP %s (%s) winner %s", r.fakeIP, r.host, candidate)
++	}
++	delete(r.requests, request)
++	r.mu.Unlock()
++
++	// backWriter rewrites the real source to the original Fake-IP and updates
++	// IPv4/ICMPv6 checksums before the packet re-enters TUN. The application
++	// must never observe the real candidate address.
++	return r.backWriter.WritePacket(packet)
++}
++
++func parseFakeIPICMPPacket(packet []byte, reply, ipv6 bool) (identifier, sequence uint16, payload []byte, ok bool) {
++	headerLength := 40
++	expectedType := byte(128)
++	if reply {
++		expectedType = 129
++	}
++	if !ipv6 {
++		if len(packet) < 20 || packet[0]>>4 != 4 {
++			return
++		}
++		headerLength = int(packet[0]&0x0f) * 4
++		expectedType = 8
++		if reply {
++			expectedType = 0
++		}
++	} else if len(packet) < 40 || packet[0]>>4 != 6 {
++		return
++	}
++	if headerLength < 20 || len(packet) < headerLength+8 || packet[headerLength] != expectedType || packet[headerLength+1] != 0 {
++		return
++	}
++	identifier = binary.BigEndian.Uint16(packet[headerLength+4 : headerLength+6])
++	sequence = binary.BigEndian.Uint16(packet[headerLength+6 : headerLength+8])
++	payload = packet[headerLength+8:]
++	ok = true
++	return
++}
++
++func (r *fakeIPICMPRace) Close() error {
++	if !r.closed.CompareAndSwap(false, true) {
++		return nil
++	}
++	r.mu.Lock()
++	destinations := make([]tun.DirectRouteDestination, 0, len(r.destinations))
++	for _, destination := range r.destinations {
++		destinations = append(destinations, destination)
++	}
++	r.mu.Unlock()
++	var errs []error
++	for _, destination := range destinations {
++		errs = append(errs, destination.Close())
++	}
++	return errors.Join(errs...)
++}
++
++func (r *fakeIPICMPRace) IsClosed() bool {
++	return r.closed.Load()
++}
+diff --git a/listener/sing_tun/fakeip_icmp_test.go b/listener/sing_tun/fakeip_icmp_test.go
+new file mode 100644
+index 00000000..ba953bdc
+--- /dev/null
++++ b/listener/sing_tun/fakeip_icmp_test.go
+@@ -0,0 +1,171 @@
++package sing_tun
++
++import (
++	"encoding/binary"
++	"net/netip"
++	"sync"
++	"testing"
++
++	tun "github.com/metacubex/sing-tun"
++	"github.com/metacubex/sing-tun/ping"
++	"github.com/metacubex/sing/common/buf"
++)
++
++type recordingICMPDestination struct {
++	mu      sync.Mutex
++	packets [][]byte
++	closed  bool
++}
++
++func (d *recordingICMPDestination) WritePacket(packet *buf.Buffer) error {
++	d.mu.Lock()
++	d.packets = append(d.packets, append([]byte(nil), packet.Bytes()...))
++	d.mu.Unlock()
++	packet.Release()
++	return nil
++}
++func (d *recordingICMPDestination) Close() error   { d.closed = true; return nil }
++func (d *recordingICMPDestination) IsClosed() bool { return d.closed }
++func (d *recordingICMPDestination) count() int {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return len(d.packets)
++}
++func (d *recordingICMPDestination) last() []byte {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	return append([]byte(nil), d.packets[len(d.packets)-1]...)
++}
++
++type recordingICMPContext struct {
++	mu      sync.Mutex
++	packets [][]byte
++}
++
++func (c *recordingICMPContext) WritePacket(packet []byte) error {
++	c.mu.Lock()
++	c.packets = append(c.packets, append([]byte(nil), packet...))
++	c.mu.Unlock()
++	return nil
++}
++func (c *recordingICMPContext) count() int {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return len(c.packets)
++}
++func (c *recordingICMPContext) last() []byte {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return append([]byte(nil), c.packets[len(c.packets)-1]...)
++}
++
++func TestFakeIPICMPRacePinsWinnerAndNeverLeaksRealIP(t *testing.T) {
++	fakeIP := netip.MustParseAddr("198.18.0.10")
++	clientIP := netip.MustParseAddr("192.0.2.100")
++	firstIP := netip.MustParseAddr("192.0.2.1")
++	winnerIP := netip.MustParseAddr("192.0.2.2")
++	back := &recordingICMPContext{}
++	first := &recordingICMPDestination{}
++	winner := &recordingICMPDestination{}
++	race := &fakeIPICMPRace{
++		fakeIP:     fakeIP,
++		host:       "game.example",
++		adapter:    "DIRECT-test",
++		backWriter: ping.NewContextDestinationWriter(back, fakeIP),
++		destinations: map[netip.Addr]tun.DirectRouteDestination{
++			firstIP:  ping.NewDestinationWriter(first, firstIP),
++			winnerIP: ping.NewDestinationWriter(winner, winnerIP),
++		},
++		winners:  make(map[uint16]netip.Addr),
++		requests: make(map[fakeIPICMPRequest][]byte),
++	}
++
++	request := makeICMPv4Packet(clientIP, fakeIP, 8, 77, 1, []byte("probe"))
++	if err := race.WritePacket(buf.As(request).ToOwned()); err != nil {
++		t.Fatal(err)
++	}
++	if first.count() != 1 || winner.count() != 1 {
++		t.Fatalf("initial fanout counts = %d, %d; want 1, 1", first.count(), winner.count())
++	}
++	if got := netip.AddrFrom4([4]byte(winner.last()[16:20])); got != winnerIP {
++		t.Fatalf("outgoing destination = %s, want %s", got, winnerIP)
++	}
++
++	reply := makeICMPv4Packet(winnerIP, clientIP, 0, 77, 1, []byte("probe"))
++	if err := race.handleReply(winnerIP, reply); err != nil {
++		t.Fatal(err)
++	}
++	if back.count() != 1 {
++		t.Fatalf("returned packets = %d, want 1", back.count())
++	}
++	returned := back.last()
++	if got := netip.AddrFrom4([4]byte(returned[12:16])); got != fakeIP {
++		t.Fatalf("application observed source %s, want Fake-IP %s", got, fakeIP)
++	}
++
++	lateLoser := makeICMPv4Packet(firstIP, clientIP, 0, 77, 1, []byte("probe"))
++	if err := race.handleReply(firstIP, lateLoser); err != nil {
++		t.Fatal(err)
++	}
++	if back.count() != 1 {
++		t.Fatal("late loser reply reached application")
++	}
++
++	next := makeICMPv4Packet(clientIP, fakeIP, 8, 77, 2, []byte("next"))
++	if err := race.WritePacket(buf.As(next).ToOwned()); err != nil {
++		t.Fatal(err)
++	}
++	if first.count() != 1 || winner.count() != 2 {
++		t.Fatalf("post-pin counts = %d, %d; want 1, 2", first.count(), winner.count())
++	}
++	wrongPayload := makeICMPv4Packet(winnerIP, clientIP, 0, 77, 2, []byte("forged"))
++	_ = race.handleReply(winnerIP, wrongPayload)
++	if back.count() != 1 {
++		t.Fatal("payload-mismatched reply reached application")
++	}
++}
++
++func TestParseFakeIPICMPPacketRejectsWrongTypeAndFamily(t *testing.T) {
++	v4 := makeICMPv4Packet(netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("198.18.0.1"), 8, 1, 2, nil)
++	if _, _, _, ok := parseFakeIPICMPPacket(v4, false, false); !ok {
++		t.Fatal("valid IPv4 echo request rejected")
++	}
++	if _, _, _, ok := parseFakeIPICMPPacket(v4, true, false); ok {
++		t.Fatal("echo request accepted as reply")
++	}
++	if _, _, _, ok := parseFakeIPICMPPacket(v4, false, true); ok {
++		t.Fatal("IPv4 packet accepted in IPv6 race")
++	}
++}
++
++func makeICMPv4Packet(source, destination netip.Addr, typ byte, identifier, sequence uint16, payload []byte) []byte {
++	packet := make([]byte, 20+8+len(payload))
++	packet[0] = 0x45
++	packet[8] = 64
++	packet[9] = 1
++	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
++	copy(packet[12:16], source.AsSlice())
++	copy(packet[16:20], destination.AsSlice())
++	packet[20] = typ
++	binary.BigEndian.PutUint16(packet[24:26], identifier)
++	binary.BigEndian.PutUint16(packet[26:28], sequence)
++	copy(packet[28:], payload)
++	binary.BigEndian.PutUint16(packet[22:24], checksumICMPTest(packet[20:]))
++	binary.BigEndian.PutUint16(packet[10:12], checksumICMPTest(packet[:20]))
++	return packet
++}
++
++func checksumICMPTest(data []byte) uint16 {
++	var sum uint32
++	for len(data) >= 2 {
++		sum += uint32(binary.BigEndian.Uint16(data[:2]))
++		data = data[2:]
++	}
++	if len(data) == 1 {
++		sum += uint32(data[0]) << 8
++	}
++	for sum>>16 != 0 {
++		sum = sum&0xffff + sum>>16
++	}
++	return ^uint16(sum)
++}
+diff --git a/listener/sing_tun/prepare.go b/listener/sing_tun/prepare.go
+index e97771c4..078b92ce 100644
+--- a/listener/sing_tun/prepare.go
++++ b/listener/sing_tun/prepare.go
+@@ -18,7 +18,14 @@ import (
+ func (h *ListenerHandler) PrepareConnection(network string, source M.Socksaddr, destination M.Socksaddr, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
+ 	switch network {
+ 	case N.NetworkICMP: // our fork only send those type to PrepareConnection now
+-		if h.DisableICMPForwarding || h.skipPingForwardingByAddr(destination.Addr) { // skip if ICMP handling is disabled or other condition
++		if h.DisableICMPForwarding {
++			log.Infoln("[ICMP] %s %s --> %s using fake ping echo", network, source, destination)
++			return nil, nil
++		}
++		if resolver.IsFakeIP(destination.Addr) {
++			return h.prepareFakeIPICMPRace(source, destination, routeContext, timeout)
++		}
++		if h.skipPingForwardingByAddr(destination.Addr) { // skip if ICMP handling is disabled or other condition
+ 			log.Infoln("[ICMP] %s %s --> %s using fake ping echo", network, source, destination)
+ 			return nil, nil
+ 		}
+diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
+index 3e5ef591..f8a41f63 100644
+--- a/listener/sing_tun/server.go
++++ b/listener/sing_tun/server.go
+@@ -54,8 +54,10 @@ type Listener struct {
+ 	packageManager          tun.PackageManager
+ 	autoRedirect            tun.AutoRedirect
+ 	autoRedirectOutputMark  int32
++	systemDNSOutputMark     int32
+ 
+-	cDialerInterfaceFinder dialer.InterfaceFinder
++	cDialerInterfaceFinder   dialer.InterfaceFinder
++	systemDNSInterfaceFinder dialer.InterfaceFinder
+ 
+ 	ruleUpdateCallbackCloser io.Closer
+ 	ruleUpdateMutex          sync.Mutex
+@@ -371,12 +373,17 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
+ 			err = E.Cause(err, "start DefaultInterfaceMonitor")
+ 			return
+ 		}
++		l.systemDNSInterfaceFinder = &cDialerInterfaceFinder{
++			tunName:                 tunName,
++			defaultInterfaceMonitor: defaultInterfaceMonitor,
++		}
++		if !dialer.SystemDNSInterfaceFinder.CompareAndSwap(nil, l.systemDNSInterfaceFinder) {
++			err = E.New("not allowed two tun listeners providing the system DNS interface")
++			return
++		}
+ 
+ 		if options.AutoDetectInterface {
+-			l.cDialerInterfaceFinder = &cDialerInterfaceFinder{
+-				tunName:                 tunName,
+-				defaultInterfaceMonitor: defaultInterfaceMonitor,
+-			}
++			l.cDialerInterfaceFinder = l.systemDNSInterfaceFinder
+ 			if !dialer.DefaultInterfaceFinder.CompareAndSwap(nil, l.cDialerInterfaceFinder) {
+ 				err = E.New("not allowed two tun listener using auto-detect-interface")
+ 				return
+@@ -523,6 +530,11 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
+ 			err = E.Cause(err, "auto redirect")
+ 			return
+ 		}
++		l.systemDNSOutputMark = int32(outputMark)
++		if !dialer.SystemDNSRoutingMark.CompareAndSwap(0, l.systemDNSOutputMark) && dialer.SystemDNSRoutingMark.Load() != l.systemDNSOutputMark {
++			err = E.New("not allowed using different system DNS bypass marks across tun listeners")
++			return
++		}
+ 		if tunOptions.AutoRedirectMarkMode {
+ 			l.autoRedirectOutputMark = int32(outputMark)
+ 			if !dialer.DefaultRoutingMark.CompareAndSwap(0, l.autoRedirectOutputMark) {
+@@ -594,6 +606,12 @@ func (l *Listener) updateRule(ruleProvider P.RuleProvider, exclude bool, update
+ }
+ 
+ func (l *Listener) OnReload() {
++	if l.systemDNSInterfaceFinder != nil {
++		dialer.SystemDNSInterfaceFinder.CompareAndSwap(nil, l.systemDNSInterfaceFinder)
++	}
++	if l.systemDNSOutputMark != 0 {
++		dialer.SystemDNSRoutingMark.CompareAndSwap(0, l.systemDNSOutputMark)
++	}
+ 	if l.autoRedirectOutputMark != 0 {
+ 		dialer.DefaultRoutingMark.CompareAndSwap(0, l.autoRedirectOutputMark)
+ 	}
+@@ -668,12 +686,18 @@ func parseRange[T constraints.Integer](uidRanges []ranges.Range[T], rangeList []
+ func (l *Listener) Close() error {
+ 	l.closed = true
+ 	resolver.RemoveSystemDnsBlacklist(l.dnsServerIp...)
++	if l.systemDNSOutputMark != 0 {
++		dialer.SystemDNSRoutingMark.CompareAndSwap(l.systemDNSOutputMark, 0)
++	}
+ 	if l.autoRedirectOutputMark != 0 {
+ 		dialer.DefaultRoutingMark.CompareAndSwap(l.autoRedirectOutputMark, 0)
+ 	}
+ 	if l.cDialerInterfaceFinder != nil {
+ 		dialer.DefaultInterfaceFinder.CompareAndSwap(l.cDialerInterfaceFinder, nil)
+ 	}
++	if l.systemDNSInterfaceFinder != nil {
++		dialer.SystemDNSInterfaceFinder.CompareAndSwap(l.systemDNSInterfaceFinder, nil)
++	}
+ 	return common.Close(
+ 		l.ruleUpdateCallbackCloser,
+ 		l.tunStack,
+diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
+--- a/listener/sing_tun/server.go
++++ b/listener/sing_tun/server.go
+@@ -15,6 +15,7 @@
+ 
+ 	"github.com/metacubex/mihomo/adapter/inbound"
+ 	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/component/ecs"
+ 	"github.com/metacubex/mihomo/component/iface"
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -367,6 +368,7 @@
+ 			}
+ 			iface.FlushCache()
+ 			resolver.ResetConnection() // reset resolver's connection after default interface changed
++			ecs.Refresh()              // the direct egress address may have changed with it
+ 		})
+ 		err = defaultInterfaceMonitor.Start()
+ 		if err != nil {

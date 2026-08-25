@@ -1,0 +1,2179 @@
+diff --git a/adapter/outbound/anytls.go b/adapter/outbound/anytls.go
+index 99786614..0177942d 100644
+--- a/adapter/outbound/anytls.go
++++ b/adapter/outbound/anytls.go
+@@ -70,7 +70,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ 	}
+ 
+ 	// create uot on tcp
+-	destination := M.SocksaddrFromNet(metadata.UDPAddr())
++	destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 	return NewPacketConn(N.NewThreadSafePacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination})), t), nil
+ }
+ 
+@@ -105,6 +105,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option: &option,
+ 	}
+diff --git a/adapter/outbound/base.go b/adapter/outbound/base.go
+index 01e00798..efdb5682 100644
+--- a/adapter/outbound/base.go
++++ b/adapter/outbound/base.go
+@@ -5,6 +5,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net"
++	"net/netip"
+ 	"runtime"
+ 	"sync"
+ 	"syscall"
+@@ -27,19 +28,20 @@ type ProxyAdapter interface {
+ }
+ 
+ type Base struct {
+-	name   string
+-	addr   string
+-	tp     C.AdapterType
+-	pdName string
+-	udp    bool
+-	xudp   bool
+-	tfo    bool
+-	mpTcp  bool
+-	iface  string
+-	rmark  int
+-	prefer C.DNSPrefer
+-	dialer C.Dialer
+-	id     uuid.UUID
++	name      string
++	addr      string
++	tp        C.AdapterType
++	pdName    string
++	udp       bool
++	xudp      bool
++	tfo       bool
++	mpTcp     bool
++	iface     string
++	rmark     int
++	prefer    C.DNSPrefer
++	remoteDNS bool
++	dialer    C.Dialer
++	id        uuid.UUID
+ }
+ 
+ type BaseOption struct {
+@@ -54,22 +56,24 @@ type BaseOption struct {
+ 	Interface    string
+ 	RoutingMark  int
+ 	Prefer       C.DNSPrefer
++	RemoteDNS    bool
+ }
+ 
+ func NewBase(opt BaseOption) *Base {
+ 	return &Base{
+-		name:   opt.Name,
+-		addr:   opt.Addr,
+-		tp:     opt.Type,
+-		pdName: opt.ProviderName,
+-		udp:    opt.UDP,
+-		xudp:   opt.XUDP,
+-		tfo:    opt.TFO,
+-		mpTcp:  opt.MPTCP,
+-		iface:  opt.Interface,
+-		rmark:  opt.RoutingMark,
+-		prefer: opt.Prefer,
+-		id:     utils.NewUUIDV4(),
++		name:      opt.Name,
++		addr:      opt.Addr,
++		tp:        opt.Type,
++		pdName:    opt.ProviderName,
++		udp:       opt.UDP,
++		xudp:      opt.XUDP,
++		tfo:       opt.TFO,
++		mpTcp:     opt.MPTCP,
++		iface:     opt.Interface,
++		rmark:     opt.RoutingMark,
++		prefer:    opt.Prefer,
++		remoteDNS: opt.RemoteDNS,
++		id:        utils.NewUUIDV4(),
+ 	}
+ }
+ 
+@@ -176,6 +180,23 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
+ }
+ 
+ func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
++	if b.remoteDNS && metadata.Host != "" {
++		switch metadata.DNSMode {
++		case C.DNSMapping, C.DNSHosts:
++			if metadata.DstIP.IsValid() {
++				// DNSMapping/DNSHosts differs from DNSFakeIP: DstIP is already
++				// the real selected destination and Host is only auxiliary rule
++				// metadata. Clear Host so the remote proxy receives that IP.
++				// This branch returns below; clearing Host does NOT invoke DNS.
++				metadata.Host = ""
++			}
++		}
++		// DNSFakeIP/explicit-domain traffic keeps Host as the wire destination;
++		// DstIP may be a synthetic TUN return address and must not be forwarded.
++		// An incomplete mapping also stays remote-only. A RemoteDNS adapter must
++		// never fall through to resolver.DefaultResolver while Host is present.
++		return nil
++	}
+ 	if !metadata.Resolved() {
+ 		ip, err := resolveIPWithResolver(ctx, metadata.Host, b.prefer, resolver.DefaultResolver)
+ 		if err != nil {
+@@ -340,11 +361,15 @@ func (c *packetConn) AddRef(ref any) {
+ }
+ 
+ func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
++	return newPacketConn(pc, a, a.ResolveUDP)
++}
++
++func newPacketConn(pc net.PacketConn, a ProxyAdapter, resolveUDP func(context.Context, *C.Metadata) error) C.PacketConn {
+ 	epc := N.NewEnhancePacketConn(pc)
+ 	if _, ok := pc.(syscall.Conn); !ok { // exclusion system conn like *net.UDPConn
+ 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
+ 	}
+-	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
++	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), resolveUDP}
+ 	cpc.AppendToChains(a)
+ 	return cpc
+ }
+@@ -359,6 +384,15 @@ type autoCloseProxyAdapter struct {
+ 	closeErr  error
+ }
+ 
++func (p *autoCloseProxyAdapter) ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error {
++	if controller, ok := p.ProxyAdapter.(interface {
++		ICMPControl(netip.Addr) func(string, string, syscall.RawConn) error
++	}); ok {
++		return controller.ICMPControl(destination)
++	}
++	return dialer.ICMPControl(destination)
++}
++
+ func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+ 	c, err := p.ProxyAdapter.DialContext(ctx, metadata)
+ 	if err != nil {
+diff --git a/adapter/outbound/base_udp_test.go b/adapter/outbound/base_udp_test.go
+new file mode 100644
+index 00000000..7fde8849
+--- /dev/null
++++ b/adapter/outbound/base_udp_test.go
+@@ -0,0 +1,72 @@
++package outbound
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestRemoteResolveUDPPreservesDomain(t *testing.T) {
++	base := NewBase(BaseOption{RemoteDNS: true})
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    "quic.example",
++		DstPort: 443,
++		DNSMode: C.DNSFakeIP,
++	}
++
++	if err := base.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.Host != "quic.example" {
++		t.Fatalf("ResolveUDP() host = %q", metadata.Host)
++	}
++	if metadata.DstIP.IsValid() {
++		t.Fatalf("ResolveUDP() unexpectedly resolved domain to %s", metadata.DstIP)
++	}
++}
++
++func TestRemoteResolveUDPUsesMappedIP(t *testing.T) {
++	base := NewBase(BaseOption{RemoteDNS: true})
++	for _, dnsMode := range []C.DNSMode{C.DNSMapping, C.DNSHosts} {
++		t.Run(dnsMode.String(), func(t *testing.T) {
++			mappedIP := netip.MustParseAddr("203.0.113.8")
++			metadata := &C.Metadata{
++				NetWork: C.UDP,
++				Host:    "mapped.example",
++				DstIP:   mappedIP,
++				DstPort: 443,
++				DNSMode: dnsMode,
++			}
++
++			if err := base.ResolveUDP(context.Background(), metadata); err != nil {
++				t.Fatalf("ResolveUDP() error = %v", err)
++			}
++			if metadata.Host != "" {
++				t.Fatalf("ResolveUDP() retained auxiliary host %q", metadata.Host)
++			}
++			if metadata.DstIP != mappedIP {
++				t.Fatalf("ResolveUDP() destination = %s, want %s", metadata.DstIP, mappedIP)
++			}
++		})
++	}
++}
++
++func TestRemoteResolveUDPNeverLocallyResolvesIncompleteMapping(t *testing.T) {
++	base := NewBase(BaseOption{RemoteDNS: true})
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    "remote-only.example",
++		DstPort: 443,
++		DNSMode: C.DNSMapping,
++	}
++
++	if err := base.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.Host != "remote-only.example" || metadata.DstIP.IsValid() {
++		t.Fatalf("ResolveUDP() unexpectedly changed remote-only target: %#v", metadata)
++	}
++}
+diff --git a/adapter/outbound/direct.go b/adapter/outbound/direct.go
+index 1e2b2ef7..d6d2f2ae 100644
+--- a/adapter/outbound/direct.go
++++ b/adapter/outbound/direct.go
+@@ -3,6 +3,8 @@ package outbound
+ import (
+ 	"context"
+ 	"fmt"
++	"net/netip"
++	"syscall"
+ 
+ 	"github.com/metacubex/mihomo/component/dialer"
+ 	"github.com/metacubex/mihomo/component/loopback"
+@@ -10,6 +12,10 @@ import (
+ 	C "github.com/metacubex/mihomo/constant"
+ )
+ 
++func (d *Direct) ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error {
++	return dialer.ICMPControlWithOptions(destination, d.DialOptions()...)
++}
++
+ type Direct struct {
+ 	*Base
+ 	loopBack *loopback.Detector
+@@ -26,7 +32,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
+ 		return nil, err
+ 	}
+ 	opts := d.DialOptions()
+-	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
++	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver), dialer.WithDirectDualStack(), dialer.WithDirectRacePreference(d.Name()))
+ 	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
+ 	if err != nil {
+ 		return nil, err
+@@ -39,6 +45,9 @@ func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata)
+ 	if err := d.loopBack.CheckPacketConn(metadata); err != nil {
+ 		return nil, err
+ 	}
++	if metadata.Host != "" && d.prefer != C.IPv4Only && d.prefer != C.IPv6Only {
++		return d.listenPacketRaceContext(ctx, metadata)
++	}
+ 	if err := d.ResolveUDP(ctx, metadata); err != nil {
+ 		return nil, err
+ 	}
+diff --git a/adapter/outbound/direct_udp.go b/adapter/outbound/direct_udp.go
+new file mode 100644
+index 00000000..89c88336
+--- /dev/null
++++ b/adapter/outbound/direct_udp.go
+@@ -0,0 +1,550 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	randv2 "math/rand/v2"
++	"net"
++	"net/netip"
++	"os"
++	"sync"
++	"time"
++
++	N "github.com/metacubex/mihomo/common/net"
++	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/component/directrace"
++	"github.com/metacubex/mihomo/component/resolver"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++const (
++	directUDPRaceDatagrams = 4
++	directUDPRaceBytes     = 16 * 1024
++	directUDPRaceWindow    = 300 * time.Millisecond
++)
++
++type directUDPReadResult struct {
++	data []byte
++	put  func()
++	addr net.Addr
++	err  error
++}
++
++type directUDPTarget struct {
++	logical    netip.AddrPort
++	candidates []netip.AddrPort
++	live       map[netip.AddrPort]bool
++	winner     netip.AddrPort
++	started    time.Time
++	datagrams  int
++	bytes      int
++}
++
++type directUDPRacePacketConn struct {
++	mu        sync.Mutex
++	closeOnce sync.Once
++	closed    chan struct{}
++	reads     chan directUDPReadResult
++	conns     map[int]net.PacketConn
++	alive     int
++	targets   map[netip.AddrPort]*directUDPTarget
++	sources   map[netip.AddrPort][]*directUDPTarget
++	factory   func(context.Context, int, netip.AddrPort) (net.PacketConn, error)
++	readBy    time.Time
++	writeBy   time.Time
++}
++
++func (d *Direct) listenPacketRaceContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
++	candidates, fallback, err := d.resolveUDPRaceCandidates(ctx, metadata)
++	if err != nil {
++		return nil, err
++	}
++	metadata.DstIP = fallback
++	opts := d.DialOptions()
++	race := newDirectUDPRacePacketConn(func(ctx context.Context, family int, remote netip.AddrPort) (net.PacketConn, error) {
++		return dialer.NewDialer(opts...).ListenPacket(ctx, fmt.Sprintf("udp%d", family), "", remote)
++	})
++	logical := metadata.AddrPort()
++	if err := race.register(ctx, logical, candidates); err != nil {
++		return nil, err
++	}
++	resolveUDP := func(ctx context.Context, metadata *C.Metadata) error {
++		candidates, fallback, err := d.resolveUDPRaceCandidates(ctx, metadata)
++		if err != nil {
++			return err
++		}
++		metadata.DstIP = fallback
++		return race.register(ctx, metadata.AddrPort(), candidates)
++	}
++	return d.loopBack.NewPacketConn(newPacketConn(race, d, resolveUDP)), nil
++}
++
++func (d *Direct) resolveUDPRaceCandidates(ctx context.Context, metadata *C.Metadata) ([]netip.AddrPort, netip.Addr, error) {
++	type result struct {
++		ips []netip.Addr
++		err error
++	}
++	results := make(chan result, 2)
++	go func() {
++		ips, err := resolver.LookupIPv4WithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
++		results <- result{ips: ips, err: err}
++	}()
++	go func() {
++		ips, err := resolver.LookupIPv6WithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
++		results <- result{ips: ips, err: err}
++	}()
++
++	var ips []netip.Addr
++	var lookupErrs []error
++	for completed := 0; completed < 2; completed++ {
++		select {
++		case <-ctx.Done():
++			return nil, netip.Addr{}, ctx.Err()
++		case result := <-results:
++			if result.err != nil {
++				lookupErrs = append(lookupErrs, result.err)
++			}
++			for _, ip := range result.ips {
++				ip = ip.Unmap()
++				if ip.IsValid() {
++					ips = append(ips, ip)
++				}
++			}
++		}
++	}
++
++	// Preserve an already-resolved destination when the old ResolveUDP path
++	// would have done so, while still discovering the other race candidates.
++	fallback := netip.Addr{}
++	if metadata.Resolved() && resolver.DirectHostResolver == resolver.DefaultResolver {
++		fallback = metadata.DstIP.Unmap()
++		ips = append(ips, fallback)
++	}
++	if len(ips) == 0 {
++		lookupErrs = append(lookupErrs, fmt.Errorf("%w: %s", resolver.ErrIPNotFound, metadata.Host))
++		return nil, netip.Addr{}, fmt.Errorf("can't resolve ip: %w", errors.Join(lookupErrs...))
++	}
++
++	ipv4s, ipv6s := resolver.SortationAddr(uniqueDirectUDPIPs(ips))
++	if !fallback.IsValid() {
++		switch {
++		case d.prefer == C.IPv6Prefer && len(ipv6s) > 0:
++			fallback = ipv6s[randv2.IntN(len(ipv6s))]
++		case len(ipv4s) > 0:
++			fallback = ipv4s[randv2.IntN(len(ipv4s))]
++		case len(ipv6s) > 0:
++			fallback = ipv6s[randv2.IntN(len(ipv6s))]
++		}
++	}
++	preferredFamily := ipv4s
++	if fallback.Is6() {
++		preferredFamily = ipv6s
++	}
++	if preferred, loaded := directrace.Prefer(metadata.Host, d.Name(), preferredFamily); loaded {
++		fallback = preferred
++	}
++
++	ordered := []netip.Addr{fallback}
++	if d.prefer == C.IPv6Prefer {
++		ordered = append(ordered, ipv6s...)
++		ordered = append(ordered, ipv4s...)
++	} else {
++		ordered = append(ordered, ipv4s...)
++		ordered = append(ordered, ipv6s...)
++	}
++	ordered = uniqueDirectUDPIPs(ordered)
++	candidates := make([]netip.AddrPort, 0, len(ordered))
++	for _, ip := range ordered {
++		candidates = append(candidates, netip.AddrPortFrom(ip, metadata.DstPort))
++	}
++	return candidates, fallback, nil
++}
++
++func uniqueDirectUDPIPs(ips []netip.Addr) []netip.Addr {
++	seen := make(map[netip.Addr]struct{}, len(ips))
++	unique := make([]netip.Addr, 0, len(ips))
++	for _, ip := range ips {
++		ip = ip.Unmap()
++		if !ip.IsValid() {
++			continue
++		}
++		if _, loaded := seen[ip]; loaded {
++			continue
++		}
++		seen[ip] = struct{}{}
++		unique = append(unique, ip)
++	}
++	return unique
++}
++
++func newDirectUDPRacePacketConn(factory func(context.Context, int, netip.AddrPort) (net.PacketConn, error)) *directUDPRacePacketConn {
++	return &directUDPRacePacketConn{
++		closed:  make(chan struct{}),
++		reads:   make(chan directUDPReadResult, 32),
++		conns:   make(map[int]net.PacketConn, 2),
++		targets: make(map[netip.AddrPort]*directUDPTarget),
++		sources: make(map[netip.AddrPort][]*directUDPTarget),
++		factory: factory,
++	}
++}
++
++func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.AddrPort, candidates []netip.AddrPort) error {
++	for _, candidate := range candidates {
++		family := 6
++		if candidate.Addr().Is4() {
++			family = 4
++		}
++		if err := c.ensureConn(ctx, family, candidate); err != nil {
++			continue
++		}
++	}
++
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if len(c.conns) == 0 {
++		return errors.New("can't create DIRECT UDP socket")
++	}
++	if _, loaded := c.targets[logical]; loaded {
++		return nil
++	}
++	target := &directUDPTarget{logical: logical, live: make(map[netip.AddrPort]bool)}
++	for _, candidate := range candidates {
++		family := 6
++		if candidate.Addr().Is4() {
++			family = 4
++		}
++		if c.conns[family] == nil {
++			continue
++		}
++		target.candidates = append(target.candidates, candidate)
++		target.live[candidate] = true
++		c.sources[candidate] = append(c.sources[candidate], target)
++	}
++	if len(target.candidates) == 0 {
++		return errors.New("no usable DIRECT UDP candidate")
++	}
++	c.targets[logical] = target
++	return nil
++}
++
++func (c *directUDPRacePacketConn) ensureConn(ctx context.Context, family int, remote netip.AddrPort) error {
++	c.mu.Lock()
++	if c.conns[family] != nil {
++		c.mu.Unlock()
++		return nil
++	}
++	c.mu.Unlock()
++
++	pc, err := c.factory(ctx, family, remote)
++	if err != nil {
++		return err
++	}
++	c.mu.Lock()
++	if existing := c.conns[family]; existing != nil {
++		c.mu.Unlock()
++		_ = pc.Close()
++		return nil
++	}
++	c.conns[family] = pc
++	c.alive++
++	readBy := c.readBy
++	writeBy := c.writeBy
++	c.mu.Unlock()
++	if !readBy.IsZero() {
++		_ = pc.SetReadDeadline(readBy)
++	}
++	if !writeBy.IsZero() {
++		_ = pc.SetWriteDeadline(writeBy)
++	}
++	go c.readLoop(pc)
++	return nil
++}
++
++func (c *directUDPRacePacketConn) readLoop(pc net.PacketConn) {
++	epc := N.NewEnhancePacketConn(pc)
++	for {
++		data, put, addr, err := epc.WaitReadFrom()
++		if err != nil && !isTerminalDirectUDPReadError(err) {
++			// An unconnected UDP socket can surface an asynchronous ICMP error
++			// from one loser without identifying its destination. Consume that
++			// error and keep the family reader alive for the other candidates.
++			if put != nil {
++				put()
++			}
++			continue
++		}
++		result := directUDPReadResult{data: data, put: put, addr: addr, err: err}
++		if err != nil {
++			// Publish the terminal error only after updating the live-reader
++			// count. WaitReadFrom can then reliably identify the last socket;
++			// doing this after the channel send races with the receiver.
++			c.mu.Lock()
++			c.alive--
++			c.mu.Unlock()
++		}
++		select {
++		case c.reads <- result:
++		case <-c.closed:
++			if put != nil {
++				put()
++			}
++			return
++		}
++		if err != nil {
++			return
++		}
++	}
++}
++
++func isTerminalDirectUDPReadError(err error) bool {
++	if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) {
++		return true
++	}
++	var netErr net.Error
++	return errors.As(err, &netErr) && netErr.Timeout()
++}
++
++func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
++	udpAddr, ok := addr.(*net.UDPAddr)
++	if !ok || udpAddr == nil {
++		return 0, fmt.Errorf("DIRECT UDP race requires UDP address, got %T", addr)
++	}
++	logical := unmapDirectUDPAddrPort(udpAddr.AddrPort())
++	now := time.Now()
++
++	c.mu.Lock()
++	target := c.targets[logical]
++	if target == nil {
++		family := 6
++		if logical.Addr().Is4() {
++			family = 4
++		}
++		pc := c.conns[family]
++		c.mu.Unlock()
++		if pc == nil {
++			return 0, errors.New("DIRECT UDP address family unavailable")
++		}
++		return pc.WriteTo(payload, addr)
++	}
++	if !target.winner.IsValid() && !target.started.IsZero() && (now.Sub(target.started) >= directUDPRaceWindow || target.datagrams >= directUDPRaceDatagrams || target.bytes+len(payload)*len(target.candidates) > directUDPRaceBytes) {
++		target.winner = firstLiveDirectUDPCandidate(target)
++	}
++	if target.winner.IsValid() {
++		candidates := []netip.AddrPort{target.winner}
++		c.mu.Unlock()
++		return c.writeCandidates(payload, candidates)
++	}
++	if target.started.IsZero() {
++		target.started = now
++	}
++	target.datagrams++
++	candidates := make([]netip.AddrPort, 0, len(target.candidates))
++	for _, candidate := range target.candidates {
++		if target.live[candidate] {
++			candidates = append(candidates, candidate)
++		}
++	}
++	target.bytes += len(payload) * len(candidates)
++	c.mu.Unlock()
++
++	n, err, failed := c.writeCandidateSet(payload, candidates)
++	if len(failed) > 0 {
++		c.mu.Lock()
++		for _, candidate := range failed {
++			delete(target.live, candidate)
++		}
++		if !target.winner.IsValid() && countLiveDirectUDPCandidates(target) == 1 {
++			target.winner = firstLiveDirectUDPCandidate(target)
++		}
++		c.mu.Unlock()
++	}
++	return n, err
++}
++
++func (c *directUDPRacePacketConn) writeCandidates(payload []byte, candidates []netip.AddrPort) (int, error) {
++	n, err, _ := c.writeCandidateSet(payload, candidates)
++	return n, err
++}
++
++func (c *directUDPRacePacketConn) writeCandidateSet(payload []byte, candidates []netip.AddrPort) (int, error, []netip.AddrPort) {
++	var errs []error
++	var failed []netip.AddrPort
++	succeeded := false
++	for _, candidate := range candidates {
++		family := 6
++		if candidate.Addr().Is4() {
++			family = 4
++		}
++		c.mu.Lock()
++		pc := c.conns[family]
++		c.mu.Unlock()
++		if pc == nil {
++			failed = append(failed, candidate)
++			continue
++		}
++		if _, err := pc.WriteTo(payload, net.UDPAddrFromAddrPort(candidate)); err != nil {
++			errs = append(errs, fmt.Errorf("send to %s: %w", candidate, err))
++			failed = append(failed, candidate)
++		} else {
++			succeeded = true
++		}
++	}
++	if succeeded {
++		return len(payload), nil, failed
++	}
++	return 0, errors.Join(errs...), failed
++}
++
++func firstLiveDirectUDPCandidate(target *directUDPTarget) netip.AddrPort {
++	for _, candidate := range target.candidates {
++		if target.live[candidate] {
++			return candidate
++		}
++	}
++	return netip.AddrPort{}
++}
++
++func countLiveDirectUDPCandidates(target *directUDPTarget) int {
++	count := 0
++	for _, candidate := range target.candidates {
++		if target.live[candidate] {
++			count++
++		}
++	}
++	return count
++}
++
++func (c *directUDPRacePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
++	for {
++		var result directUDPReadResult
++		select {
++		case <-c.closed:
++			return nil, nil, nil, net.ErrClosed
++		case result = <-c.reads:
++		}
++		if result.err != nil {
++			c.mu.Lock()
++			alive := c.alive
++			c.mu.Unlock()
++			if alive == 0 {
++				return nil, nil, nil, result.err
++			}
++			continue
++		}
++		udpAddr, ok := result.addr.(*net.UDPAddr)
++		if !ok || udpAddr == nil {
++			return result.data, result.put, result.addr, nil
++		}
++		source := unmapDirectUDPAddrPort(udpAddr.AddrPort())
++		now := time.Now()
++		c.mu.Lock()
++		var logical netip.AddrPort
++		for _, target := range c.sources[source] {
++			if target.started.IsZero() {
++				continue
++			}
++			if !target.winner.IsValid() && now.Sub(target.started) >= directUDPRaceWindow {
++				target.winner = firstLiveDirectUDPCandidate(target)
++			}
++			if target.winner.IsValid() {
++				if target.winner == source {
++					logical = target.logical
++					break
++				}
++				continue
++			}
++			if target.live[source] {
++				target.winner = source
++				logical = target.logical
++				break
++			}
++		}
++		_, knownSource := c.sources[source]
++		c.mu.Unlock()
++		if logical.IsValid() {
++			return result.data, result.put, net.UDPAddrFromAddrPort(logical), nil
++		}
++		if !knownSource {
++			return result.data, result.put, result.addr, nil
++		}
++		if result.put != nil {
++			result.put()
++		}
++	}
++}
++
++func unmapDirectUDPAddrPort(addrPort netip.AddrPort) netip.AddrPort {
++	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port())
++}
++
++func (c *directUDPRacePacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
++	data, put, addr, err := c.WaitReadFrom()
++	if put != nil {
++		defer put()
++	}
++	return copy(payload, data), addr, err
++}
++
++func (c *directUDPRacePacketConn) Close() error {
++	var errs []error
++	c.closeOnce.Do(func() {
++		close(c.closed)
++		c.mu.Lock()
++		for _, pc := range c.conns {
++			errs = append(errs, pc.Close())
++		}
++		c.mu.Unlock()
++	})
++	return errors.Join(errs...)
++}
++
++func (c *directUDPRacePacketConn) LocalAddr() net.Addr {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if pc := c.conns[4]; pc != nil {
++		return pc.LocalAddr()
++	}
++	if pc := c.conns[6]; pc != nil {
++		return pc.LocalAddr()
++	}
++	return &net.UDPAddr{}
++}
++
++func (c *directUDPRacePacketConn) SetDeadline(t time.Time) error {
++	c.mu.Lock()
++	c.readBy = t
++	c.writeBy = t
++	c.mu.Unlock()
++	return errors.Join(c.setDeadline(func(pc net.PacketConn) error { return pc.SetDeadline(t) })...)
++}
++
++func (c *directUDPRacePacketConn) SetReadDeadline(t time.Time) error {
++	c.mu.Lock()
++	c.readBy = t
++	c.mu.Unlock()
++	return errors.Join(c.setDeadline(func(pc net.PacketConn) error { return pc.SetReadDeadline(t) })...)
++}
++
++func (c *directUDPRacePacketConn) SetWriteDeadline(t time.Time) error {
++	c.mu.Lock()
++	c.writeBy = t
++	c.mu.Unlock()
++	return errors.Join(c.setDeadline(func(pc net.PacketConn) error { return pc.SetWriteDeadline(t) })...)
++}
++
++func (c *directUDPRacePacketConn) setDeadline(set func(net.PacketConn) error) []error {
++	c.mu.Lock()
++	conns := make([]net.PacketConn, 0, len(c.conns))
++	for _, pc := range c.conns {
++		conns = append(conns, pc)
++	}
++	c.mu.Unlock()
++	errs := make([]error, 0, len(conns))
++	for _, pc := range conns {
++		if err := set(pc); err != nil {
++			errs = append(errs, err)
++		}
++	}
++	return errs
++}
+diff --git a/adapter/outbound/direct_udp_test.go b/adapter/outbound/direct_udp_test.go
+new file mode 100644
+index 00000000..3bb768f9
+--- /dev/null
++++ b/adapter/outbound/direct_udp_test.go
+@@ -0,0 +1,381 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++type directUDPTestPacket struct {
++	data []byte
++	from net.Addr
++}
++
++type directUDPTestConn struct {
++	mu     sync.Mutex
++	writes []netip.AddrPort
++	reads  chan directUDPTestPacket
++	errs   chan error
++	closed chan struct{}
++	once   sync.Once
++}
++
++func newDirectUDPTestConn() *directUDPTestConn {
++	return &directUDPTestConn{
++		reads:  make(chan directUDPTestPacket, 16),
++		errs:   make(chan error, 4),
++		closed: make(chan struct{}),
++	}
++}
++
++func (c *directUDPTestConn) ReadFrom(payload []byte) (int, net.Addr, error) {
++	select {
++	case packet := <-c.reads:
++		return copy(payload, packet.data), packet.from, nil
++	case err := <-c.errs:
++		return 0, nil, err
++	case <-c.closed:
++		return 0, nil, net.ErrClosed
++	}
++}
++
++func (c *directUDPTestConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
++	c.mu.Lock()
++	c.writes = append(c.writes, addr.(*net.UDPAddr).AddrPort())
++	c.mu.Unlock()
++	return len(payload), nil
++}
++
++func (c *directUDPTestConn) Close() error {
++	c.once.Do(func() { close(c.closed) })
++	return nil
++}
++
++func (c *directUDPTestConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
++func (c *directUDPTestConn) SetDeadline(time.Time) error      { return nil }
++func (c *directUDPTestConn) SetReadDeadline(time.Time) error  { return nil }
++func (c *directUDPTestConn) SetWriteDeadline(time.Time) error { return nil }
++func (c *directUDPTestConn) inject(payload string, from netip.AddrPort) {
++	c.reads <- directUDPTestPacket{data: []byte(payload), from: net.UDPAddrFromAddrPort(from)}
++}
++func (c *directUDPTestConn) injectError(err error) { c.errs <- err }
++func (c *directUDPTestConn) destinations() []netip.AddrPort {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	return append([]netip.AddrPort(nil), c.writes...)
++}
++
++func newDirectUDPTestRace(t *testing.T) (*directUDPRacePacketConn, map[int]*directUDPTestConn) {
++	t.Helper()
++	conns := make(map[int]*directUDPTestConn)
++	race := newDirectUDPRacePacketConn(func(_ context.Context, family int, _ netip.AddrPort) (net.PacketConn, error) {
++		conn := newDirectUDPTestConn()
++		conns[family] = conn
++		return conn, nil
++	})
++	t.Cleanup(func() { _ = race.Close() })
++	return race, conns
++}
++
++func directUDPTestAddr(address string, port uint16) netip.AddrPort {
++	return netip.AddrPortFrom(netip.MustParseAddr(address), port)
++}
++
++func TestDirectUDPRaceFirstResponsePinsAndDropsLoser(t *testing.T) {
++	race, conns := newDirectUDPTestRace(t)
++	logical := directUDPTestAddr("192.0.2.10", 443)
++	v4 := logical
++	v6 := directUDPTestAddr("2001:db8::10", 443)
++	if err := race.register(context.Background(), logical, []netip.AddrPort{v4, v6}); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := race.WriteTo([]byte("p1"), net.UDPAddrFromAddrPort(logical)); err != nil {
++		t.Fatal(err)
++	}
++	if got := len(conns[4].destinations()); got != 1 {
++		t.Fatalf("IPv4 writes = %d, want 1", got)
++	}
++	if got := len(conns[6].destinations()); got != 1 {
++		t.Fatalf("IPv6 writes = %d, want 1", got)
++	}
++
++	conns[6].inject("winner", v6)
++	data, put, from, err := race.WaitReadFrom()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if put != nil {
++		defer put()
++	}
++	if string(data) != "winner" || from.(*net.UDPAddr).AddrPort() != logical {
++		t.Fatalf("first response = %q from %v, want winner from logical %v", data, from, logical)
++	}
++
++	if _, err := race.WriteTo([]byte("p2"), net.UDPAddrFromAddrPort(logical)); err != nil {
++		t.Fatal(err)
++	}
++	if got := len(conns[4].destinations()); got != 1 {
++		t.Fatalf("loser received post-pin write: total IPv4 writes = %d", got)
++	}
++	if got := len(conns[6].destinations()); got != 2 {
++		t.Fatalf("winner writes = %d, want 2", got)
++	}
++
++	conns[4].inject("late-loser", v4)
++	conns[6].inject("winner-again", v6)
++	data, put, _, err = race.WaitReadFrom()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if put != nil {
++		defer put()
++	}
++	if string(data) != "winner-again" {
++		t.Fatalf("late loser was not dropped: got %q", data)
++	}
++}
++
++func TestDirectUDPRaceDatagramBudgetPinsFallback(t *testing.T) {
++	race, conns := newDirectUDPTestRace(t)
++	logical := directUDPTestAddr("192.0.2.20", 8443)
++	v6 := directUDPTestAddr("2001:db8::20", 8443)
++	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
++		t.Fatal(err)
++	}
++
++	for i := 0; i < directUDPRaceDatagrams+1; i++ {
++		if _, err := race.WriteTo([]byte("x"), net.UDPAddrFromAddrPort(logical)); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if got := len(conns[4].destinations()); got != directUDPRaceDatagrams+1 {
++		t.Fatalf("fallback writes = %d, want %d", got, directUDPRaceDatagrams+1)
++	}
++	if got := len(conns[6].destinations()); got != directUDPRaceDatagrams {
++		t.Fatalf("IPv6 replicated writes = %d, want %d", got, directUDPRaceDatagrams)
++	}
++}
++
++func TestDirectUDPRaceByteAndTimeBudgetsPinFallback(t *testing.T) {
++	t.Run("bytes", func(t *testing.T) {
++		race, conns := newDirectUDPTestRace(t)
++		logical := directUDPTestAddr("192.0.2.30", 53)
++		v6 := directUDPTestAddr("2001:db8::30", 53)
++		if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
++			t.Fatal(err)
++		}
++		payload := make([]byte, directUDPRaceBytes/2+1)
++		if _, err := race.WriteTo(payload, net.UDPAddrFromAddrPort(logical)); err != nil {
++			t.Fatal(err)
++		}
++		if len(conns[4].destinations()) != 1 || len(conns[6].destinations()) != 1 {
++			t.Fatal("first datagram must still probe every candidate")
++		}
++		if _, err := race.WriteTo([]byte("next"), net.UDPAddrFromAddrPort(logical)); err != nil {
++			t.Fatal(err)
++		}
++		if got := len(conns[6].destinations()); got != 1 {
++			t.Fatalf("byte budget did not stop replication: IPv6 writes = %d", got)
++		}
++	})
++
++	t.Run("time", func(t *testing.T) {
++		race, conns := newDirectUDPTestRace(t)
++		logical := directUDPTestAddr("192.0.2.31", 53)
++		v6 := directUDPTestAddr("2001:db8::31", 53)
++		if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := race.WriteTo([]byte("first"), net.UDPAddrFromAddrPort(logical)); err != nil {
++			t.Fatal(err)
++		}
++		race.mu.Lock()
++		race.targets[logical].started = time.Now().Add(-directUDPRaceWindow)
++		race.mu.Unlock()
++		if _, err := race.WriteTo([]byte("next"), net.UDPAddrFromAddrPort(logical)); err != nil {
++			t.Fatal(err)
++		}
++		if got := len(conns[6].destinations()); got != 1 {
++			t.Fatalf("time budget did not stop replication: IPv6 writes = %d", got)
++		}
++	})
++}
++
++func TestDirectUDPRaceKeepsEIMTargetsSeparate(t *testing.T) {
++	race, conns := newDirectUDPTestRace(t)
++	first := directUDPTestAddr("192.0.2.40", 1000)
++	firstV6 := directUDPTestAddr("2001:db8::40", 1000)
++	second := directUDPTestAddr("192.0.2.41", 2000)
++	secondV6 := directUDPTestAddr("2001:db8::41", 2000)
++	if err := race.register(context.Background(), first, []netip.AddrPort{first, firstV6}); err != nil {
++		t.Fatal(err)
++	}
++	if err := race.register(context.Background(), second, []netip.AddrPort{second, secondV6}); err != nil {
++		t.Fatal(err)
++	}
++	_, _ = race.WriteTo([]byte("one"), net.UDPAddrFromAddrPort(first))
++	_, _ = race.WriteTo([]byte("two"), net.UDPAddrFromAddrPort(second))
++
++	conns[6].inject("second-response", secondV6)
++	_, put, from, err := race.WaitReadFrom()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if put != nil {
++		defer put()
++	}
++	if got := from.(*net.UDPAddr).AddrPort(); got != second {
++		t.Fatalf("second target restored as %v, want %v", got, second)
++	}
++
++	_, _ = race.WriteTo([]byte("one-again"), net.UDPAddrFromAddrPort(first))
++	_, _ = race.WriteTo([]byte("two-again"), net.UDPAddrFromAddrPort(second))
++	if got := len(conns[4].destinations()); got != 3 {
++		t.Fatalf("IPv4 writes = %d, want first race twice plus second's initial race", got)
++	}
++	if got := len(conns[6].destinations()); got != 4 {
++		t.Fatalf("IPv6 writes = %d, want first race twice plus pinned second twice", got)
++	}
++}
++
++func TestDirectUDPRaceRealDualStackSockets(t *testing.T) {
++	v4Server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer v4Server.Close()
++	port := v4Server.LocalAddr().(*net.UDPAddr).Port
++	v6Server, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: port})
++	if err != nil {
++		t.Skipf("IPv6 loopback unavailable: %v", err)
++	}
++	defer v6Server.Close()
++
++	var v4Packets, v6Packets atomic.Int32
++	echo := func(server *net.UDPConn, packets *atomic.Int32, delay time.Duration) {
++		buffer := make([]byte, 1024)
++		for {
++			n, remote, err := server.ReadFromUDP(buffer)
++			if err != nil {
++				return
++			}
++			packets.Add(1)
++			if delay > 0 {
++				time.Sleep(delay)
++			}
++			_, _ = server.WriteToUDP(buffer[:n], remote)
++		}
++	}
++	go echo(v4Server, &v4Packets, 80*time.Millisecond)
++	go echo(v6Server, &v6Packets, 0)
++
++	race := newDirectUDPRacePacketConn(func(_ context.Context, family int, _ netip.AddrPort) (net.PacketConn, error) {
++		network := "udp6"
++		if family == 4 {
++			network = "udp4"
++		}
++		return net.ListenPacket(network, "")
++	})
++	defer race.Close()
++	logical := directUDPTestAddr("127.0.0.1", uint16(port))
++	v6 := directUDPTestAddr("::1", uint16(port))
++	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
++		t.Fatal(err)
++	}
++	_ = race.SetReadDeadline(time.Now().Add(2 * time.Second))
++	if _, err := race.WriteTo([]byte("probe"), net.UDPAddrFromAddrPort(logical)); err != nil {
++		t.Fatal(err)
++	}
++	data, put, from, err := race.WaitReadFrom()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if string(data) != "probe" || from.(*net.UDPAddr).AddrPort() != logical {
++		t.Fatalf("response = %q from %v, want logical %v", data, from, logical)
++	}
++	if put != nil {
++		put()
++	}
++	if _, err := race.WriteTo([]byte("pinned"), net.UDPAddrFromAddrPort(logical)); err != nil {
++		t.Fatal(err)
++	}
++	deadline := time.Now().Add(time.Second)
++	for v6Packets.Load() < 2 && time.Now().Before(deadline) {
++		time.Sleep(time.Millisecond)
++	}
++	if got := v6Packets.Load(); got != 2 {
++		t.Fatalf("IPv6 winner packets = %d, want 2", got)
++	}
++	if got := v4Packets.Load(); got != 1 {
++		t.Fatalf("IPv4 loser packets = %d, want 1", got)
++	}
++}
++
++func TestDirectUDPRaceReturnsLastReaderError(t *testing.T) {
++	race, conns := newDirectUDPTestRace(t)
++	logical := directUDPTestAddr("192.0.2.50", 443)
++	v6 := directUDPTestAddr("2001:db8::50", 443)
++	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
++		t.Fatal(err)
++	}
++	_ = conns[4].Close()
++	_ = conns[6].Close()
++
++	done := make(chan error, 1)
++	go func() {
++		_, _, _, err := race.WaitReadFrom()
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("last reader error was lost")
++		}
++	case <-time.After(time.Second):
++		t.Fatal("WaitReadFrom blocked after every socket failed")
++	}
++}
++
++func TestDirectUDPRaceIgnoresCandidateICMPReadError(t *testing.T) {
++	race, conns := newDirectUDPTestRace(t)
++	logical := directUDPTestAddr("192.0.2.60", 443)
++	v6 := directUDPTestAddr("2001:db8::60", 443)
++	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := race.WriteTo([]byte("probe"), net.UDPAddrFromAddrPort(logical)); err != nil {
++		t.Fatal(err)
++	}
++	conns[4].injectError(&net.OpError{Op: "read", Net: "udp4", Err: testDirectUDPConnectionRefusedError{}})
++	conns[6].inject("winner", v6)
++
++	done := make(chan error, 1)
++	go func() {
++		data, put, _, err := race.WaitReadFrom()
++		if put != nil {
++			defer put()
++		}
++		if err == nil && string(data) != "winner" {
++			err = errors.New("unexpected response")
++		}
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Fatalf("loser ICMP terminated race: %v", err)
++		}
++	case <-time.After(time.Second):
++		t.Fatal("winner response blocked after loser ICMP")
++	}
++}
++
++type testDirectUDPConnectionRefusedError struct{}
++
++func (testDirectUDPConnectionRefusedError) Error() string { return "connection refused" }
+diff --git a/adapter/outbound/hysteria.go b/adapter/outbound/hysteria.go
+index 26032953..f945daed 100644
+--- a/adapter/outbound/hysteria.go
++++ b/adapter/outbound/hysteria.go
+@@ -252,6 +252,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:    &option,
+ 		client:    client,
+@@ -281,7 +282,7 @@ func (c *hyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+ 		return
+ 	}
+ 	n = copy(p, b)
+-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
++	addr = hysteriaPacketAddr(addrStr)
+ 	return
+ }
+ 
+@@ -291,10 +292,18 @@ func (c *hyPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, e
+ 		return
+ 	}
+ 	data = b
+-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
++	addr = hysteriaPacketAddr(addrStr)
+ 	return
+ }
+ 
++func hysteriaPacketAddr(addr string) net.Addr {
++	destination := M.ParseSocksaddr(addr)
++	if destination.IsFqdn() {
++		return destination
++	}
++	return destination.UDPAddr()
++}
++
+ func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+ 	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
+ 	if err != nil {
+diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
+--- a/adapter/outbound/hysteria2.go
++++ b/adapter/outbound/hysteria2.go
+@@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option: &option,
+ 	}
+@@ -199,6 +200,11 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+ 	}
+ 
+ 	quicConfig := &quic.Config{
++		// Dial with QUIC v2 (RFC 9369). This must stay a single version:
++		// hysteria2 authenticates over HTTP/3, and http3.Transport rejects a
++		// quic.Config carrying more than one version, so quic-go's Version
++		// Negotiation fallback is not available here. Servers must support v2.
++		Versions:                       []quic.Version{quic.Version2},
+ 		InitialStreamReceiveWindow:     option.InitialStreamReceiveWindow,
+ 		MaxStreamReceiveWindow:         option.MaxStreamReceiveWindow,
+ 		InitialConnectionReceiveWindow: option.InitialConnectionReceiveWindow,
+diff --git a/adapter/outbound/ipstack.go b/adapter/outbound/ipstack.go
+new file mode 100644
+index 00000000..3b10bfd2
+--- /dev/null
++++ b/adapter/outbound/ipstack.go
+@@ -0,0 +1,122 @@
++package outbound
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"strings"
++	"time"
++
++	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/constant/features"
++
++	"github.com/metacubex/mipstack"
++)
++
++const (
++	ipStackAuto   = "auto"
++	ipStackGVisor = "gvisor"
++	ipStackMips   = "mips"
++)
++
++type IPStackOption struct {
++	Mode                 string `proxy:"mode,omitempty"`
++	CongestionController string `proxy:"congestion-controller,omitempty"`
++}
++
++func (o *IPStackOption) normalize() {
++	o.Mode = strings.ToLower(o.Mode)
++	if o.Mode == "" {
++		o.Mode = ipStackAuto
++	}
++	o.CongestionController = strings.ToLower(o.CongestionController)
++}
++
++func (o IPStackOption) validate() error {
++	switch o.Mode {
++	case ipStackAuto, ipStackMips:
++	case ipStackGVisor:
++		if !features.WithGVisor {
++			return errors.New("gVisor IP stack requires the with_gvisor build tag")
++		}
++	default:
++		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
++	}
++	switch o.CongestionController {
++	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
++		return nil
++	default:
++		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
++	}
++}
++
++// ipStack is the mihomo IP stack's packet and socket surface.
++type ipStack interface {
++	Start() error
++	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
++	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
++	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
++	Read(buffers [][]byte, sizes []int, offset int) (int, error)
++	Write(buffers [][]byte, offset int) (int, error)
++	MTU() (int, error)
++	Name() (string, error)
++	BatchSize() int
++	Close() error
++}
++
++// newIPStack constructs the selected userspace IP stack.
++func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
++	mode := option.Mode
++	if mode == ipStackAuto {
++		if features.WithGVisor {
++			mode = ipStackGVisor
++		} else {
++			mode = ipStackMips
++		}
++	}
++	switch mode {
++	case ipStackGVisor:
++		return newGVisorIPStack(localAddresses, mtu)
++	case ipStackMips:
++		return mipstack.New(mipstack.Config{
++			LocalAddresses: localAddresses,
++			MTU:            mtu,
++			TCP: mipstack.TCPSocketDefaults{
++				CongestionControl: option.CongestionController,
++				// Align with sing-wireguard: enable keepalive with 15-second
++				// idle/interval timing and gVisor's default probe count.
++				KeepAlive: true,
++				KeepAliveConfig: mipstack.KeepAliveConfig{
++					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
++				},
++			},
++		})
++	default:
++		return nil, errors.New("invalid IP stack mode")
++	}
++}
++
++var _ ipStack = (*mipstack.Stack)(nil)
++
++type ipStackNetDialer struct {
++	stack ipStack
++}
++
++var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
++
++func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
++	dst, err := netip.ParseAddrPort(address)
++	if err != nil {
++		return nil, fmt.Errorf("invalid address %q: %w", address, err)
++	}
++	switch {
++	case strings.HasPrefix(network, "tcp"):
++		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
++	case strings.HasPrefix(network, "udp"):
++		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
++	default:
++		return nil, fmt.Errorf("invalid network %q", network)
++	}
++}
+diff --git a/adapter/outbound/ipstack_gvisor.go b/adapter/outbound/ipstack_gvisor.go
+new file mode 100644
+index 00000000..36f00af5
+--- /dev/null
++++ b/adapter/outbound/ipstack_gvisor.go
+@@ -0,0 +1,15 @@
++//go:build with_gvisor
++
++package outbound
++
++import (
++	"net/netip"
++
++	wireguard "github.com/metacubex/sing-wireguard"
++)
++
++func newGVisorIPStack(localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
++	return wireguard.NewStackDevice(localAddresses, mtu)
++}
++
++var _ ipStack = (wireguard.Device)(nil)
+diff --git a/adapter/outbound/ipstack_gvisor_stub.go b/adapter/outbound/ipstack_gvisor_stub.go
+new file mode 100644
+index 00000000..eaec1541
+--- /dev/null
++++ b/adapter/outbound/ipstack_gvisor_stub.go
+@@ -0,0 +1,12 @@
++//go:build !with_gvisor
++
++package outbound
++
++import (
++	"errors"
++	"net/netip"
++)
++
++func newGVisorIPStack([]netip.Prefix, uint32) (ipStack, error) {
++	return nil, errors.New("gVisor IP stack requires the with_gvisor build tag")
++}
+diff --git a/adapter/outbound/mieru.go b/adapter/outbound/mieru.go
+index 9f4e82d6..11fe5802 100644
+--- a/adapter/outbound/mieru.go
++++ b/adapter/outbound/mieru.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/mieru_stub.go b/adapter/outbound/mieru_stub.go
+new file mode 100644
+index 00000000..46e6fd38
+--- /dev/null
++++ b/adapter/outbound/mieru_stub.go
+@@ -0,0 +1,28 @@
++//go:build no_mieru
++
++package outbound
++
++import "fmt"
++
++type Mieru struct {
++	*Base
++}
++
++type MieruOption struct {
++	BasicOption
++	Name           string `proxy:"name"`
++	Server         string `proxy:"server"`
++	Port           int    `proxy:"port,omitempty"`
++	PortRange      string `proxy:"port-range,omitempty"`
++	Transport      string `proxy:"transport"`
++	UDP            bool   `proxy:"udp,omitempty"`
++	UserName       string `proxy:"username"`
++	Password       string `proxy:"password"`
++	Multiplexing   string `proxy:"multiplexing,omitempty"`
++	HandshakeMode  string `proxy:"handshake-mode,omitempty"`
++	TrafficPattern string `proxy:"traffic-pattern,omitempty"`
++}
++
++func NewMieru(MieruOption) (*Mieru, error) {
++	return nil, fmt.Errorf("mieru support is disabled by \"no_mieru\" build tag")
++}
+diff --git a/adapter/outbound/mieru_test.go b/adapter/outbound/mieru_test.go
+index f47cf998..661c1dcb 100644
+--- a/adapter/outbound/mieru_test.go
++++ b/adapter/outbound/mieru_test.go
+@@ -1,3 +1,5 @@
++//go:build !no_mieru
++
+ package outbound
+ 
+ import "testing"
+diff --git a/adapter/outbound/openvpn.go b/adapter/outbound/openvpn.go
+index 3c7b1e63..a30187b4 100644
+--- a/adapter/outbound/openvpn.go
++++ b/adapter/outbound/openvpn.go
+@@ -1,3 +1,5 @@
++//go:build !no_openvpn
++
+ package outbound
+ 
+ import (
+diff --git a/adapter/outbound/openvpn_stub.go b/adapter/outbound/openvpn_stub.go
+new file mode 100644
+index 00000000..368bf673
+--- /dev/null
++++ b/adapter/outbound/openvpn_stub.go
+@@ -0,0 +1,47 @@
++//go:build no_openvpn
++
++package outbound
++
++import "fmt"
++
++type OpenVPN struct {
++	*Base
++}
++
++type OpenVPNOption struct {
++	BasicOption
++	Name               string            `proxy:"name"`
++	Server             string            `proxy:"server"`
++	Port               int               `proxy:"port"`
++	Proto              string            `proxy:"proto,omitempty"`
++	Dev                string            `proxy:"dev,omitempty"`
++	Cipher             string            `proxy:"cipher,omitempty"`
++	DataCiphers        []string          `proxy:"data-ciphers,omitempty"`
++	DataCipherFallback string            `proxy:"data-ciphers-fallback,omitempty"`
++	Auth               string            `proxy:"auth,omitempty"`
++	CompLZO            string            `proxy:"comp-lzo,omitempty"`
++	CA                 string            `proxy:"ca"`
++	Cert               string            `proxy:"cert,omitempty"`
++	Key                string            `proxy:"key,omitempty"`
++	TLSAuth            string            `proxy:"tls-auth,omitempty"`
++	KeyDirection       string            `proxy:"key-direction,omitempty"`
++	TLSCrypt           string            `proxy:"tls-crypt,omitempty"`
++	TLSCryptV2         string            `proxy:"tls-crypt-v2,omitempty"`
++	Username           string            `proxy:"username,omitempty"`
++	Password           string            `proxy:"password,omitempty"`
++	PeerInfo           map[string]string `proxy:"peer-info,omitempty"`
++	Ping               int               `proxy:"ping,omitempty"`
++	PingRestart        int               `proxy:"ping-restart,omitempty"`
++	HandshakeTimeout   int               `proxy:"handshake-timeout,omitempty"`
++	MTU                int               `proxy:"mtu,omitempty"`
++	UDP                bool              `proxy:"udp,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++}
++
++func NewOpenVPN(OpenVPNOption) (*OpenVPN, error) {
++	return nil, fmt.Errorf("openvpn support is disabled by \"no_openvpn\" build tag")
++}
+diff --git a/adapter/outbound/reject.go b/adapter/outbound/reject.go
+index 79dd0586..2c5b8ae3 100644
+--- a/adapter/outbound/reject.go
++++ b/adapter/outbound/reject.go
+@@ -5,6 +5,7 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/netip"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/metacubex/mihomo/common/buf"
+@@ -24,7 +25,7 @@ type RejectOption struct {
+ // DialContext implements C.ProxyAdapter
+ func (r *Reject) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
+ 	if r.drop {
+-		return NewConn(dropConn{}, r), nil
++		return NewConn(newDropConn(), r), nil
+ 	}
+ 	return NewConn(nopConn{}, r), nil
+ }
+@@ -133,18 +134,42 @@ func (npc nopPacketConn) SetDeadline(time.Time) error      { return nil }
+ func (npc nopPacketConn) SetReadDeadline(time.Time) error  { return nil }
+ func (npc nopPacketConn) SetWriteDeadline(time.Time) error { return nil }
+ 
+-type dropConn struct{}
++// dropConn keeps a connection hanging for [C.DefaultDropTime] instead of
++// closing it, so the client behaves like it would against a dropped packet.
++// Writes are swallowed silently and the wait is released by Close, so a client
++// that goes away doesn't keep the goroutine around until the timeout.
++type dropConn struct {
++	closeOnce sync.Once
++	closed    chan struct{}
++}
++
++func newDropConn() *dropConn {
++	return &dropConn{closed: make(chan struct{})}
++}
+ 
+-func (rw dropConn) Read(b []byte) (int, error) { return 0, io.EOF }
+-func (rw dropConn) ReadBuffer(buffer *buf.Buffer) error {
+-	time.Sleep(C.DefaultDropTime)
++func (rw *dropConn) block() error {
++	timer := time.NewTimer(C.DefaultDropTime)
++	defer timer.Stop()
++	select {
++	case <-timer.C:
++	case <-rw.closed:
++	}
+ 	return io.EOF
+ }
+-func (rw dropConn) Write(b []byte) (int, error)          { return 0, io.EOF }
+-func (rw dropConn) WriteBuffer(buffer *buf.Buffer) error { return io.EOF }
+-func (rw dropConn) Close() error                         { return nil }
+-func (rw dropConn) LocalAddr() net.Addr                  { return nil }
+-func (rw dropConn) RemoteAddr() net.Addr                 { return nil }
+-func (rw dropConn) SetDeadline(time.Time) error          { return nil }
+-func (rw dropConn) SetReadDeadline(time.Time) error      { return nil }
+-func (rw dropConn) SetWriteDeadline(time.Time) error     { return nil }
++
++func (rw *dropConn) Read(b []byte) (int, error)          { return 0, rw.block() }
++func (rw *dropConn) ReadBuffer(buffer *buf.Buffer) error { return rw.block() }
++func (rw *dropConn) Write(b []byte) (int, error)         { return len(b), nil }
++func (rw *dropConn) WriteBuffer(buffer *buf.Buffer) error {
++	buffer.Release()
++	return nil
++}
++func (rw *dropConn) Close() error {
++	rw.closeOnce.Do(func() { close(rw.closed) })
++	return nil
++}
++func (rw *dropConn) LocalAddr() net.Addr              { return nil }
++func (rw *dropConn) RemoteAddr() net.Addr             { return nil }
++func (rw *dropConn) SetDeadline(time.Time) error      { return nil }
++func (rw *dropConn) SetReadDeadline(time.Time) error  { return nil }
++func (rw *dropConn) SetWriteDeadline(time.Time) error { return nil }
+diff --git a/adapter/outbound/shadowquic.go b/adapter/outbound/shadowquic.go
+index 8fefe367..fc42ee35 100644
+--- a/adapter/outbound/shadowquic.go
++++ b/adapter/outbound/shadowquic.go
+@@ -167,6 +167,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:     &option,
+ 		quicConfig: quicConfig,
+diff --git a/adapter/outbound/shadowsocks.go b/adapter/outbound/shadowsocks.go
+index 8c562a8d..41e9fcde 100644
+--- a/adapter/outbound/shadowsocks.go
++++ b/adapter/outbound/shadowsocks.go
+@@ -260,7 +260,7 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
+ 		if err = ss.ResolveUDP(ctx, metadata); err != nil {
+ 			return nil, err
+ 		}
+-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
++		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 		if ss.option.UDPOverTCPVersion == uot.LegacyVersion {
+ 			return NewPacketConn(N.NewThreadSafePacketConn(uot.NewConn(c, uot.Request{Destination: destination})), ss), nil
+ 		} else {
+@@ -507,6 +507,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		method: method,
+ 
+diff --git a/adapter/outbound/shadowsocksr.go b/adapter/outbound/shadowsocksr.go
+index fd386a8a..31b7793f 100644
+--- a/adapter/outbound/shadowsocksr.go
++++ b/adapter/outbound/shadowsocksr.go
+@@ -169,6 +169,7 @@ func NewShadowSocksR(option ShadowSocksROption) (*ShadowSocksR, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:   &option,
+ 		cipher:   coreCiph,
+diff --git a/adapter/outbound/snell.go b/adapter/outbound/snell.go
+index c4142ec4..4f523d2d 100644
+--- a/adapter/outbound/snell.go
++++ b/adapter/outbound/snell.go
+@@ -272,6 +272,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:          &option,
+ 		psk:             psk,
+diff --git a/adapter/outbound/socks5.go b/adapter/outbound/socks5.go
+index 7f3f111f..dfde7f09 100644
+--- a/adapter/outbound/socks5.go
++++ b/adapter/outbound/socks5.go
+@@ -201,6 +201,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:         &option,
+ 		user:           option.UserName,
+diff --git a/adapter/outbound/sudoku.go b/adapter/outbound/sudoku.go
+index 839be32e..6b192ba5 100644
+--- a/adapter/outbound/sudoku.go
++++ b/adapter/outbound/sudoku.go
+@@ -1,3 +1,5 @@
++//go:build !no_sudoku
++
+ package outbound
+ 
+ import (
+@@ -237,6 +239,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:   &option,
+ 		baseConf: baseConf,
+diff --git a/adapter/outbound/sudoku_stub.go b/adapter/outbound/sudoku_stub.go
+new file mode 100644
+index 00000000..149d44cd
+--- /dev/null
++++ b/adapter/outbound/sudoku_stub.go
+@@ -0,0 +1,45 @@
++//go:build no_sudoku
++
++package outbound
++
++import "fmt"
++
++type Sudoku struct {
++	*Base
++}
++
++type SudokuOption struct {
++	BasicOption
++	Name               string                 `proxy:"name"`
++	Server             string                 `proxy:"server"`
++	Port               int                    `proxy:"port"`
++	Key                string                 `proxy:"key"`
++	AEADMethod         string                 `proxy:"aead-method,omitempty"`
++	PaddingMin         *int                   `proxy:"padding-min,omitempty"`
++	PaddingMax         *int                   `proxy:"padding-max,omitempty"`
++	TableType          string                 `proxy:"table-type,omitempty"`
++	EnablePureDownlink *bool                  `proxy:"enable-pure-downlink,omitempty"`
++	HTTPMask           *bool                  `proxy:"http-mask,omitempty"`
++	HTTPMaskMode       string                 `proxy:"http-mask-mode,omitempty"`
++	HTTPMaskTLS        bool                   `proxy:"http-mask-tls,omitempty"`
++	HTTPMaskHost       string                 `proxy:"http-mask-host,omitempty"`
++	PathRoot           string                 `proxy:"path-root,omitempty"`
++	Multiplex          string                 `proxy:"multiplex,omitempty"`
++	HTTPMaskMultiplex  string                 `proxy:"http-mask-multiplex,omitempty"`
++	HTTPMaskOptions    *SudokuHTTPMaskOptions `proxy:"httpmask,omitempty"`
++	CustomTable        string                 `proxy:"custom-table,omitempty"`
++	CustomTables       []string               `proxy:"custom-tables,omitempty"`
++}
++
++type SudokuHTTPMaskOptions struct {
++	Disable   bool   `proxy:"disable,omitempty"`
++	Mode      string `proxy:"mode,omitempty"`
++	TLS       bool   `proxy:"tls,omitempty"`
++	Host      string `proxy:"host,omitempty"`
++	PathRoot  string `proxy:"path-root,omitempty"`
++	Multiplex string `proxy:"multiplex,omitempty"`
++}
++
++func NewSudoku(SudokuOption) (*Sudoku, error) {
++	return nil, fmt.Errorf("sudoku support is disabled by \"no_sudoku\" build tag")
++}
+diff --git a/adapter/outbound/trojan.go b/adapter/outbound/trojan.go
+index d581e80a..28f10856 100644
+--- a/adapter/outbound/trojan.go
++++ b/adapter/outbound/trojan.go
+@@ -299,6 +299,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:      &option,
+ 		hexPassword: trojan.Key(option.Password),
+diff --git a/adapter/outbound/tuic.go b/adapter/outbound/tuic.go
+index ed54d99f..15d0efde 100644
+--- a/adapter/outbound/tuic.go
++++ b/adapter/outbound/tuic.go
+@@ -96,7 +96,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
+ 
+ 		// tuic uos use stream-oriented udp with a special address, so we need a net.UDPAddr
+ 
+-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
++		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
+ 		if t.option.UDPOverStreamVersion == uot.LegacyVersion {
+ 			return NewPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
+ 		} else {
+@@ -249,6 +249,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		option:     &option,
+ 		quicConfig: quicConfig,
+diff --git a/adapter/outbound/vless.go b/adapter/outbound/vless.go
+index 6b9edd38..3ae778e9 100644
+--- a/adapter/outbound/vless.go
++++ b/adapter/outbound/vless.go
+@@ -285,6 +285,12 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 				Host:    packetaddr.SeqPacketMagicAddress,
+ 				DstPort: 443,
+ 			}
++		} else if v.option.XUDP && metadata.Host != "" {
++			metadata = &C.Metadata{
++				NetWork: C.UDP,
++				Host:    metadata.Host,
++				DstPort: metadata.DstPort,
++			}
+ 		} else {
+ 			metadata = &C.Metadata{ // a clear metadata only contains ip
+ 				NetWork: C.UDP,
+@@ -391,7 +397,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
+ 		return NewPacketConn(N.NewThreadSafePacketConn(
+ 			vmessSing.NewXUDPConn(c,
+ 				globalID,
+-				M.SocksaddrFromNet(metadata.UDPAddr())),
++				M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)),
+ 		), v), nil
+ 	} else if v.option.PacketAddr {
+ 		return NewPacketConn(N.NewThreadSafePacketConn(
+@@ -501,6 +507,7 @@ func NewVless(option VlessOption) (*Vless, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    option.XUDP,
+ 		}),
+ 		client: client,
+ 		option: &option,
+diff --git a/adapter/outbound/vless_test.go b/adapter/outbound/vless_test.go
+new file mode 100644
+index 00000000..4c83403c
+--- /dev/null
++++ b/adapter/outbound/vless_test.go
+@@ -0,0 +1,28 @@
++package outbound
++
++import (
++	"context"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++func TestVlessXUDPLeavesDomainForRemoteResolution(t *testing.T) {
++	v := &Vless{
++		Base:   NewBase(BaseOption{RemoteDNS: true}),
++		option: &VlessOption{XUDP: true},
++	}
++	metadata := &C.Metadata{
++		NetWork: C.UDP,
++		Host:    "quic.example",
++		DstPort: 443,
++		DNSMode: C.DNSFakeIP,
++	}
++
++	if err := v.ResolveUDP(context.Background(), metadata); err != nil {
++		t.Fatalf("ResolveUDP() error = %v", err)
++	}
++	if metadata.DstIP.IsValid() {
++		t.Fatalf("ResolveUDP() unexpectedly resolved domain to %s", metadata.DstIP)
++	}
++}
+diff --git a/adapter/outbound/vmess.go b/adapter/outbound/vmess.go
+index aef7cce8..811ea92c 100644
+--- a/adapter/outbound/vmess.go
++++ b/adapter/outbound/vmess.go
+@@ -304,11 +304,11 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 			if useEarly {
+ 				conn = v.client.DialEarlyXUDPPacketConn(c,
+ 					globalID,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			} else {
+ 				conn, err = v.client.DialXUDPPacketConn(c,
+ 					globalID,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			}
+ 		} else if v.option.PacketAddr {
+ 			if useEarly {
+@@ -322,10 +322,10 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
+ 		} else {
+ 			if useEarly {
+ 				conn = v.client.DialEarlyPacketConn(c,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			} else {
+ 				conn, err = v.client.DialPacketConn(c,
+-					M.SocksaddrFromNet(metadata.UDPAddr()))
++					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+ 			}
+ 		}
+ 	} else {
+@@ -435,7 +435,7 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
+ 	if pc, ok := c.(net.PacketConn); ok {
+ 		return NewPacketConn(N.NewThreadSafePacketConn(pc), v), nil
+ 	}
+-	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: metadata.UDPAddr()}, v), nil
++	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)}, v), nil
+ }
+ 
+ // ProxyInfo implements C.ProxyAdapter
+@@ -504,6 +504,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
+ 			Interface:    option.Interface,
+ 			RoutingMark:  option.RoutingMark,
+ 			Prefer:       option.IPVersion,
++			RemoteDNS:    true,
+ 		}),
+ 		client: client,
+ 		option: &option,
+diff --git a/adapter/outbound/wireguard.go b/adapter/outbound/wireguard.go
+index 8b5abcec..81ab6fc5 100644
+--- a/adapter/outbound/wireguard.go
++++ b/adapter/outbound/wireguard.go
+@@ -1,10 +1,11 @@
++//go:build !no_wireguard
++
+ package outbound
+ 
+ import (
+ 	"context"
+ 	"encoding/base64"
+ 	"encoding/hex"
+-	"errors"
+ 	"fmt"
+ 	"net"
+ 	"net/netip"
+@@ -20,13 +21,11 @@ import (
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	"github.com/metacubex/mihomo/component/slowdown"
+ 	C "github.com/metacubex/mihomo/constant"
+-	"github.com/metacubex/mihomo/constant/features"
+ 	"github.com/metacubex/mihomo/dns"
+ 	"github.com/metacubex/mihomo/log"
+ 
+ 	amneziav3 "github.com/metacubex/amneziawg-go/device"
+ 	amnezia "github.com/metacubex/amneziawg-go/device_v1"
+-	"github.com/metacubex/mipstack"
+ 	wireguard "github.com/metacubex/sing-wireguard"
+ 	"github.com/metacubex/wireguard-go/device"
+ 	"github.com/metacubex/wireguard-go/tun"
+@@ -36,12 +35,6 @@ import (
+ 	M "github.com/metacubex/sing/common/metadata"
+ )
+ 
+-const (
+-	ipStackAuto   = "auto"
+-	ipStackGVisor = "gvisor"
+-	ipStackMips   = "mips"
+-)
+-
+ type wireguardGoDevice interface {
+ 	Close()
+ 	IpcSet(uapiConf string) error
+@@ -140,108 +133,6 @@ type AmneziaWGOption struct {
+ 	DisableCookies         bool   `proxy:"disable-cookies,omitempty"` // AmneziaWG v3.1+
+ }
+ 
+-type IPStackOption struct {
+-	Mode                 string `proxy:"mode,omitempty"`
+-	CongestionController string `proxy:"congestion-controller,omitempty"`
+-}
+-
+-func (o *IPStackOption) normalize() {
+-	o.Mode = strings.ToLower(o.Mode)
+-	if o.Mode == "" {
+-		o.Mode = ipStackAuto
+-	}
+-	o.CongestionController = strings.ToLower(o.CongestionController)
+-}
+-
+-func (o IPStackOption) validate() error {
+-	switch o.Mode {
+-	case ipStackAuto, ipStackMips:
+-	case ipStackGVisor:
+-		if !features.WithGVisor {
+-			return errors.New("gVisor IP stack requires the with_gvisor build tag")
+-		}
+-	default:
+-		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
+-	}
+-	switch o.CongestionController {
+-	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR, mipstack.CongestionControlBBR3:
+-		return nil
+-	default:
+-		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, bbr, or bbr3", o.CongestionController)
+-	}
+-}
+-
+-// ipStack is the mihomo IP stack's packet and socket surface, adapted from
+-// sing-wireguard only for gVisor.
+-type ipStack interface {
+-	Start() error
+-	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+-	DialUDP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
+-	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
+-	Read(buffers [][]byte, sizes []int, offset int) (int, error)
+-	Write(buffers [][]byte, offset int) (int, error)
+-	MTU() (int, error)
+-	Name() (string, error)
+-	BatchSize() int
+-	Close() error
+-}
+-
+-// newIPStack constructs the selected userspace IP stack.
+-func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
+-	mode := option.Mode
+-	if mode == ipStackAuto {
+-		if features.WithGVisor {
+-			mode = ipStackGVisor
+-		} else {
+-			mode = ipStackMips
+-		}
+-	}
+-	switch mode {
+-	case ipStackGVisor:
+-		return wireguard.NewStackDevice(localAddresses, mtu)
+-	case ipStackMips:
+-		return mipstack.New(mipstack.Config{
+-			LocalAddresses: localAddresses,
+-			MTU:            mtu,
+-			TCP: mipstack.TCPSocketDefaults{
+-				CongestionControl: option.CongestionController,
+-				// Align with sing-wireguard: enable keepalive with 15-second
+-				// idle/interval timing and gVisor's default probe count.
+-				KeepAlive: true,
+-				KeepAliveConfig: mipstack.KeepAliveConfig{
+-					Idle: 15 * time.Second, Interval: 15 * time.Second, Count: 9,
+-				},
+-			},
+-		})
+-	default:
+-		return nil, errors.New("invalid IP stack mode")
+-	}
+-}
+-
+-var _ ipStack = (*mipstack.Stack)(nil)
+-var _ ipStack = (wireguard.Device)(nil)
+-
+-type ipStackNetDialer struct {
+-	stack ipStack
+-}
+-
+-var _ dialer.NetDialer = (*ipStackNetDialer)(nil)
+-
+-func (d ipStackNetDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+-	dst, err := netip.ParseAddrPort(address)
+-	if err != nil {
+-		return nil, fmt.Errorf("invalid address %q: %w", address, err)
+-	}
+-	switch {
+-	case strings.HasPrefix(network, "tcp"):
+-		return d.stack.DialTCP(ctx, network, netip.AddrPort{}, dst)
+-	case strings.HasPrefix(network, "udp"):
+-		return d.stack.DialUDP(ctx, network, netip.AddrPort{}, dst)
+-	default:
+-		return nil, fmt.Errorf("invalid network %q", network)
+-	}
+-}
+-
+ type wireguardDevice interface {
+ 	ipStack
+ 	tun.Device
+diff --git a/adapter/outbound/wireguard_stub.go b/adapter/outbound/wireguard_stub.go
+new file mode 100644
+index 00000000..847279f4
+--- /dev/null
++++ b/adapter/outbound/wireguard_stub.go
+@@ -0,0 +1,84 @@
++//go:build no_wireguard
++
++package outbound
++
++import "fmt"
++
++type WireGuard struct {
++	*Base
++}
++
++type WireGuardOption struct {
++	BasicOption
++	WireGuardPeerOption
++	Name                string `proxy:"name"`
++	Ip                  string `proxy:"ip,omitempty"`
++	Ipv6                string `proxy:"ipv6,omitempty"`
++	PrivateKey          string `proxy:"private-key"`
++	Workers             int    `proxy:"workers,omitempty"`
++	MTU                 int    `proxy:"mtu,omitempty"`
++	UDP                 bool   `proxy:"udp,omitempty"`
++	PersistentKeepalive int    `proxy:"persistent-keepalive,omitempty"`
++
++	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
++
++	AmneziaWGOption *AmneziaWGOption `proxy:"amnezia-wg-option,omitempty"`
++
++	Peers []WireGuardPeerOption `proxy:"peers,omitempty"`
++
++	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
++	Dns              []string `proxy:"dns,omitempty"`
++
++	RefreshServerIPInterval int `proxy:"refresh-server-ip-interval,omitempty"`
++}
++
++type WireGuardPeerOption struct {
++	Server       string   `proxy:"server,omitempty"`
++	Port         int      `proxy:"port,omitempty"`
++	PublicKey    string   `proxy:"public-key,omitempty"`
++	PreSharedKey string   `proxy:"pre-shared-key,omitempty"`
++	Reserved     []uint8  `proxy:"reserved,omitempty"`
++	AllowedIPs   []string `proxy:"allowed-ips,omitempty"`
++}
++
++type AmneziaWGOption struct {
++	Version int `proxy:"version,omitempty"`
++
++	JC   int `proxy:"jc,omitempty"`
++	JMin int `proxy:"jmin,omitempty"`
++	JMax int `proxy:"jmax,omitempty"`
++	S1   int `proxy:"s1,omitempty"`
++	S2   int `proxy:"s2,omitempty"`
++	S3   int `proxy:"s3,omitempty"`
++	S4   int `proxy:"s4,omitempty"`
++
++	H1 string `proxy:"h1,omitempty"`
++	H2 string `proxy:"h2,omitempty"`
++	H3 string `proxy:"h3,omitempty"`
++	H4 string `proxy:"h4,omitempty"`
++
++	I1 string `proxy:"i1,omitempty"`
++	I2 string `proxy:"i2,omitempty"`
++	I3 string `proxy:"i3,omitempty"`
++	I4 string `proxy:"i4,omitempty"`
++	I5 string `proxy:"i5,omitempty"`
++
++	J1    string `proxy:"j1,omitempty"`
++	J2    string `proxy:"j2,omitempty"`
++	J3    string `proxy:"j3,omitempty"`
++	Itime int64  `proxy:"itime,omitempty"`
++
++	HeaderProtectionKey    string `proxy:"header-protection-key,omitempty"`
++	ContentPaddingAddition string `proxy:"content-padding-addition,omitempty"`
++	RekeyAfterTime         string `proxy:"rekey-after-time,omitempty"`
++	RekeyTimeout           string `proxy:"rekey-timeout,omitempty"`
++	RejectAfterTime        string `proxy:"reject-after-time,omitempty"`
++	KeepaliveTimeout       string `proxy:"keepalive-timeout,omitempty"`
++	MaxHandshakeAttempts   string `proxy:"max-handshake-attempts,omitempty"`
++	RandomTrailers         bool   `proxy:"random-trailers,omitempty"`
++	DisableCookies         bool   `proxy:"disable-cookies,omitempty"`
++}
++
++func NewWireGuard(WireGuardOption) (*WireGuard, error) {
++	return nil, fmt.Errorf("wireguard support is disabled by \"no_wireguard\" build tag")
++}

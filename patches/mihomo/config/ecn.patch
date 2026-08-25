@@ -1,0 +1,18 @@
+diff --git a/config/config.go b/config/config.go
+--- a/config/config.go
++++ b/config/config.go
+@@ -564,13 +564,9 @@ func UnmarshalRawConfig(buf []byte) (*RawConfig, error) {
+ 			Enable:           false,
+ 			InboundInterface: "lo",
+ 			Bypass:           []string{},
+ 			DnsRedirect:      true,
+ 		},
+-		Experimental: RawExperimental{
+-			// https://github.com/quic-go/quic-go/issues/4178
+-			// Quic-go currently cannot automatically fall back on platforms that do not support ecn, so this feature is turned off by default.
+-			QUICGoDisableECN: true,
+-		},
++		Experimental: RawExperimental{},
+ 		Profile: RawProfile{
+ 			StoreSelected: true,
+ 		},
