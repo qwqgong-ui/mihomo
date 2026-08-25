@@ -1824,7 +1824,7 @@ new file mode 100644
 index 00000000..1346b3a7
 --- /dev/null
 +++ b/component/dialer/tcp_concurrent_cache_test.go
-@@ -0,0 +1,659 @@
+@@ -0,0 +1,662 @@
 +package dialer
 +
 +import (
@@ -2385,11 +2385,11 @@ index 00000000..1346b3a7
 +	ipA := netip.MustParseAddr("192.0.2.1")
 +	ipB := netip.MustParseAddr("192.0.2.2")
 +	slow := make(chan struct{})
-+	time.AfterFunc(20*time.Millisecond, func() { close(slow) })
 +	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
 +		ipA: {{release: slow}},
 +		ipB: {{release: slow, err: errors.New("ipB failed")}},
 +	})
++	time.AfterFunc(20*time.Millisecond, func() { close(slow) })
 +
 +	// Racing more than one candidate must ignore opt.tfo and still produce a
 +	// real, positive RTT sample: TFO is only safe to honor once there is a
@@ -2399,7 +2399,10 @@ index 00000000..1346b3a7
 +		t.Fatalf("result = %s, %v; want %s, nil", result.ip, result.error, ipA)
 +	}
 +	_ = result.Conn.Close()
-+	if result.dialDuration < 20*time.Millisecond {
++	// The timer is armed just before the dial, so dialDuration lands a hair
++	// under 20ms; the point is that it reflects the real connect wait rather
++	// than a TFO-stub near-zero value.
++	if result.dialDuration < 15*time.Millisecond {
 +		t.Fatalf("dialDuration = %s; want it to reflect the real ~20ms connect wait, not a TFO-stub near-zero value", result.dialDuration)
 +	}
 +}
