@@ -4,9 +4,11 @@
 # - Physical-network DNS dialing
 # - TCP concurrent winner cache
 # - Runtime IPv6 gate test integration
+# - Single-allocation candidate address formatting
+# - DIRECT internal-overhead percentile tests
 #
 diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
-index c4e9c5ce..1a3f5d2e 100644
+index c4e9c5ce..22a81573 100644
 --- a/component/dialer/dialer.go
 +++ b/component/dialer/dialer.go
 @@ -13,6 +13,7 @@ import (
@@ -17,7 +19,7 @@ index c4e9c5ce..1a3f5d2e 100644
  	"github.com/metacubex/mihomo/component/keepalive"
  	"github.com/metacubex/mihomo/component/mptcp"
  	"github.com/metacubex/mihomo/component/resolver"
-@@ -50,32 +51,432 @@ func DialContext(ctx context.Context, network, address string, options ...Option
+@@ -50,32 +51,450 @@ func DialContext(ctx context.Context, network, address string, options ...Option
  		network = fmt.Sprintf("%s%d", network, opt.network)
  	}
  
@@ -112,9 +114,7 @@ index c4e9c5ce..1a3f5d2e 100644
 +		} else {
 +			ips, lookupErr = resolver.LookupIPv6WithResolver(raceCtx, host, preferResolver)
 +		}
-+		for i, ip := range ips {
-+			ips[i] = ip.Unmap()
-+		}
++		ips = unmapAddrs(ips)
 +		ips = prioritizeDirectWinner(host, opt.directAdapter, ips)
 +		lookups <- lookupResult{version: version, ips: ips, err: lookupErr}
 +	}
@@ -146,6 +146,26 @@ index c4e9c5ce..1a3f5d2e 100644
 +		}
 +	}
 +	return nil, errors.Join(lookupErrs...)
++}
++
++// unmapAddrs returns ips with every 4-in-6 address unmapped, allocating a copy
++// only when something actually has to change. The slice comes straight from a
++// resolver and may be shared with state that outlives this call (a hosts
++// entry, another concurrent lookup of the same name), so it must never be
++// rewritten in place.
++func unmapAddrs(ips []netip.Addr) []netip.Addr {
++	for index, ip := range ips {
++		unmapped := ip.Unmap()
++		if unmapped == ip {
++			continue
++		}
++		unmappedIPs := append([]netip.Addr(nil), ips...)
++		for rest := index; rest < len(unmappedIPs); rest++ {
++			unmappedIPs[rest] = unmappedIPs[rest].Unmap()
++		}
++		return unmappedIPs
++	}
++	return ips
 +}
 +
 +func prioritizeDirectWinner(host, adapter string, ips []netip.Addr) []netip.Addr {
@@ -456,7 +476,7 @@ index c4e9c5ce..1a3f5d2e 100644
  func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort, options ...Option) (net.PacketConn, error) {
  	opt := applyOptions(options...)
  
-@@ -120,6 +521,18 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
+@@ -120,10 +539,49 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
  	return lc.ListenPacket(ctx, network, address)
  }
  
@@ -472,10 +492,43 @@ index c4e9c5ce..1a3f5d2e 100644
 +	return DefaultSocketHook == nil && opt.tfo && !DisableTFO
 +}
 +
++// joinAddrPort formats destination:port the same way
++// net.JoinHostPort(destination.String(), port) does, but with a single
++// allocation instead of one for the address text and another for the join.
++// Every racing candidate of every DIRECT dial goes through here.
++func joinAddrPort(destination netip.Addr, port string) string {
++	if !destination.IsValid() {
++		// AppendTo writes nothing for the zero Addr; keep the caller-visible
++		// text identical to the old formatting so error messages don't change.
++		return net.JoinHostPort(destination.String(), port)
++	}
++	var buf [64]byte
++	b := buf[:0]
++	if destination.Is6() {
++		// Matches JoinHostPort's rule: anything whose text can contain ':'
++		// or a '%' zone has to be bracketed. That is every 16-byte address,
++		// including the "::ffff:1.2.3.4" form of a 4-in-6 address, and
++		// nothing else (an invalid Addr prints as plain text).
++		b = append(b, '[')
++		b = destination.AppendTo(b)
++		b = append(b, ']')
++	} else {
++		b = destination.AppendTo(b)
++	}
++	b = append(b, ':')
++	b = append(b, port...)
++	return string(b)
++}
++
  func dialContext(ctx context.Context, network string, destination netip.Addr, port string, opt option) (net.Conn, error) {
- 	var address string
+-	var address string
  	destination, port = resolver.LookupIP4P(destination, port)
-@@ -175,12 +588,20 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+-	address = net.JoinHostPort(destination.String(), port)
++	address := joinAddrPort(destination, port)
+ 
+ 	netDialer := opt.netDialer
+ 	switch netDialer.(type) {
+@@ -175,12 +633,20 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
  }
  
  func ICMPControl(destination netip.Addr) func(network, address string, conn syscall.RawConn) error {
@@ -497,7 +550,7 @@ index c4e9c5ce..1a3f5d2e 100644
  		if interfaceName == "" {
  			if finder := DefaultInterfaceFinder.Load(); finder != nil {
  				interfaceName = finder.FindInterfaceName(destination)
-@@ -191,7 +612,10 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
+@@ -191,7 +657,10 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
  				return err
  			}
  		}
@@ -509,7 +562,7 @@ index c4e9c5ce..1a3f5d2e 100644
  		if routingMark != 0 {
  			bindMarkToDialer(routingMark, dialer, network, destination)
  		}
-@@ -202,12 +626,12 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
+@@ -202,12 +671,12 @@ func ICMPControl(destination netip.Addr) func(network, address string, conn sysc
  	}
  }
  
@@ -525,7 +578,7 @@ index c4e9c5ce..1a3f5d2e 100644
  	}
  	if len(ipv4s) == 0 && len(ipv6s) != 0 {
  		return dialFn(ctx, network, ipv6s, port, opt)
-@@ -228,7 +652,8 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
+@@ -228,7 +697,8 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
  
  	racer := func(ips []netip.Addr, isPrimary bool) {
  		defer wg.Done()
@@ -535,7 +588,7 @@ index c4e9c5ce..1a3f5d2e 100644
  		defer func() {
  			select {
  			case results <- result:
-@@ -238,7 +663,6 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
+@@ -238,7 +708,6 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string,
  				}
  			}
  		}()
@@ -543,7 +596,7 @@ index c4e9c5ce..1a3f5d2e 100644
  	}
  
  	if len(ipv4s) != 0 {
-@@ -264,7 +688,7 @@ loop:
+@@ -264,7 +733,7 @@ loop:
  		select {
  		case <-fallbackTicker.C:
  			if fallback.error == nil && fallback.Conn != nil {
@@ -552,7 +605,7 @@ index c4e9c5ce..1a3f5d2e 100644
  			}
  		case res, ok := <-results:
  			if !ok {
-@@ -277,7 +701,7 @@ loop:
+@@ -277,7 +746,7 @@ loop:
  							_ = fallback.Conn.Close()
  						}()
  					}
@@ -561,7 +614,7 @@ index c4e9c5ce..1a3f5d2e 100644
  				}
  				fallback = res
  			} else {
-@@ -291,22 +715,43 @@ loop:
+@@ -291,22 +760,43 @@ loop:
  	}
  
  	if fallback.error == nil && fallback.Conn != nil {
@@ -610,7 +663,7 @@ index c4e9c5ce..1a3f5d2e 100644
  		result := dialResult{isPrimary: true, ip: ip}
  		defer func() {
  			select {
-@@ -317,7 +762,8 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
+@@ -317,7 +807,8 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
  				}
  			}
  		}()
@@ -620,7 +673,7 @@ index c4e9c5ce..1a3f5d2e 100644
  	}
  
  	for _, ip := range ips {
-@@ -327,30 +773,30 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
+@@ -327,30 +818,30 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr,
  	for i := 0; i < len(ips); i++ {
  		res := <-results
  		if res.error == nil {
@@ -658,7 +711,7 @@ index c4e9c5ce..1a3f5d2e 100644
  }
  
  type dialResult struct {
-@@ -358,6 +804,12 @@ type dialResult struct {
+@@ -358,6 +849,12 @@ type dialResult struct {
  	net.Conn
  	error
  	isPrimary bool
@@ -1190,6 +1243,248 @@ index 00000000..55ffd87f
 +		t.Fatalf("fallback attempt = %s, want IPv6 %s", got, v6)
 +	}
 +	requireRaceSuccess(t, result)
++}
+diff --git a/component/dialer/direct_latency_test.go b/component/dialer/direct_latency_test.go
+new file mode 100644
+index 00000000..366bb025
+--- /dev/null
++++ b/component/dialer/direct_latency_test.go
+@@ -0,0 +1,236 @@
++package dialer
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"sort"
++	"testing"
++	"time"
++)
++
++// The tests here measure DIRECT's *internal* handling cost: DNS answers and
++// TCP connects are served instantly by fakes, so every measured nanosecond is
++// mihomo's own work (goroutine fan-out, channel hand-offs, timers, cache
++// lookups). Thresholds are deliberately loose so a loaded CI box doesn't turn
++// them into flakes; the useful output is the logged distribution.
++
++type instantLookup struct {
++	controlledLookup
++}
++
++func newInstantLookup(v4, v6 []netip.Addr) *instantLookup {
++	return &instantLookup{controlledLookup{
++		v4Gate:  closedGate(),
++		v6Gate:  closedGate(),
++		v4:      v4,
++		v6:      v6,
++		timeout: 100 * time.Millisecond,
++	}}
++}
++
++// instantDialer completes every connect immediately, without the attempt
++// bookkeeping controlledDialer does (an unbuffered channel would dominate the
++// measurement).
++type instantDialer struct{}
++
++func (instantDialer) DialContext(context.Context, string, string) (net.Conn, error) {
++	left, right := net.Pipe()
++	_ = right.Close()
++	return left, nil
++}
++
++type latencyStats struct {
++	p50, p95, p99, p100 time.Duration
++}
++
++func percentiles(samples []time.Duration) latencyStats {
++	sorted := append([]time.Duration(nil), samples...)
++	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
++	at := func(p float64) time.Duration {
++		if len(sorted) == 0 {
++			return 0
++		}
++		index := int(float64(len(sorted))*p/100+0.5) - 1
++		if index < 0 {
++			index = 0
++		}
++		if index >= len(sorted) {
++			index = len(sorted) - 1
++		}
++		return sorted[index]
++	}
++	return latencyStats{p50: at(50), p95: at(95), p99: at(99), p100: at(100)}
++}
++
++func measure(t *testing.T, name string, iterations int, dial func() (net.Conn, error)) latencyStats {
++	t.Helper()
++	// Warm up caches and let the allocator settle before sampling.
++	for i := 0; i < 20; i++ {
++		conn, err := dial()
++		if err != nil {
++			t.Fatalf("%s warmup failed: %v", name, err)
++		}
++		_ = conn.Close()
++	}
++	samples := make([]time.Duration, 0, iterations)
++	for i := 0; i < iterations; i++ {
++		start := time.Now()
++		conn, err := dial()
++		elapsed := time.Since(start)
++		if err != nil {
++			t.Fatalf("%s iteration %d failed: %v", name, i, err)
++		}
++		_ = conn.Close()
++		samples = append(samples, elapsed)
++	}
++	stats := percentiles(samples)
++	t.Logf("%s over %d dials: p50=%s p95=%s p99=%s p100=%s",
++		name, iterations, stats.p50, stats.p95, stats.p99, stats.p100)
++	return stats
++}
++
++var (
++	latencyV4 = []netip.Addr{netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("198.51.100.2")}
++	latencyV6 = []netip.Addr{netip.MustParseAddr("2001:db8::1"), netip.MustParseAddr("2001:db8::2")}
++)
++
++// TestDirectDialInternalLatencyBaseline records what a bare dial through the
++// injected dialer costs, so the race numbers below can be read as overhead
++// rather than absolute time.
++func TestDirectDialInternalLatencyBaseline(t *testing.T) {
++	stats := measure(t, "baseline netDialer", 500, func() (net.Conn, error) {
++		return instantDialer{}.DialContext(context.Background(), "tcp", "198.51.100.1:443")
++	})
++	if stats.p100 > 20*time.Millisecond {
++		t.Fatalf("baseline p100 %s is implausibly slow; machine too loaded to trust the other numbers", stats.p100)
++	}
++}
++
++// TestDirectDualStackInternalLatencyPercentiles covers the default DIRECT TCP
++// path: A and AAAA answered at once, four candidates racing.
++func TestDirectDualStackInternalLatencyPercentiles(t *testing.T) {
++	SetTcpConcurrent(false)
++	lookup := newInstantLookup(latencyV4, latencyV6)
++	dial := instantDialer{}
++
++	stats := measure(t, "direct dual-stack race", 500, func() (net.Conn, error) {
++		return DialContext(context.Background(), "tcp", "example.test:443",
++			WithResolver(lookup), WithNetDialer(dial), WithDirectDualStack(),
++			WithDirectRacePreference("DIRECT"))
++	})
++	if stats.p95 > 5*time.Millisecond {
++		t.Fatalf("direct dual-stack p95 %s exceeds 5ms of internal overhead", stats.p95)
++	}
++	if stats.p100 > 50*time.Millisecond {
++		t.Fatalf("direct dual-stack p100 %s exceeds 50ms; a timer or lookup budget is leaking into the fast path", stats.p100)
++	}
++}
++
++// TestDirectPreferredInternalLatencyPercentiles covers prefer: ipv6, whose
++// state machine arms an extra preference timer.
++func TestDirectPreferredInternalLatencyPercentiles(t *testing.T) {
++	SetTcpConcurrent(false)
++	lookup := newInstantLookup(latencyV4, latencyV6)
++	dial := instantDialer{}
++
++	stats := measure(t, "direct prefer-ipv6 race", 500, func() (net.Conn, error) {
++		return DialContext(context.Background(), "tcp", "example.test:443",
++			WithResolver(lookup), WithNetDialer(dial), WithDirectDualStack(),
++			WithDirectRacePreference("DIRECT"), WithPreferIPv6())
++	})
++	if stats.p95 > 5*time.Millisecond {
++		t.Fatalf("direct prefer-ipv6 p95 %s exceeds 5ms of internal overhead", stats.p95)
++	}
++	if stats.p100 > 50*time.Millisecond {
++		t.Fatalf("direct prefer-ipv6 p100 %s exceeds 50ms; the preference timer is being waited on", stats.p100)
++	}
++}
++
++// TestTCPConcurrentCacheInternalLatencyPercentiles covers the tcp-concurrent
++// path, where a warm cache entry should make every dial a single fast-path
++// connect.
++func TestTCPConcurrentCacheInternalLatencyPercentiles(t *testing.T) {
++	SetTcpConcurrent(true)
++	t.Cleanup(func() {
++		SetTcpConcurrent(false)
++		ClearTCPConcurrentCache()
++	})
++	ClearTCPConcurrentCache()
++	lookup := newInstantLookup(latencyV4, latencyV6)
++	dial := instantDialer{}
++
++	stats := measure(t, "tcp-concurrent cached fast path", 500, func() (net.Conn, error) {
++		return DialContext(context.Background(), "tcp", "example.test:443",
++			WithResolver(lookup), WithNetDialer(dial))
++	})
++	if stats.p95 > 5*time.Millisecond {
++		t.Fatalf("tcp-concurrent p95 %s exceeds 5ms of internal overhead", stats.p95)
++	}
++	if stats.p100 > 50*time.Millisecond {
++		t.Fatalf("tcp-concurrent p100 %s exceeds 50ms; the fast-path timer is firing on a warm entry", stats.p100)
++	}
++}
++
++func BenchmarkDirectDualStackInternal(b *testing.B) {
++	SetTcpConcurrent(false)
++	lookup := newInstantLookup(latencyV4, latencyV6)
++	dial := instantDialer{}
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		conn, err := DialContext(context.Background(), "tcp", "example.test:443",
++			WithResolver(lookup), WithNetDialer(dial), WithDirectDualStack(),
++			WithDirectRacePreference("DIRECT"))
++		if err != nil {
++			b.Fatal(err)
++		}
++		_ = conn.Close()
++	}
++}
++
++func TestJoinAddrPortMatchesJoinHostPort(t *testing.T) {
++	for _, destination := range []netip.Addr{
++		netip.MustParseAddr("198.51.100.1"),
++		netip.MustParseAddr("2001:db8::1"),
++		netip.MustParseAddr("::ffff:198.51.100.1"),
++		netip.MustParseAddr("fe80::1%eth0"),
++		netip.IPv4Unspecified(),
++		netip.IPv6Unspecified(),
++		{},
++	} {
++		want := net.JoinHostPort(destination.String(), "443")
++		if got := joinAddrPort(destination, "443"); got != want {
++			t.Fatalf("joinAddrPort(%v) = %q, want %q", destination, got, want)
++		}
++	}
++}
++
++func BenchmarkJoinAddrPort(b *testing.B) {
++	destination := netip.MustParseAddr("2001:db8::1")
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		_ = joinAddrPort(destination, "443")
++	}
++}
++
++func TestUnmapAddrsDoesNotMutateResolverSlice(t *testing.T) {
++	mapped := netip.MustParseAddr("::ffff:198.51.100.1")
++	shared := []netip.Addr{netip.MustParseAddr("2001:db8::1"), mapped}
++	unmapped := unmapAddrs(shared)
++
++	if shared[1] != mapped {
++		t.Fatalf("resolver slice was rewritten in place: %v", shared[1])
++	}
++	if want := netip.MustParseAddr("198.51.100.1"); unmapped[1] != want {
++		t.Fatalf("unmapAddrs returned %v, want %v", unmapped[1], want)
++	}
++	if unmapped[0] != shared[0] {
++		t.Fatalf("unmapAddrs changed an already-unmapped address: %v", unmapped[0])
++	}
++
++	clean := []netip.Addr{netip.MustParseAddr("198.51.100.1")}
++	if got := unmapAddrs(clean); &got[0] != &clean[0] {
++		t.Fatal("unmapAddrs copied a slice that needed no change")
++	}
 +}
 diff --git a/component/dialer/options.go b/component/dialer/options.go
 index c1c622dd..78d43cf4 100644

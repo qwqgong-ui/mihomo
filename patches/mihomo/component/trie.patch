@@ -1,0 +1,38 @@
+# Functions:
+# - Empty-trie domain lookup fast path
+#
+diff --git a/component/trie/domain.go b/component/trie/domain.go
+index f790d666..234ea180 100644
+--- a/component/trie/domain.go
++++ b/component/trie/domain.go
+@@ -137,6 +137,11 @@ func (t *DomainTrie[T]) insert(parts []string, data T) {
+ // 2. wildcard domain
+ // 2. dot wildcard domain
+ func (t *DomainTrie[T]) Search(domain string) *Node[T] {
++	if t.root.hasNoChild() {
++		// Nothing can match, and search() would only ever reach
++		// root.getChild(dotWildcard) == nil anyway.
++		return nil
++	}
+ 	parts, err := ValidAndSplitDomain(domain)
+ 	if err != nil || parts[0] == "" {
+ 		return nil
+diff --git a/component/trie/node.go b/component/trie/node.go
+index 3aa2bc7d..b949f2cb 100644
+--- a/component/trie/node.go
++++ b/component/trie/node.go
+@@ -21,6 +21,14 @@ func (n *Node[T]) getChild(s string) *Node[T] {
+ 	return n.childMap[s]
+ }
+ 
++// hasNoChild reports whether the node has no children at all, which lets a
++// lookup skip splitting the domain when the whole trie is empty (the common
++// case for hosts: with no user entries every DNS lookup would otherwise pay a
++// lower-case + split allocation).
++func (n *Node[T]) hasNoChild() bool {
++	return n == nil || (n.childMap == nil && n.childNode == nil)
++}
++
+ func (n *Node[T]) hasChild(s string) bool {
+ 	return n.getChild(s) != nil
+ }

@@ -13,6 +13,7 @@ component/dialer.patch
 component/directrace.patch
 component/ecs.patch
 component/resolver.patch
+component/trie.patch
 dns.patch
 listener/sing_tun.patch
 config.patch
