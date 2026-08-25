@@ -179,6 +179,24 @@ Patches:
 - `transport/tuic.patch`
 - `../../quic-go/0001-hy2-expose-validated-ack-ecn-deltas.patch`（依赖补丁）
 
+## HY2 QUIC v2
+
+Hysteria2 出站的 `quic.Config.Versions` 固定为 `[v2]`，首包按 QUIC v2（RFC 9369）发出。无配置项。
+
+**没有版本回落**：hysteria2 的认证走 HTTP/3，而 `http3.Transport` 在 `Versions` 多于一个时直接报
+`can only use a single QUIC version for dialing a HTTP/3 connection`（quic-go `http3/transport.go:152`），
+所以 quic-go 的 Version Negotiation 回落在这里用不了，只能填单个版本。服务端必须支持 v2，否则握手失败。
+
+mihomo 自己的 hy2 入站和 Xray-core 的 hysteria 入站都不设 `Versions`，quic-go 会填成
+`SupportedVersions`（v1 和 v2），因此两者都能接 v2。
+
+v2 与 v1 的帧格式相同，只有版本号、Initial salt/HKDF label 和长包头 packet type 编码不同，
+不影响 hy2 自身协议、Salamander/Gecko 混淆和端口跳跃。
+
+Patches:
+
+- `adapter/outbound.patch`
+
 ## Reject-Rule Short-Circuit
 
 命中 REJECT 或 REJECT-DROP 的连接在规则匹配后直接短路，不再拨出站、不再包装 deadline conn、traffic tracker 和双向 relay。TCP REJECT 立即关闭客户端连接；TCP REJECT-DROP 交给共享 parker 挂起，由单个按截止时间排序的 goroutine 统一释放，队列有上限以免洪水堆积 fd；UDP 在 nat 表中吸收整个会话，后续报文由已关闭的 sender 直接丢弃，不再重复匹配规则、拨号和打日志。`reject` 出站自身的 dropConn 同时成为真正的黑洞：写入被吞掉而不是报错。

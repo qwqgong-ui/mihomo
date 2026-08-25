@@ -1265,7 +1265,6 @@ index 26032953..f945daed 100644
  	err = c.UDPConn.WriteTo(p, M.SocksaddrFromNet(addr).String())
  	if err != nil {
 diff --git a/adapter/outbound/hysteria2.go b/adapter/outbound/hysteria2.go
-index 4731611f..6e3018cd 100644
 --- a/adapter/outbound/hysteria2.go
 +++ b/adapter/outbound/hysteria2.go
 @@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
@@ -1276,6 +1275,18 @@ index 4731611f..6e3018cd 100644
  		}),
  		option: &option,
  	}
+@@ -199,6 +200,11 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
+ 	}
+ 
+ 	quicConfig := &quic.Config{
++		// Dial with QUIC v2 (RFC 9369). This must stay a single version:
++		// hysteria2 authenticates over HTTP/3, and http3.Transport rejects a
++		// quic.Config carrying more than one version, so quic-go's Version
++		// Negotiation fallback is not available here. Servers must support v2.
++		Versions:                       []quic.Version{quic.Version2},
+ 		InitialStreamReceiveWindow:     option.InitialStreamReceiveWindow,
+ 		MaxStreamReceiveWindow:         option.MaxStreamReceiveWindow,
+ 		InitialConnectionReceiveWindow: option.InitialConnectionReceiveWindow,
 diff --git a/adapter/outbound/ipstack.go b/adapter/outbound/ipstack.go
 new file mode 100644
 index 00000000..3b10bfd2
