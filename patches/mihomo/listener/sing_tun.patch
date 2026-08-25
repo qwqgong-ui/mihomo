@@ -1,6 +1,7 @@
 # Functions:
 # - Fake-IP ICMP DIRECT race
 # - Physical-network DNS TUN bypass
+# - Direct-nameserver auto ECS
 #
 diff --git a/listener/sing_tun/fakeip_icmp.go b/listener/sing_tun/fakeip_icmp.go
 new file mode 100644
@@ -561,3 +562,22 @@ index 3e5ef591..f8a41f63 100644
  	return common.Close(
  		l.ruleUpdateCallbackCloser,
  		l.tunStack,
+diff --git a/listener/sing_tun/server.go b/listener/sing_tun/server.go
+--- a/listener/sing_tun/server.go
++++ b/listener/sing_tun/server.go
+@@ -15,6 +15,7 @@
+ 
+ 	"github.com/metacubex/mihomo/adapter/inbound"
+ 	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/component/ecs"
+ 	"github.com/metacubex/mihomo/component/iface"
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	C "github.com/metacubex/mihomo/constant"
+@@ -367,6 +368,7 @@
+ 			}
+ 			iface.FlushCache()
+ 			resolver.ResetConnection() // reset resolver's connection after default interface changed
++			ecs.Refresh()              // the direct egress address may have changed with it
+ 		})
+ 		err = defaultInterfaceMonitor.Start()
+ 		if err != nil {

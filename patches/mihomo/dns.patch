@@ -3,6 +3,7 @@
 # - Fake-IP HTTPS/SVCB hint synthesis
 # - Built-in proxied Cloudflare DoH for Fake-IP SVCB/HTTPS queries only
 # - Physical-network DNS dialing
+# - Direct-nameserver auto ECS
 #
 diff --git a/dns/client.go b/dns/client.go
 index 6362fe7e..242bd47a 100644
@@ -1300,3 +1301,216 @@ index 6e5fe56e..993bf35a 100644
  	for {
  		b = make([]byte, l)
  		const flags = windows.GAA_FLAG_INCLUDE_PREFIX | windows.GAA_FLAG_INCLUDE_GATEWAYS
+diff --git a/dns/resolver.go b/dns/resolver.go
+--- a/dns/resolver.go
++++ b/dns/resolver.go
+@@ -508,6 +508,10 @@
+ 	*Resolver
+ 	ProxyResolver  *Resolver
+ 	DirectResolver *Resolver
++	// BootstrapResolver is the `default-nameserver` resolver, which only
++	// talks to plain IP servers and is therefore the one path that resolves
++	// a hostname regardless of how the other lists are configured.
++	BootstrapResolver *Resolver
+ }
+ 
+ func (rs Resolvers) ClearCache() {
+@@ -629,6 +633,7 @@
+ 	}
+ 	r.defaultResolver = defaultResolver
+ 	rs.Resolver = r
++	rs.BootstrapResolver = defaultResolver
+ 
+ 	if len(config.ProxyServer) != 0 {
+ 		rs.ProxyResolver = &Resolver{
+diff --git a/dns/util.go b/dns/util.go
+--- a/dns/util.go
++++ b/dns/util.go
+@@ -11,6 +11,7 @@
+ 
+ 	"github.com/metacubex/mihomo/common/picker"
+ 	"github.com/metacubex/mihomo/component/ech/echparser"
++	"github.com/metacubex/mihomo/component/ecs"
+ 	"github.com/metacubex/mihomo/component/resolver"
+ 	"github.com/metacubex/mihomo/log"
+ 
+@@ -240,13 +241,26 @@
+ 
+ type clientWithEdns0Subnet struct {
+ 	dnsClient
+-	ecsPrefix   netip.Prefix
++	ecsPrefix   netip.Prefix // zero when ecsAuto is set
++	ecsAuto     bool         // take the prefix from the STUN discovered egress address
+ 	ecsOverride bool
+ }
+ 
+ func (c clientWithEdns0Subnet) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
++	ecsPrefix := c.ecsPrefix
++	if c.ecsAuto {
++		// answer an A question with an IPv4 subnet and an AAAA one with an
++		// IPv6 subnet; discovery is asynchronous, so an invalid prefix here
++		// just means it has not succeeded (yet) and the query goes out
++		// without ECS
++		ipv4 := len(m.Question) == 0 || m.Question[0].Qtype != D.TypeAAAA
++		ecsPrefix = ecs.Prefix(ipv4)
++		if !ecsPrefix.IsValid() {
++			return c.dnsClient.ExchangeContext(ctx, m)
++		}
++	}
+ 	m = m.Copy()
+-	setEdns0Subnet(m, c.ecsPrefix, c.ecsOverride)
++	setEdns0Subnet(m, ecsPrefix, c.ecsOverride)
+ 	return c.dnsClient.ExchangeContext(ctx, m)
+ }
+ 
+@@ -263,27 +277,31 @@
+ 
+ func wrapClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient {
+ 	var ecsPrefix netip.Prefix
++	var ecsAuto bool
+ 	var ecsOverride bool
+-	if ecs := params["ecs"]; ecs != "" {
+-		prefix, err := netip.ParsePrefix(ecs)
+-		if err != nil {
+-			addr, err := netip.ParseAddr(ecs)
+-			if err != nil {
+-				log.Warnln("DNS [%s] config with invalid ecs: %s", c.Address(), ecs)
+-			} else {
+-				ecsPrefix = netip.PrefixFrom(addr, addr.BitLen())
+-			}
+-		} else {
++	if value := params["ecs"]; value != "" {
++		if value == "auto" {
++			// the prefix is discovered at runtime, see [ecs.Prefix]
++			ecsAuto = true
++		} else if prefix, err := netip.ParsePrefix(value); err == nil {
+ 			ecsPrefix = prefix
++		} else if addr, err := netip.ParseAddr(value); err == nil {
++			ecsPrefix = netip.PrefixFrom(addr, addr.BitLen())
++		} else {
++			log.Warnln("DNS [%s] config with invalid ecs: %s", c.Address(), value)
+ 		}
+ 	}
+ 
+-	if ecsPrefix.IsValid() {
+-		log.Debugln("DNS [%s] config with ecs: %s", c.Address(), ecsPrefix)
++	if ecsAuto || ecsPrefix.IsValid() {
++		if ecsAuto {
++			log.Debugln("DNS [%s] config with auto ecs", c.Address())
++		} else {
++			log.Debugln("DNS [%s] config with ecs: %s", c.Address(), ecsPrefix)
++		}
+ 		if params["ecs-override"] == "true" {
+ 			ecsOverride = true
+ 		}
+-		return clientWithEdns0Subnet{c, ecsPrefix, ecsOverride}
++		return clientWithEdns0Subnet{c, ecsPrefix, ecsAuto, ecsOverride}
+ 	}
+ 	return c
+ }
+diff --git a/dns/ecs_auto_test.go b/dns/ecs_auto_test.go
+new file mode 100644
+index 00000000..cd809f23
+--- /dev/null
++++ b/dns/ecs_auto_test.go
+@@ -0,0 +1,100 @@
++package dns
++
++import (
++	"context"
++	"net/netip"
++	"testing"
++
++	"github.com/metacubex/mihomo/component/ecs"
++
++	D "github.com/miekg/dns"
++	"github.com/stretchr/testify/assert"
++)
++
++type recordingClient struct {
++	last *D.Msg
++}
++
++func (c *recordingClient) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
++	c.last = m
++	return m, nil
++}
++
++func (c *recordingClient) Address() string { return "test" }
++
++func (c *recordingClient) ResetConnection() {}
++
++func subnetOf(t *testing.T, m *D.Msg) *D.EDNS0_SUBNET {
++	t.Helper()
++	opt := m.IsEdns0()
++	if opt == nil {
++		return nil
++	}
++	for _, option := range opt.Option {
++		if subnet, ok := option.(*D.EDNS0_SUBNET); ok {
++			return subnet
++		}
++	}
++	return nil
++}
++
++func TestClientWithAutoEdns0Subnet(t *testing.T) {
++	raw := &recordingClient{}
++	c := wrapClientWithEdns0Subnet(raw, map[string]string{"ecs": "auto"})
++	assert.IsType(t, clientWithEdns0Subnet{}, c)
++
++	query := new(D.Msg)
++	query.SetQuestion("example.com.", D.TypeA)
++
++	// nothing discovered yet: the query must go out untouched
++	ecs.Setup(false)
++	_, err := c.ExchangeContext(context.Background(), query)
++	assert.NoError(t, err)
++	assert.Nil(t, subnetOf(t, raw.last))
++
++	ecs.SetPrefixForTest(netip.MustParsePrefix("1.2.3.0/24"), netip.MustParsePrefix("2001:db8::/56"))
++	t.Cleanup(func() { ecs.SetPrefixForTest(netip.Prefix{}, netip.Prefix{}) })
++
++	_, err = c.ExchangeContext(context.Background(), query)
++	assert.NoError(t, err)
++	subnet := subnetOf(t, raw.last)
++	if assert.NotNil(t, subnet) {
++		assert.Equal(t, uint16(1), subnet.Family)
++		assert.Equal(t, uint8(24), subnet.SourceNetmask)
++		assert.Equal(t, "1.2.3.0", subnet.Address.String())
++	}
++	// the caller's message is never mutated
++	assert.Nil(t, subnetOf(t, query))
++
++	// an AAAA question gets the IPv6 subnet instead
++	query6 := new(D.Msg)
++	query6.SetQuestion("example.com.", D.TypeAAAA)
++	_, err = c.ExchangeContext(context.Background(), query6)
++	assert.NoError(t, err)
++	subnet = subnetOf(t, raw.last)
++	if assert.NotNil(t, subnet) {
++		assert.Equal(t, uint16(2), subnet.Family)
++		assert.Equal(t, uint8(56), subnet.SourceNetmask)
++		assert.Equal(t, "2001:db8::", subnet.Address.String())
++	}
++}
++
++func TestClientWithStaticEdns0SubnetStillWorks(t *testing.T) {
++	raw := &recordingClient{}
++	c := wrapClientWithEdns0Subnet(raw, map[string]string{"ecs": "5.6.7.8"})
++
++	query := new(D.Msg)
++	query.SetQuestion("example.com.", D.TypeA)
++	_, err := c.ExchangeContext(context.Background(), query)
++	assert.NoError(t, err)
++	subnet := subnetOf(t, raw.last)
++	if assert.NotNil(t, subnet) {
++		assert.Equal(t, uint8(32), subnet.SourceNetmask)
++		assert.Equal(t, "5.6.7.8", subnet.Address.String())
++	}
++}
++
++func TestWrapClientWithInvalidEcsIsPassthrough(t *testing.T) {
++	raw := &recordingClient{}
++	assert.Equal(t, dnsClient(raw), wrapClientWithEdns0Subnet(raw, map[string]string{"ecs": "not-an-ip"}))
++}

@@ -1,6 +1,7 @@
 # Functions:
 # - Preserve configured IPv6 intent across runtime availability changes
 # - Expose shared IPv6-usability detection for hub/executor's runtime monitor
+# - Direct-nameserver auto ECS
 #
 diff --git a/config/config.go b/config/config.go
 index c8c9e1c9..466aebf0 100644
@@ -249,4 +250,87 @@ index 7b413847..5bc36c68 100644
 +		}
 +	}
 +	return true
++}
+diff --git a/config/config.go b/config/config.go
+--- a/config/config.go
++++ b/config/config.go
+@@ -1190,6 +1190,24 @@
+ 	return net.JoinHostPort(hostname, port), nil
+ }
+ 
++// markAutoEdns0Subnet turns on the STUN discovered EDNS Client Subnet for
++// every direct nameserver. Only the direct ones get it: those are the queries
++// leaving through the direct egress, so its public address is the subnet the
++// upstream should optimize for. A nameserver carrying an explicit `ecs=`
++// keeps that value, and no `ecs-override` is added, so a client that sent its
++// own subnet still wins.
++func markAutoEdns0Subnet(nameservers []dns.NameServer) {
++	for _, ns := range nameservers {
++		if ns.Params == nil {
++			continue // parseNameServer always allocates, keep the nil check defensive
++		}
++		if _, exist := ns.Params["ecs"]; exist {
++			continue
++		}
++		ns.Params["ecs"] = "auto"
++	}
++}
++
+ func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.NameServer, error) {
+ 	var nameservers []dns.NameServer
+ 
+@@ -1447,6 +1465,7 @@
+ 		return nil, err
+ 	}
+ 	dnsCfg.DirectFollowPolicy = cfg.DirectNameServerFollowPolicy
++	markAutoEdns0Subnet(dnsCfg.DirectNameServer)
+ 
+ 	if len(cfg.DefaultNameserver) == 0 {
+ 		return nil, errors.New("default nameserver should have at least one nameserver")
+diff --git a/config/ecs_test.go b/config/ecs_test.go
+new file mode 100644
+index 00000000..4d154637
+--- /dev/null
++++ b/config/ecs_test.go
+@@ -0,0 +1,41 @@
++package config
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestMarkAutoEdns0Subnet(t *testing.T) {
++	nameservers, err := parseNameServer([]string{"223.5.5.5", "udp://119.29.29.29#ecs=1.2.3.0/24"}, false, false)
++	assert.NoError(t, err)
++
++	markAutoEdns0Subnet(nameservers)
++
++	// on by default, without adding ecs-override so a client subnet wins
++	assert.Equal(t, "auto", nameservers[0].Params["ecs"])
++	assert.NotContains(t, nameservers[0].Params, "ecs-override")
++	// an explicit ecs= keeps its own value
++	assert.Equal(t, "1.2.3.0/24", nameservers[1].Params["ecs"])
++}
++
++func TestDirectNameServerGetsAutoEdns0Subnet(t *testing.T) {
++	rawCfg, err := UnmarshalRawConfig([]byte(`
++dns:
++  enable: true
++  nameserver:
++    - 114.114.114.114
++  direct-nameserver:
++    - 223.5.5.5
++    - udp://119.29.29.29#ecs=1.2.3.0/24
++`))
++	assert.NoError(t, err)
++
++	dnsCfg, err := parseDNS(rawCfg, nil)
++	assert.NoError(t, err)
++	assert.Len(t, dnsCfg.DirectNameServer, 2)
++	assert.Equal(t, "auto", dnsCfg.DirectNameServer[0].Params["ecs"])
++	assert.Equal(t, "1.2.3.0/24", dnsCfg.DirectNameServer[1].Params["ecs"])
++	// other nameserver lists are untouched
++	assert.NotContains(t, dnsCfg.NameServer[0].Params, "ecs")
 +}

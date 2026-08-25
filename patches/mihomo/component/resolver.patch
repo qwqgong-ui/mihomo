@@ -1,6 +1,7 @@
 # Functions:
 # - DIRECT dual-stack DNS race timing
 # - Race-free runtime IPv6 availability gate
+# - Direct-nameserver auto ECS
 #
 diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
 index e87a9103..c8555c3d 100644
@@ -73,4 +74,19 @@ index e87a9103..c8555c3d 100644
 +	} else if DisableIPv6.Load() {
  		return LookupIPv4WithResolver(ctx, host, r)
  	}
+ 
+diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -25,6 +25,11 @@
+ 	// DirectHostResolver resolve ip for direct outbound host, only nil when DefaultResolver is nil
+ 	DirectHostResolver Resolver
+ 
++	// BootstrapResolver is the `default-nameserver` resolver used to bring
++	// the DNS module up (it resolves the other nameservers' hostnames), only
++	// nil when DefaultResolver is nil
++	BootstrapResolver Resolver
++
+ 	// SystemResolver always using system dns, and was init in dns module
+ 	SystemResolver Resolver
  

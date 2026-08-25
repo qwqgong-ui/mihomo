@@ -11,6 +11,7 @@ listener/mieru.patch
 listener/sudoku.patch
 component/dialer.patch
 component/directrace.patch
+component/ecs.patch
 component/resolver.patch
 dns.patch
 listener/sing_tun.patch
