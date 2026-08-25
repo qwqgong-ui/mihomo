@@ -3,6 +3,7 @@
 # - Race-free runtime IPv6 availability gate
 # - Direct-nameserver auto ECS
 # - Allocation-free IP literal pre-filter
+# - 3s default DNS timeout
 #
 diff --git a/component/resolver/parse_literal_test.go b/component/resolver/parse_literal_test.go
 new file mode 100644
@@ -47,7 +48,7 @@ index 00000000..fdce99fb
 +	}
 +}
 diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
-index e87a9103..53e5203a 100644
+index e87a9103..506f8ba6 100644
 --- a/component/resolver/resolver.go
 +++ b/component/resolver/resolver.go
 @@ -5,8 +5,10 @@ import (
@@ -61,7 +62,7 @@ index e87a9103..53e5203a 100644
  	"github.com/metacubex/mihomo/common/utils"
  	"github.com/metacubex/mihomo/component/trie"
  
-@@ -24,12 +26,21 @@ var (
+@@ -24,18 +26,27 @@ var (
  	// DirectHostResolver resolve ip for direct outbound host, only nil when DefaultResolver is nil
  	DirectHostResolver Resolver
  
@@ -84,6 +85,13 @@ index e87a9103..53e5203a 100644
  
  	// DefaultHosts aim to resolve hosts
  	DefaultHosts = NewHosts(trie.New[HostValue]())
+ 
+ 	// DefaultDNSTimeout defined the default dns request timeout
+-	DefaultDNSTimeout = time.Second * 5
++	DefaultDNSTimeout = time.Second * 3
+ )
+ 
+ var (
 @@ -55,6 +66,50 @@ type Resolver interface {
  	ResetConnection()
  }
