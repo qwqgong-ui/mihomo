@@ -40,3 +40,12 @@ If a patch no longer applies, stop and repair/rebase the patch chain. Do not byp
 Do not restore unrelated upstream architectures unless explicitly requested.
 
 CMFA update automation is intentionally disabled and must not be restored during upstream synchronization.
+
+## CI testing
+
+`go test` runs in the `test` job of `.github/workflows/build.yml`, on the patched
+tree and with the downstream build tags, so that tests carried by `patches/`
+actually execute. Upstream's `.github/workflows/test.yml` tested the unpatched
+tree with upstream build tags; it is intentionally removed and
+`sync-upstream.yml` deletes it again on every upstream synchronization. Do not
+restore it, and do not add a test job that skips the patch chain.

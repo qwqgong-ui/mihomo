@@ -69,12 +69,17 @@ jobs:
           # CMFA integration is intentionally disabled downstream.
           rm -f .github/workflows/trigger-cmfa-update.yml
 
+          # Upstream's test workflow builds the unpatched tree with upstream
+          # build tags; downstream testing lives in build.yml instead.
+          rm -f .github/workflows/test.yml
+
           git add -A patches \
             SKILL.md \
             .github/workflows/build.yml \
             .github/workflows/trigger-androidcyaml-update.yml \
             .github/workflows/sync-upstream.yml \
-            .github/workflows/trigger-cmfa-update.yml
+            .github/workflows/trigger-cmfa-update.yml \
+            .github/workflows/test.yml
 
           git commit -m "chore: sync upstream Alpha ${upstream_sha:0:8}"
           git push --force-with-lease origin HEAD:Alpha

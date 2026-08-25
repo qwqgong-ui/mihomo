@@ -24,6 +24,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: 0
+      GOTOOLCHAIN: local
+      # Skip mihomo inbound interop test
+      SKIP_INTEROP_TEST: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go 1.27
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: "1.27.0"
+
+      - name: Apply complete mihomo patch chain
+        shell: bash
+        run: sh patches/apply-mihomo-patches.sh
+
+      - name: Apply dependency patches
+        shell: bash
+        run: sh patches/apply-dependency-patches.sh "$GITHUB_ENV"
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./... -count=1 \
+            -tags "no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku no_fake_tcp"
+
   build:
     runs-on: ubuntu-latest
     strategy:
