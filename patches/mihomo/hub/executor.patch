@@ -730,3 +730,15 @@ diff --git a/hub/executor/executor.go b/hub/executor/executor.go
  }
  
  func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
+diff --git a/hub/executor/executor.go b/hub/executor/executor.go
+index 001ec942..b00612d6 100644
+--- a/hub/executor/executor.go
++++ b/hub/executor/executor.go
+@@ -555,6 +555,7 @@ func Shutdown() {
+ 	listener.Cleanup()
+ 	tproxy.CleanupTProxyIPTables()
+ 	resolver.StoreFakePoolState()
++	dns.StoreCache()
+ 
+ 	log.Warnln("Mihomo shutting down")
+ }

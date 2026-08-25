@@ -3,6 +3,8 @@ tunnel.patch
 component/process.patch
 adapter/outbound.patch
 constant.patch
+common/arc.patch
+common/lru.patch
 common/convert.patch
 component/generator.patch
 constant/features.patch
@@ -13,6 +15,7 @@ component/dialer.patch
 component/directrace.patch
 component/ecs.patch
 component/resolver.patch
+component/profile.patch
 component/trie.patch
 dns.patch
 listener/sing_tun.patch

@@ -216,3 +216,33 @@ Patches:
 Patches:
 
 - `component/resolver.patch`
+
+## Larger DNS Cache and Softer Optimistic TTL
+
+`newCache` 的默认 `CacheMaxSize` 由 4096 提到 32768（`dns.cache-max-size` 仍可覆盖）。
+乐观缓存命中已过期条目时返给客户端的 TTL 由 1s 提到 3s —— 后台 `continueFetch` 照常刷新，
+但客户端不再几乎立刻重查。代价是 IP 刚变更的域名，每个客户端最多多用 3s 旧地址。
+
+Patches:
+
+- `dns.patch`
+
+## Persisted DNS Answer Cache
+
+DNS 应答缓存写入 `cache.db`（新 `dnscache` bucket），每小时一次加关机时 flush，
+启动时载回。每条显式带过期时间：ARC 读取时不检查 `expires`，不带的话恢复后无法区分新鲜与陈旧；
+带上之后，停机期间过期的条目会以陈旧状态恢复，由既有的乐观缓存路径返回一次并后台刷新。
+
+`arc` 和 `lru` 两种 `cache-algorithm` 都支持，各自加了 `Snapshot()`：ARC 跳过 ghost 条目，
+LRU 按最近最少使用顺序返回以便恢复时重放同样的 recency。两者的 item 类型不同，
+`dns/cachestore.go` 里做归一化。
+
+main / proxy-server / direct 三个 resolver 的缓存共用一个 bucket，键前缀区分，避免碰撞。
+
+Patches:
+
+- `common/arc.patch`
+- `common/lru.patch`
+- `component/profile.patch`
+- `dns.patch`
+- `hub/executor.patch`
