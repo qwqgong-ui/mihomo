@@ -52,6 +52,11 @@ apply_module_patches \
 	"$repo_root/patches/sing-quic" \
 	sing-quic
 
+apply_module_patches \
+	github.com/metacubex/sing-tun \
+	"$repo_root/patches/sing-tun" \
+	sing-tun
+
 if [ "$#" -gt 0 ]; then
 	printf 'GOFLAGS=-modfile=%s\n' "$modfile" >> "$1"
 else

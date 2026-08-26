@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Wed, 26 Aug 2026 17:06:15 +0800
+Subject: [PATCH 1/5] system: fix batched write-back buffer list and tighten
+ loop teardown
+
+batchLoopLinux and batchLoopDarwin's gvisor twin allocated the write-back
+list with make([][]byte, batchSize), so the first batch handed BatchWrite
+128 nil entries ahead of the real packets. handleGRO rejects a nil buffer
+with "invalid offset", which drops the whole first batch of forwarded
+packets. Allocate with zero length and full capacity instead.
+
+Also treat EBADF as a normal shutdown in the darwin batch read loop, and
+lift the per-connection closure in acceptLoop into a method.
+---
+ stack_mixed.go  |  7 +++++--
+ stack_system.go | 26 ++++++++++++++------------
+ 2 files changed, 19 insertions(+), 14 deletions(-)
+
+diff --git a/stack_mixed.go b/stack_mixed.go
+index eed6dfe..aa2c1c6 100644
+--- a/stack_mixed.go
++++ b/stack_mixed.go
+@@ -3,6 +3,9 @@
+ package tun
+ 
+ import (
++	"errors"
++	"syscall"
++
+ 	"github.com/metacubex/gvisor/pkg/buffer"
+ 	gHdr "github.com/metacubex/gvisor/pkg/tcpip/header"
+ 	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
+@@ -114,7 +117,7 @@ func (m *Mixed) wintunLoop(winTun WinTun) {
+ 
+ func (m *Mixed) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
+ 	packetBuffers := make([][]byte, batchSize)
+-	writeBuffers := make([][]byte, batchSize)
++	writeBuffers := make([][]byte, 0, batchSize)
+ 	packetSizes := make([]int, batchSize)
+ 	for i := range packetBuffers {
+ 		packetBuffers[i] = make([]byte, m.mtu+PacketOffset+m.frontHeadroom)
+@@ -156,7 +159,7 @@ func (m *Mixed) batchLoopDarwin(darwinTUN DarwinTUN) {
+ 	for {
+ 		buffers, err := darwinTUN.BatchRead()
+ 		if err != nil {
+-			if E.IsClosed(err) {
++			if E.IsClosed(err) || errors.Is(err, syscall.EBADF) {
+ 				return
+ 			}
+ 			m.logger.Error(E.Cause(err, "batch read packet"))
+diff --git a/stack_system.go b/stack_system.go
+index 7a2244b..2ae943a 100644
+--- a/stack_system.go
++++ b/stack_system.go
+@@ -239,7 +239,7 @@ func (s *System) wintunLoop(winTun WinTun) {
+ 
+ func (s *System) batchLoopLinux(linuxTUN LinuxTUN, batchSize int) {
+ 	packetBuffers := make([][]byte, batchSize)
+-	writeBuffers := make([][]byte, batchSize)
++	writeBuffers := make([][]byte, 0, batchSize)
+ 	packetSizes := make([]int, batchSize)
+ 	for i := range packetBuffers {
+ 		packetBuffers[i] = make([]byte, s.mtu+s.frontHeadroom)
+@@ -281,7 +281,7 @@ func (s *System) batchLoopDarwin(darwinTUN DarwinTUN) {
+ 	for {
+ 		buffers, err := darwinTUN.BatchRead()
+ 		if err != nil {
+-			if E.IsClosed(err) {
++			if E.IsClosed(err) || errors.Is(err, syscall.EBADF) {
+ 				return
+ 			}
+ 			s.logger.Error(E.Cause(err, "batch read packet"))
+@@ -344,17 +344,19 @@ func (s *System) acceptLoop(listener net.Listener) {
+ 			s.logger.Trace(E.New("unknown session with port ", connPort))
+ 			continue
+ 		}
+-		go func() {
+-			_ = s.handler.NewConnection(s.ctx, conn, M.Metadata{
+-				Source:      M.SocksaddrFromNetIP(session.Source),
+-				Destination: M.SocksaddrFromNetIP(session.Destination),
+-			})
+-			if tcpConn, isTCPConn := conn.(*net.TCPConn); isTCPConn {
+-				_ = tcpConn.SetLinger(0)
+-			}
+-			_ = conn.Close()
+-		}()
++		go s.handleConnection(conn, session)
++	}
++}
++
++func (s *System) handleConnection(conn net.Conn, session *TCPSession) {
++	_ = s.handler.NewConnection(s.ctx, conn, M.Metadata{
++		Source:      M.SocksaddrFromNetIP(session.Source),
++		Destination: M.SocksaddrFromNetIP(session.Destination),
++	})
++	if tcpConn, isTCPConn := conn.(*net.TCPConn); isTCPConn {
++		_ = tcpConn.SetLinger(0)
+ 	}
++	_ = conn.Close()
+ }
+ 
+ func (s *System) processIPv4(ipHdr header.IPv4) (writeBack bool, err error) {
