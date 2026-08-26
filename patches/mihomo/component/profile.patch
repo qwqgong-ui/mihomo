@@ -3,10 +3,10 @@
 #
 diff --git a/component/profile/cachefile/dnscache.go b/component/profile/cachefile/dnscache.go
 new file mode 100644
-index 00000000..564a6022
+index 00000000..e9be1f73
 --- /dev/null
 +++ b/component/profile/cachefile/dnscache.go
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,99 @@
 +package cachefile
 +
 +import (
@@ -40,7 +40,9 @@ index 00000000..564a6022
 +		return
 +	}
 +
-+	err := c.DB.Batch(func(t *bbolt.Tx) error {
++	// Update, not Batch: Batch defers the commit to coalesce callers, and the
++	// shutdown path exits before that fires, so the snapshot was silently lost.
++	err := c.DB.Update(func(t *bbolt.Tx) error {
 +		if err := t.DeleteBucket(bucketDNSCache); err != nil && err != bbolt.ErrBucketNotFound {
 +			return err
 +		}

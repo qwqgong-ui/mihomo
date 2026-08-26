@@ -710,7 +710,7 @@ diff --git a/hub/executor/executor.go b/hub/executor/executor.go
  		dns.ReCreateServer("", nil, nil)
  		return
  	}
-@@ -303,9 +306,19 @@
+@@ -303,9 +306,24 @@
  		resolver.DirectHostResolver = r.Resolver
  	}
  
@@ -727,6 +727,11 @@ diff --git a/hub/executor/executor.go b/hub/executor/executor.go
 +	// after the resolvers are in place: STUN server names are resolved
 +	// through the direct resolver
 +	ecs.Setup(len(c.DirectNameServer) > 0)
++
++	// The cache file may only be opened once C.Path points at the -d
++	// directory, so the persisted answers are restored here rather than while
++	// the resolvers are being constructed.
++	dns.LoadPersistentCache()
  }
  
  func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
