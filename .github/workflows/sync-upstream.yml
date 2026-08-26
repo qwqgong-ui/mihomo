@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: sync-upstream-alpha
@@ -15,81 +16,55 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    outputs:
-      mihomo_commit: ${{ steps.publish.outputs.mihomo_commit }}
     steps:
-      - name: Check out Alpha
+      - name: Check out downstream dev
         uses: actions/checkout@v6
         with:
-          ref: Alpha
+          ref: dev
           fetch-depth: 0
 
-      - name: Reset to upstream and restore local files
-        id: publish
+      - name: Mirror upstream Alpha and open review PR
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git remote remove upstream 2>/dev/null || true
           git remote add upstream https://github.com/MetaCubeX/mihomo.git
           git fetch --no-tags upstream Alpha
+          git fetch --no-tags origin Alpha dev
 
           upstream_sha="$(git rev-parse upstream/Alpha)"
+          current_alpha="$(git rev-parse origin/Alpha)"
+
+          if [ "$upstream_sha" != "$current_alpha" ]; then
+            git push \
+              --force-with-lease="refs/heads/Alpha:${current_alpha}" \
+              origin "${upstream_sha}:refs/heads/Alpha"
+          fi
 
           if git merge-base --is-ancestor "$upstream_sha" HEAD; then
-            current_sha="$(git rev-parse HEAD)"
-            echo "Alpha already contains upstream ${upstream_sha:0:8}."
-            echo "mihomo_commit=$current_sha" >> "$GITHUB_OUTPUT"
+            echo "dev already contains upstream Alpha ${upstream_sha:0:8}."
             exit 0
           fi
 
-          backup="$(mktemp -d)"
-          trap 'rm -rf "$backup"' EXIT
+          pr_number="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --base dev \
+            --head Alpha \
+            --json number \
+            --jq '.[0].number // empty')"
 
-          mkdir -p "$backup" "$backup/workflows"
-          cp -a patches "$backup/"
-          cp -a SKILL.md "$backup/"
-          cp -a .github/workflows/build.yml "$backup/workflows/"
-          cp -a .github/workflows/trigger-androidcyaml-update.yml "$backup/workflows/"
-          cp -a .github/workflows/sync-upstream.yml "$backup/workflows/"
+          if [ -n "$pr_number" ]; then
+            echo "Upstream review PR #${pr_number} already tracks Alpha."
+            exit 0
+          fi
 
-          git reset --hard upstream/Alpha
-          git clean -fdx
-
-          mkdir -p patches .github/workflows
-          cp -a "$backup/patches/." patches/
-          cp -a "$backup/SKILL.md" SKILL.md
-          cp -a "$backup/workflows/build.yml" .github/workflows/
-          cp -a "$backup/workflows/trigger-androidcyaml-update.yml" .github/workflows/
-          cp -a "$backup/workflows/sync-upstream.yml" .github/workflows/
-
-          # CMFA integration is intentionally disabled downstream.
-          rm -f .github/workflows/trigger-cmfa-update.yml
-
-          # Upstream's test workflow builds the unpatched tree with upstream
-          # build tags; downstream testing lives in build.yml instead.
-          rm -f .github/workflows/test.yml
-
-          git add -A patches \
-            SKILL.md \
-            .github/workflows/build.yml \
-            .github/workflows/trigger-androidcyaml-update.yml \
-            .github/workflows/sync-upstream.yml \
-            .github/workflows/trigger-cmfa-update.yml \
-            .github/workflows/test.yml
-
-          git commit -m "chore: sync upstream Alpha ${upstream_sha:0:8}"
-          git push --force-with-lease origin HEAD:Alpha
-
-          synced_sha="$(git rev-parse HEAD)"
-          echo "mihomo_commit=$synced_sha" >> "$GITHUB_OUTPUT"
-
-  update-androidcyaml:
-    needs: sync
-    uses: ./.github/workflows/trigger-androidcyaml-update.yml
-    with:
-      mihomo_commit: ${{ needs.sync.outputs.mihomo_commit }}
-    secrets: inherit
+          gh pr create \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base dev \
+            --head Alpha \
+            --title "chore: sync upstream Alpha ${upstream_sha:0:8}" \
+            --body "Automated upstream sync. Review conflicts and CI before merging into dev."

@@ -40,6 +40,6 @@ func (s *Service) ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
 
 var _ resolver.Service = (*Service)(nil)
 
-func NewService(resolver resolver.Resolver, mapper *ResolverEnhancer) *Service {
-	return &Service{handler: newHandler(resolver, mapper)}
+func NewService(resolver resolver.Resolver, serviceResolver resolver.Resolver, mapper *ResolverEnhancer) *Service {
+	return &Service{handler: newHandler(resolver, serviceResolver, mapper)}
 }

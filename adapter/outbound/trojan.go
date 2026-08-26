@@ -299,6 +299,7 @@ func NewTrojan(option TrojanOption) (*Trojan, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:      &option,
 		hexPassword: trojan.Key(option.Password),

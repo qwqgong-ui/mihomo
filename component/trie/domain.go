@@ -137,6 +137,11 @@ func (t *DomainTrie[T]) insert(parts []string, data T) {
 // 2. wildcard domain
 // 2. dot wildcard domain
 func (t *DomainTrie[T]) Search(domain string) *Node[T] {
+	if t.root.hasNoChild() {
+		// Nothing can match, and search() would only ever reach
+		// root.getChild(dotWildcard) == nil anyway.
+		return nil
+	}
 	parts, err := ValidAndSplitDomain(domain)
 	if err != nil || parts[0] == "" {
 		return nil

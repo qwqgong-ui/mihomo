@@ -331,8 +331,8 @@ type PacketSender interface {
 	// AddMapping add a destination NAT record
 	AddMapping(originMetadata *Metadata, metadata *Metadata)
 	// RestoreReadFrom restore destination NAT for ReadFrom
-	// the implement must ensure returned netip.Add is valid (or just return input addr)
-	RestoreReadFrom(addr netip.Addr) netip.Addr
+	// the implement returns an invalid address when a domain response has no mapping
+	RestoreReadFrom(addr net.Addr) netip.Addr
 }
 
 type NatTable interface {

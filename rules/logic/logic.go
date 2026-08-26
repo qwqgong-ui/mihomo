@@ -176,6 +176,44 @@ func (logic *Logic) RuleType() C.RuleType {
 	return logic.ruleType
 }
 
+func (logic *Logic) HasProcessRule() bool {
+	if logic.ruleType == C.SubRules {
+		// Sub-rule graphs may be recursive. Disable filtering for this container
+		// rather than risk excluding a process hidden in a referenced rule set.
+		return true
+	}
+	for _, rule := range logic.rules {
+		if matcher, ok := rule.(interface{ HasProcessRule() bool }); ok && matcher.HasProcessRule() {
+			return true
+		}
+	}
+	return false
+}
+
+func (logic *Logic) MatchProcess(path string) bool {
+	if logic.ruleType == C.SubRules {
+		return true
+	}
+	for _, rule := range logic.rules {
+		if matcher, ok := rule.(interface{ MatchProcess(string) bool }); ok && matcher.MatchProcess(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (logic *Logic) MatchProcessName(name string) bool {
+	if logic.ruleType == C.SubRules {
+		return true
+	}
+	for _, rule := range logic.rules {
+		if matcher, ok := rule.(interface{ MatchProcessName(string) bool }); ok && matcher.MatchProcessName(name) {
+			return true
+		}
+	}
+	return false
+}
+
 func matchSubRules(metadata *C.Metadata, name string, subRules map[string][]C.Rule, helper C.RuleMatchHelper) (bool, string) {
 	for _, rule := range subRules[name] {
 		if m, a := rule.Match(metadata, helper); m {
@@ -183,7 +221,7 @@ func matchSubRules(metadata *C.Metadata, name string, subRules map[string][]C.Ru
 				m, a = matchSubRules(metadata, rule.Adapter(), subRules, helper)
 			}
 			if m && (a == "PASS-RULE" || (helper.CheckPassRule != nil && helper.CheckPassRule(a))) {
-				continue 
+				continue
 			}
 			return m, a
 		}

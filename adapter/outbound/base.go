@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"runtime"
 	"sync"
 	"syscall"
@@ -27,19 +28,20 @@ type ProxyAdapter interface {
 }
 
 type Base struct {
-	name   string
-	addr   string
-	tp     C.AdapterType
-	pdName string
-	udp    bool
-	xudp   bool
-	tfo    bool
-	mpTcp  bool
-	iface  string
-	rmark  int
-	prefer C.DNSPrefer
-	dialer C.Dialer
-	id     uuid.UUID
+	name      string
+	addr      string
+	tp        C.AdapterType
+	pdName    string
+	udp       bool
+	xudp      bool
+	tfo       bool
+	mpTcp     bool
+	iface     string
+	rmark     int
+	prefer    C.DNSPrefer
+	remoteDNS bool
+	dialer    C.Dialer
+	id        uuid.UUID
 }
 
 type BaseOption struct {
@@ -54,22 +56,24 @@ type BaseOption struct {
 	Interface    string
 	RoutingMark  int
 	Prefer       C.DNSPrefer
+	RemoteDNS    bool
 }
 
 func NewBase(opt BaseOption) *Base {
 	return &Base{
-		name:   opt.Name,
-		addr:   opt.Addr,
-		tp:     opt.Type,
-		pdName: opt.ProviderName,
-		udp:    opt.UDP,
-		xudp:   opt.XUDP,
-		tfo:    opt.TFO,
-		mpTcp:  opt.MPTCP,
-		iface:  opt.Interface,
-		rmark:  opt.RoutingMark,
-		prefer: opt.Prefer,
-		id:     utils.NewUUIDV4(),
+		name:      opt.Name,
+		addr:      opt.Addr,
+		tp:        opt.Type,
+		pdName:    opt.ProviderName,
+		udp:       opt.UDP,
+		xudp:      opt.XUDP,
+		tfo:       opt.TFO,
+		mpTcp:     opt.MPTCP,
+		iface:     opt.Interface,
+		rmark:     opt.RoutingMark,
+		prefer:    opt.Prefer,
+		remoteDNS: opt.RemoteDNS,
+		id:        utils.NewUUIDV4(),
 	}
 }
 
@@ -176,6 +180,23 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
 }
 
 func (b *Base) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	if b.remoteDNS && metadata.Host != "" {
+		switch metadata.DNSMode {
+		case C.DNSMapping, C.DNSHosts:
+			if metadata.DstIP.IsValid() {
+				// DNSMapping/DNSHosts differs from DNSFakeIP: DstIP is already
+				// the real selected destination and Host is only auxiliary rule
+				// metadata. Clear Host so the remote proxy receives that IP.
+				// This branch returns below; clearing Host does NOT invoke DNS.
+				metadata.Host = ""
+			}
+		}
+		// DNSFakeIP/explicit-domain traffic keeps Host as the wire destination;
+		// DstIP may be a synthetic TUN return address and must not be forwarded.
+		// An incomplete mapping also stays remote-only. A RemoteDNS adapter must
+		// never fall through to resolver.DefaultResolver while Host is present.
+		return nil
+	}
 	if !metadata.Resolved() {
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, b.prefer, resolver.DefaultResolver)
 		if err != nil {
@@ -340,11 +361,15 @@ func (c *packetConn) AddRef(ref any) {
 }
 
 func NewPacketConn(pc net.PacketConn, a ProxyAdapter) C.PacketConn {
+	return newPacketConn(pc, a, a.ResolveUDP)
+}
+
+func newPacketConn(pc net.PacketConn, a ProxyAdapter, resolveUDP func(context.Context, *C.Metadata) error) C.PacketConn {
 	epc := N.NewEnhancePacketConn(pc)
 	if _, ok := pc.(syscall.Conn); !ok { // exclusion system conn like *net.UDPConn
 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
 	}
-	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), a.ResolveUDP}
+	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), resolveUDP}
 	cpc.AppendToChains(a)
 	return cpc
 }
@@ -357,6 +382,15 @@ type autoCloseProxyAdapter struct {
 	ProxyAdapter
 	closeOnce sync.Once
 	closeErr  error
+}
+
+func (p *autoCloseProxyAdapter) ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error {
+	if controller, ok := p.ProxyAdapter.(interface {
+		ICMPControl(netip.Addr) func(string, string, syscall.RawConn) error
+	}); ok {
+		return controller.ICMPControl(destination)
+	}
+	return dialer.ICMPControl(destination)
 }
 
 func (p *autoCloseProxyAdapter) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {

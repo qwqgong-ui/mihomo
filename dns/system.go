@@ -3,10 +3,12 @@ package dns
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
 
 	D "github.com/miekg/dns"
@@ -20,6 +22,38 @@ const (
 type systemDnsClient struct {
 	disableTimes uint32
 	dnsClient
+}
+
+type systemNameServer struct {
+	address       string
+	interfaceName string
+}
+
+func (s systemNameServer) key() string {
+	return s.interfaceName + "\x00" + s.address
+}
+
+func defaultPhysicalInterface() string {
+	if finder := dialer.SystemDNSInterfaceFinder.Load(); finder != nil {
+		for _, destination := range [...]string{"1.1.1.1", "2606:4700:4700::1111"} {
+			if interfaceName := finder.FindInterfaceName(netip.MustParseAddr(destination)); interfaceName != "" {
+				return interfaceName
+			}
+		}
+	}
+	if interfaceName := dialer.DefaultInterface.Load(); interfaceName != "" {
+		return interfaceName
+	}
+	if finder := dialer.DefaultInterfaceFinder.Load(); finder != nil {
+		// Use stable public destinations only to ask the route/interface monitor;
+		// no packet is sent to either address.
+		for _, destination := range [...]string{"1.1.1.1", "2606:4700:4700::1111"} {
+			if interfaceName := finder.FindInterfaceName(netip.MustParseAddr(destination)); interfaceName != "" {
+				return interfaceName
+			}
+		}
+	}
+	return ""
 }
 
 type systemClient struct {

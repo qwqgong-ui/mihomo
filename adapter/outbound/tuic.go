@@ -96,7 +96,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 
 		// tuic uos use stream-oriented udp with a special address, so we need a net.UDPAddr
 
-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
+		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
 		if t.option.UDPOverStreamVersion == uot.LegacyVersion {
 			return NewPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
 		} else {
@@ -249,6 +249,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:     &option,
 		quicConfig: quicConfig,

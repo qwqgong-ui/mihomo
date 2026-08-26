@@ -21,6 +21,14 @@ func (n *Node[T]) getChild(s string) *Node[T] {
 	return n.childMap[s]
 }
 
+// hasNoChild reports whether the node has no children at all, which lets a
+// lookup skip splitting the domain when the whole trie is empty (the common
+// case for hosts: with no user entries every DNS lookup would otherwise pay a
+// lower-case + split allocation).
+func (n *Node[T]) hasNoChild() bool {
+	return n == nil || (n.childMap == nil && n.childNode == nil)
+}
+
 func (n *Node[T]) hasChild(s string) bool {
 	return n.getChild(s) != nil
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/component/auth"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/ecs"
 	"github.com/metacubex/mihomo/component/geodata"
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/iface"
@@ -84,6 +85,7 @@ func ParseWithBytes(buf []byte) (*config.Config, error) {
 func ApplyConfig(cfg *config.Config, force bool) {
 	mux.Lock()
 	defer mux.Unlock()
+	prepareRuntimeIPv6(cfg)
 	log.SetLevel(cfg.General.LogLevel)
 
 	tunnel.OnSuspend()
@@ -102,7 +104,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
-	updateDNS(cfg.DNS, cfg.General.IPv6)
+	updateDNS(cfg.DNS, cfg.General.IPv6Active)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
 	updateListeners(cfg.General, cfg.Listeners, force)
 	updateTun(cfg.General) // tun should not care "force"
@@ -120,6 +122,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateUpdater(cfg)
 
 	resolver.ResetConnection()
+	startRuntimeIPv6MonitorLocked()
 }
 
 func initInnerTcp() {
@@ -140,7 +143,7 @@ func GetGeneral() *config.General {
 			RedirPort:         ports.RedirPort,
 			TProxyPort:        ports.TProxyPort,
 			MixedPort:         ports.MixedPort,
-			Tun:               listener.GetTunConf(),
+			Tun:               ConfiguredTun(),
 			TuicServer:        listener.GetTuicConf(),
 			ShadowSocksConfig: ports.ShadowSocksConfig,
 			VmessConfig:       ports.VmessConfig,
@@ -156,7 +159,8 @@ func GetGeneral() *config.General {
 		Mode:         tunnel.Mode(),
 		UnifiedDelay: adapter.UnifiedDelay.Load(),
 		LogLevel:     log.Level(),
-		IPv6:         !resolver.DisableIPv6,
+		IPv6:         configuredIPv6.Load(),
+		IPv6Active:   !resolver.DisableIPv6.Load(),
 		Interface:    dialer.DefaultInterface.Load(),
 		RoutingMark:  int(dialer.DefaultRoutingMark.Load()),
 		GeoXUrl: config.GeoXUrl{
@@ -208,16 +212,14 @@ func updateListeners(general *config.General, listeners map[string]C.InboundList
 }
 
 func updateTun(general *config.General) {
-	listener.ReCreateTun(general.Tun, tunnel.Tunnel)
+	applyTunIPv6Availability(general.Tun, general.IPv6Active)
 }
 
 func updateExperimental(c *config.Experimental) {
 	if c.QUICGoDisableGSO {
 		_ = os.Setenv("QUIC_GO_DISABLE_GSO", strconv.FormatBool(true))
 	}
-	if c.QUICGoDisableECN {
-		_ = os.Setenv("QUIC_GO_DISABLE_ECN", strconv.FormatBool(true))
-	}
+	_ = os.Setenv("QUIC_GO_DISABLE_ECN", strconv.FormatBool(c.QUICGoDisableECN))
 	resolver.SetIP4PEnable(c.IP4PEnable)
 }
 
@@ -237,11 +239,13 @@ func updateNTP(c *config.NTP) {
 
 func updateDNS(c *config.DNS, generalIPv6 bool) {
 	if !c.Enable {
+		ecs.Setup(false)
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
 		resolver.DefaultService = nil
 		resolver.ProxyServerHostResolver = nil
 		resolver.DirectHostResolver = nil
+		resolver.BootstrapResolver = nil
 		dns.ReCreateServer("", nil, nil)
 		return
 	}
@@ -279,7 +283,11 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		m.PatchFrom(old.(*dns.ResolverEnhancer))
 	}
 
-	s := dns.NewService(r, m)
+	var serviceResolver resolver.Resolver
+	if m.FakeIPEnabled() {
+		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, c.CacheAlgorithm, c.CacheMaxSize)
+	}
+	s := dns.NewService(r, serviceResolver, m)
 
 	resolver.DefaultResolver = r
 	resolver.DefaultHostMapper = m
@@ -298,9 +306,24 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.DirectHostResolver = r.Resolver
 	}
 
+	if r.BootstrapResolver.Invalid() {
+		resolver.BootstrapResolver = r.BootstrapResolver
+	} else {
+		resolver.BootstrapResolver = r.Resolver
+	}
+
 	lc := inbound.NewListenConfig()
 	lc.SetRouteMark(c.ListenRoutingMark)
 	dns.ReCreateServer(c.Listen, lc, s)
+
+	// after the resolvers are in place: STUN server names are resolved
+	// through the direct resolver
+	ecs.Setup(len(c.DirectNameServer) > 0)
+
+	// The cache file may only be opened once C.Path points at the -d
+	// directory, so the persisted answers are restored here rather than while
+	// the resolvers are being constructed.
+	dns.LoadPersistentCache()
 }
 
 func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
@@ -393,7 +416,7 @@ func temporaryUpdateGeneral(general *config.General) func() {
 func updateGeneral(general *config.General, logging bool) {
 	tunnel.SetMode(general.Mode)
 	tunnel.SetFindProcessMode(general.FindProcessMode)
-	resolver.DisableIPv6 = !general.IPv6
+	resolver.DisableIPv6.Store(!general.IPv6Active)
 
 	dialer.SetTcpConcurrent(general.TCPConcurrent)
 	if logging && general.TCPConcurrent {
@@ -530,9 +553,14 @@ func updateIPTables(cfg *config.Config) {
 }
 
 func Shutdown() {
+	mux.Lock()
+	stopRuntimeIPv6MonitorLocked()
+	mux.Unlock()
+
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()
+	dns.StoreCache()
 
 	log.Warnln("Mihomo shutting down")
 }

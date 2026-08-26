@@ -18,20 +18,36 @@ import (
 const DnsRespectRules = "RULES"
 
 type DNSDialer struct {
-	r            resolver.Resolver
-	proxyAdapter C.ProxyAdapter
-	proxyName    string
+	r             resolver.Resolver
+	proxyAdapter  C.ProxyAdapter
+	proxyName     string
+	interfaceName string
+	systemDNS     bool
 }
 
 func NewDNSDialer(r resolver.Resolver, proxyAdapter C.ProxyAdapter, proxyName string) *DNSDialer {
 	return &DNSDialer{r: r, proxyAdapter: proxyAdapter, proxyName: proxyName}
 }
 
+// NewSystemDNSDialer creates a direct DNS dialer pinned to the physical
+// interface that supplied the system name server. It explicitly applies
+// sing-tun's active auto-redirect output bypass mark on Linux. On Windows,
+// WithInterface becomes IP_UNICAST_IF/IPV6_UNICAST_IF.
+func NewSystemDNSDialer(r resolver.Resolver, interfaceName string) *DNSDialer {
+	return &DNSDialer{r: r, interfaceName: interfaceName, systemDNS: true}
+}
+
 func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	r := d.r
 	proxyName := d.proxyName
 	proxyAdapter := d.proxyAdapter
-	var opts []dialer.Option
+	opts := []dialer.Option{dialer.WithPreferIPv6()}
+	if d.interfaceName != "" {
+		opts = append(opts, dialer.WithInterface(d.interfaceName))
+	}
+	if d.systemDNS {
+		opts = append(opts, dialer.WithRoutingMark(int(dialer.SystemDNSRoutingMark.Load())))
+	}
 	var rule C.Rule
 	metadata := &C.Metadata{
 		NetWork: C.TCP,
@@ -43,14 +59,6 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 	}
 	if !strings.Contains(network, "tcp") {
 		metadata.NetWork = C.UDP
-		if !metadata.Resolved() {
-			// udp must resolve host first
-			dstIP, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, r)
-			if err != nil {
-				return nil, err
-			}
-			metadata.DstIP = dstIP
-		}
 	}
 
 	if proxyAdapter == nil && len(proxyName) != 0 {
@@ -100,14 +108,23 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 			logMetadataErr(metadata, rule, proxyAdapter, err)
 			return nil, err
 		}
-		logMetadata(metadata, rule, conn)
+		logMetadata(metadata, rule, conn.Chains())
 
 		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
 		return conn, nil
 	} else {
 		if proxyAdapter == nil {
-			return dialer.DialContext(ctx, network, metadata.AddrPort().String(), opts...)
+			opts = append(opts, dialer.WithResolver(r))
+			return dialer.DialContext(ctx, network, addr, opts...)
+		}
+
+		if !metadata.Resolved() {
+			dstIP, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, r)
+			if err != nil {
+				return nil, err
+			}
+			metadata.DstIP = dstIP
 		}
 
 		if !proxyAdapter.SupportUDP() {
@@ -119,7 +136,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 			logMetadataErr(metadata, rule, proxyAdapter, err)
 			return nil, err
 		}
-		logMetadata(metadata, rule, packetConn)
+		logMetadata(metadata, rule, packetConn.Chains())
 
 		packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
@@ -133,6 +150,12 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 	proxyAdapter := d.proxyAdapter
 	proxyName := d.proxyName
 	var opts []dialer.Option
+	if d.interfaceName != "" {
+		opts = append(opts, dialer.WithInterface(d.interfaceName))
+	}
+	if d.systemDNS {
+		opts = append(opts, dialer.WithRoutingMark(int(dialer.SystemDNSRoutingMark.Load())))
+	}
 	metadata := &C.Metadata{
 		NetWork: C.UDP,
 		Type:    C.INNER,
@@ -181,7 +204,7 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 		logMetadataErr(metadata, rule, proxyAdapter, err)
 		return nil, err
 	}
-	logMetadata(metadata, rule, packetConn)
+	logMetadata(metadata, rule, packetConn.Chains())
 
 	packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 

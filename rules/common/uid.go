@@ -54,6 +54,14 @@ func (u *Uid) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, strin
 	return false, ""
 }
 
+// UID rules still require socket ownership lookup, but they cannot narrow the
+// executable candidates. Match every path to preserve existing behavior.
+func (u *Uid) HasProcessRule() bool { return true }
+
+func (u *Uid) MatchProcess(string) bool { return true }
+
+func (u *Uid) MatchProcessName(string) bool { return true }
+
 func (u *Uid) Adapter() string {
 	return u.adapter
 }

@@ -272,6 +272,7 @@ func NewSnell(option SnellOption) (*Snell, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:          &option,
 		psk:             psk,

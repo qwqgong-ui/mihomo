@@ -5,9 +5,17 @@ import (
 
 	"github.com/metacubex/mihomo/adapter"
 	. "github.com/metacubex/mihomo/common/convert"
+	"github.com/metacubex/mihomo/constant/features"
 
 	"github.com/stretchr/testify/assert"
 )
+
+func requireMieru(t *testing.T) {
+	t.Helper()
+	if features.NoMieru {
+		t.Skip("mieru support is disabled by the no_mieru build tag")
+	}
+}
 
 // https://v2.hysteria.network/zh/docs/developers/URI-Scheme/
 func TestConvertsV2Ray_normal(t *testing.T) {
@@ -72,6 +80,8 @@ func TestConvertsV2Ray_hysteria2RealmScheme(t *testing.T) {
 }
 
 func TestConvertsV2RayMieru(t *testing.T) {
+	requireMieru(t)
+
 	mierusTest := "mierus://user:pass@1.2.3.4?handshake-mode=HANDSHAKE_NO_WAIT&mtu=1400&multiplexing=MULTIPLEXING_HIGH&port=6666&port=9998-9999&port=6489&port=4896&profile=default&protocol=TCP&protocol=TCP&protocol=UDP&protocol=UDP&traffic-pattern=CCoQARoECAEQCiIYCAMQASoIMDAwMTAyMDMqCDA0MDUwNjA3"
 
 	expected := []map[string]any{
@@ -139,6 +149,8 @@ func TestConvertsV2RayMieru(t *testing.T) {
 }
 
 func TestConvertsV2RayMieruMinimal(t *testing.T) {
+	requireMieru(t)
+
 	mierusTest := "mierus://user:pass@example.com?port=443&protocol=TCP&profile=simple"
 
 	expected := []map[string]any{
@@ -164,6 +176,8 @@ func TestConvertsV2RayMieruMinimal(t *testing.T) {
 }
 
 func TestConvertsV2RayMieruFragment(t *testing.T) {
+	requireMieru(t)
+
 	mierusTest := "mierus://user:pass@example.com?port=443&protocol=TCP&profile=default#myproxy"
 
 	proxies, err := ConvertsV2Ray([]byte(mierusTest))

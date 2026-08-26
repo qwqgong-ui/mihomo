@@ -15,6 +15,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/ecs"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -54,8 +55,10 @@ type Listener struct {
 	packageManager          tun.PackageManager
 	autoRedirect            tun.AutoRedirect
 	autoRedirectOutputMark  int32
+	systemDNSOutputMark     int32
 
-	cDialerInterfaceFinder dialer.InterfaceFinder
+	cDialerInterfaceFinder   dialer.InterfaceFinder
+	systemDNSInterfaceFinder dialer.InterfaceFinder
 
 	ruleUpdateCallbackCloser io.Closer
 	ruleUpdateMutex          sync.Mutex
@@ -365,18 +368,24 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			}
 			iface.FlushCache()
 			resolver.ResetConnection() // reset resolver's connection after default interface changed
+			ecs.Refresh()              // the direct egress address may have changed with it
 		})
 		err = defaultInterfaceMonitor.Start()
 		if err != nil {
 			err = E.Cause(err, "start DefaultInterfaceMonitor")
 			return
 		}
+		l.systemDNSInterfaceFinder = &cDialerInterfaceFinder{
+			tunName:                 tunName,
+			defaultInterfaceMonitor: defaultInterfaceMonitor,
+		}
+		if !dialer.SystemDNSInterfaceFinder.CompareAndSwap(nil, l.systemDNSInterfaceFinder) {
+			err = E.New("not allowed two tun listeners providing the system DNS interface")
+			return
+		}
 
 		if options.AutoDetectInterface {
-			l.cDialerInterfaceFinder = &cDialerInterfaceFinder{
-				tunName:                 tunName,
-				defaultInterfaceMonitor: defaultInterfaceMonitor,
-			}
+			l.cDialerInterfaceFinder = l.systemDNSInterfaceFinder
 			if !dialer.DefaultInterfaceFinder.CompareAndSwap(nil, l.cDialerInterfaceFinder) {
 				err = E.New("not allowed two tun listener using auto-detect-interface")
 				return
@@ -523,6 +532,11 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			err = E.Cause(err, "auto redirect")
 			return
 		}
+		l.systemDNSOutputMark = int32(outputMark)
+		if !dialer.SystemDNSRoutingMark.CompareAndSwap(0, l.systemDNSOutputMark) && dialer.SystemDNSRoutingMark.Load() != l.systemDNSOutputMark {
+			err = E.New("not allowed using different system DNS bypass marks across tun listeners")
+			return
+		}
 		if tunOptions.AutoRedirectMarkMode {
 			l.autoRedirectOutputMark = int32(outputMark)
 			if !dialer.DefaultRoutingMark.CompareAndSwap(0, l.autoRedirectOutputMark) {
@@ -594,6 +608,12 @@ func (l *Listener) updateRule(ruleProvider P.RuleProvider, exclude bool, update 
 }
 
 func (l *Listener) OnReload() {
+	if l.systemDNSInterfaceFinder != nil {
+		dialer.SystemDNSInterfaceFinder.CompareAndSwap(nil, l.systemDNSInterfaceFinder)
+	}
+	if l.systemDNSOutputMark != 0 {
+		dialer.SystemDNSRoutingMark.CompareAndSwap(0, l.systemDNSOutputMark)
+	}
 	if l.autoRedirectOutputMark != 0 {
 		dialer.DefaultRoutingMark.CompareAndSwap(0, l.autoRedirectOutputMark)
 	}
@@ -668,11 +688,17 @@ func parseRange[T constraints.Integer](uidRanges []ranges.Range[T], rangeList []
 func (l *Listener) Close() error {
 	l.closed = true
 	resolver.RemoveSystemDnsBlacklist(l.dnsServerIp...)
+	if l.systemDNSOutputMark != 0 {
+		dialer.SystemDNSRoutingMark.CompareAndSwap(l.systemDNSOutputMark, 0)
+	}
 	if l.autoRedirectOutputMark != 0 {
 		dialer.DefaultRoutingMark.CompareAndSwap(l.autoRedirectOutputMark, 0)
 	}
 	if l.cDialerInterfaceFinder != nil {
 		dialer.DefaultInterfaceFinder.CompareAndSwap(l.cDialerInterfaceFinder, nil)
+	}
+	if l.systemDNSInterfaceFinder != nil {
+		dialer.SystemDNSInterfaceFinder.CompareAndSwap(l.systemDNSInterfaceFinder, nil)
 	}
 	return common.Close(
 		l.ruleUpdateCallbackCloser,

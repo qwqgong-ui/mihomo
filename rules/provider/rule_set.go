@@ -35,6 +35,33 @@ func (rs *RuleSet) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, 
 	return false, ""
 }
 
+func (rs *RuleSet) HasProcessRule() bool {
+	provider, ok := rs.getProvider()
+	if !ok {
+		return false
+	}
+	matcher, ok := provider.Strategy().(interface{ HasProcessRule() bool })
+	return ok && matcher.HasProcessRule()
+}
+
+func (rs *RuleSet) MatchProcess(path string) bool {
+	provider, ok := rs.getProvider()
+	if !ok {
+		return false
+	}
+	matcher, ok := provider.Strategy().(interface{ MatchProcess(string) bool })
+	return ok && matcher.MatchProcess(path)
+}
+
+func (rs *RuleSet) MatchProcessName(name string) bool {
+	provider, ok := rs.getProvider()
+	if !ok {
+		return false
+	}
+	matcher, ok := provider.Strategy().(interface{ MatchProcessName(string) bool })
+	return ok && matcher.MatchProcessName(name)
+}
+
 // MatchDomain implements C.DomainMatcher
 func (rs *RuleSet) MatchDomain(domain string) bool {
 	ok, _ := rs.Match(&C.Metadata{Host: domain}, C.RuleMatchHelper{})

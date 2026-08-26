@@ -285,6 +285,12 @@ func (v *Vless) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 				Host:    packetaddr.SeqPacketMagicAddress,
 				DstPort: 443,
 			}
+		} else if v.option.XUDP && metadata.Host != "" {
+			metadata = &C.Metadata{
+				NetWork: C.UDP,
+				Host:    metadata.Host,
+				DstPort: metadata.DstPort,
+			}
 		} else {
 			metadata = &C.Metadata{ // a clear metadata only contains ip
 				NetWork: C.UDP,
@@ -391,7 +397,7 @@ func (v *Vless) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 		return NewPacketConn(N.NewThreadSafePacketConn(
 			vmessSing.NewXUDPConn(c,
 				globalID,
-				M.SocksaddrFromNet(metadata.UDPAddr())),
+				M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)),
 		), v), nil
 	} else if v.option.PacketAddr {
 		return NewPacketConn(N.NewThreadSafePacketConn(
@@ -501,6 +507,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    option.XUDP,
 		}),
 		client: client,
 		option: &option,

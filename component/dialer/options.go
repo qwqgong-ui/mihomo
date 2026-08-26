@@ -12,8 +12,14 @@ import (
 var (
 	DefaultInterface   = atomic.NewTypedValue[string]("")
 	DefaultRoutingMark = atomic.NewInt32(0)
+	// SystemDNSRoutingMark is the active sing-tun auto-redirect output mark.
+	// It is intentionally separate from DefaultRoutingMark: ordinary direct
+	// sockets only need the global mark in mark mode, while system DNS sockets
+	// must always be identifiable as TUN-bypass traffic.
+	SystemDNSRoutingMark = atomic.NewInt32(0)
 
-	DefaultInterfaceFinder = atomic.NewTypedValue[InterfaceFinder](nil)
+	DefaultInterfaceFinder   = atomic.NewTypedValue[InterfaceFinder](nil)
+	SystemDNSInterfaceFinder = atomic.NewTypedValue[InterfaceFinder](nil)
 )
 
 type InterfaceFinder interface {
@@ -37,6 +43,8 @@ type option struct {
 	routingMark   int
 	network       int
 	prefer        int
+	directRace    bool
+	directAdapter string
 	tfo           bool
 	mpTcp         bool
 	resolver      resolver.Resolver
@@ -84,6 +92,23 @@ func WithPreferIPv4() Option {
 func WithPreferIPv6() Option {
 	return func(opt *option) {
 		opt.prefer = 6
+	}
+}
+
+// WithDirectDualStack enables the asynchronous A/AAAA and TCP connection race
+// used by the DIRECT outbound. It is intentionally separate from the generic
+// dual-stack dialer so DNS upstream hostnames keep their existing behavior.
+func WithDirectDualStack() Option {
+	return func(opt *option) {
+		opt.directRace = true
+	}
+}
+
+// WithDirectRacePreference identifies the DIRECT adapter whose recent ICMP
+// winner may be scheduled first after it is validated against the DNS RRset.
+func WithDirectRacePreference(adapter string) Option {
+	return func(opt *option) {
+		opt.directAdapter = adapter
 	}
 }
 

@@ -167,6 +167,7 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:     &option,
 		quicConfig: quicConfig,

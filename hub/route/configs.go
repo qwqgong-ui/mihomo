@@ -7,7 +7,6 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/process"
-	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
@@ -364,7 +363,11 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 	listener.ReCreateRedir(pointerOrDefault(general.RedirPort, ports.RedirPort), tunnel.Tunnel)
 	listener.ReCreateTProxy(pointerOrDefault(general.TProxyPort, ports.TProxyPort), tunnel.Tunnel)
 	listener.ReCreateMixed(pointerOrDefault(general.MixedPort, ports.MixedPort), tunnel.Tunnel)
-	listener.ReCreateTun(pointerOrDefaultTun(general.Tun, listener.LastTunConf), tunnel.Tunnel)
+	if general.IPv6 != nil {
+		executor.SetIPv6Enabled(*general.IPv6)
+	}
+	tunConfig := pointerOrDefaultTun(general.Tun, executor.ConfiguredTun())
+	executor.UpdateTun(&tunConfig)
 	listener.ReCreateShadowSocks(pointerOrDefault(general.ShadowSocksConfig, ports.ShadowSocksConfig), tunnel.Tunnel)
 	listener.ReCreateVmess(pointerOrDefault(general.VmessConfig, ports.VmessConfig), tunnel.Tunnel)
 	listener.ReCreateTuic(pointerOrDefaultTuicServer(general.TuicServer, listener.LastTuicConf), tunnel.Tunnel)
@@ -379,10 +382,6 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 
 	if general.LogLevel != nil {
 		log.SetLevel(*general.LogLevel)
-	}
-
-	if general.IPv6 != nil {
-		resolver.DisableIPv6 = !*general.IPv6
 	}
 
 	render.NoContent(w, r)

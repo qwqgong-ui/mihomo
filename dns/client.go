@@ -101,3 +101,13 @@ func newClient(addr string, resolver resolver.Resolver, netType string, params m
 	}
 	return c
 }
+
+func newSystemDNSClient(addr, interfaceName string) *client {
+	host, port, _ := net.SplitHostPort(addr)
+	return &client{
+		port:   port,
+		host:   host,
+		dialer: newSystemDNSDialer(nil, interfaceName),
+		schema: "udp",
+	}
+}

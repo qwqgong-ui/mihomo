@@ -50,6 +50,13 @@ type Resolver struct {
 	defaultResolver       *Resolver
 }
 
+func (r *Resolver) IPv6Timeout() time.Duration {
+	if r == nil {
+		return 0
+	}
+	return r.ipv6Timeout
+}
+
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
 	ch := make(chan []netip.Addr, 1)
 	go func() {
@@ -171,7 +178,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
 		now := time.Now()
 		if expireTime.Before(now) {
-			setMsgTTL(msg, uint32(1)) // Continue fetch
+			setMsgTTL(msg, uint32(3)) // Continue fetch
 			continueFetch = true
 		} else {
 			// updating TTL by subtracting common delta time from each DNS record
@@ -487,7 +494,7 @@ type Config struct {
 
 func (config Config) newCache() dnsCache {
 	if config.CacheMaxSize == 0 {
-		config.CacheMaxSize = 4096
+		config.CacheMaxSize = 32768
 	}
 	switch config.CacheAlgorithm {
 	case "arc":
@@ -501,6 +508,10 @@ type Resolvers struct {
 	*Resolver
 	ProxyResolver  *Resolver
 	DirectResolver *Resolver
+	// BootstrapResolver is the `default-nameserver` resolver, which only
+	// talks to plain IP servers and is therefore the one path that resolves
+	// a hostname regardless of how the other lists are configured.
+	BootstrapResolver *Resolver
 }
 
 func (rs Resolvers) ClearCache() {
@@ -521,6 +532,25 @@ func NewResolverFromClient(client dnsClient) *Resolver {
 		main:  []dnsClient{client},
 		cache: Config{}.newCache(),
 	}
+}
+
+// NewFakeIPServiceResolver returns the built-in resolver used only for
+// SVCB/HTTPS queries that are synthesized by fake-IP mode. Address queries
+// never reach this resolver. The DoH transport follows routing rules so the
+// query to 1.1.1.1 is carried by the selected proxy instead of local UDP DNS.
+func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string, cacheMaxSize int) *Resolver {
+	return NewResolver(Config{
+		Main: []NameServer{{
+			Net:       "https",
+			Addr:      "https://1.1.1.1:443/dns-query",
+			ProxyName: RespectRules,
+			Params:    map[string]string{},
+		}},
+		Default:        defaultServers,
+		IPv6:           true,
+		CacheAlgorithm: cacheAlgorithm,
+		CacheMaxSize:   cacheMaxSize,
+	}).Resolver
 }
 
 func NewResolver(config Config) (rs Resolvers) {
@@ -603,6 +633,8 @@ func NewResolver(config Config) (rs Resolvers) {
 	}
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
+	registerPersistentCache("main", r.cache)
+	rs.BootstrapResolver = defaultResolver
 
 	if len(config.ProxyServer) != 0 {
 		rs.ProxyResolver = &Resolver{
@@ -612,6 +644,7 @@ func NewResolver(config Config) (rs Resolvers) {
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
 		}
+		registerPersistentCache("proxy-server", rs.ProxyResolver.cache)
 	}
 
 	if len(config.DirectServer) != 0 {
@@ -621,6 +654,7 @@ func NewResolver(config Config) (rs Resolvers) {
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		}
+		registerPersistentCache("direct", rs.DirectResolver.cache)
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy
 		}

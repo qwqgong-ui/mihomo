@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/metacubex/mihomo/component/ech"
-	"github.com/metacubex/mihomo/transport/sudoku"
 	"github.com/metacubex/mihomo/transport/vless/encryption"
 
 	"github.com/gofrs/uuid/v5"
@@ -81,7 +80,7 @@ func Main(args []string) {
 		fmt.Printf("[Server] decryption: \"mlkem768x25519plus.native.600s.%s\"\n", privateKeyBase64)
 		fmt.Printf("[Client] encryption: \"mlkem768x25519plus.native.0rtt.%s\"\n", passwordBase64)
 	case "sudoku-keypair":
-		privateKey, publicKey, err := sudoku.GenKeyPair()
+		privateKey, publicKey, err := genSudokuKeyPair()
 		if err != nil {
 			panic(err)
 		}

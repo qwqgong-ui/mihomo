@@ -70,7 +70,7 @@ func (t *AnyTLS) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 	}
 
 	// create uot on tcp
-	destination := M.SocksaddrFromNet(metadata.UDPAddr())
+	destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
 	return NewPacketConn(N.NewThreadSafePacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination})), t), nil
 }
 
@@ -105,6 +105,7 @@ func NewAnyTLS(option AnyTLSOption) (*AnyTLS, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option: &option,
 	}

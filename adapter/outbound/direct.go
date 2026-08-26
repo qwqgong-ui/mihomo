@@ -3,12 +3,18 @@ package outbound
 import (
 	"context"
 	"fmt"
+	"net/netip"
+	"syscall"
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/loopback"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 )
+
+func (d *Direct) ICMPControl(destination netip.Addr) func(string, string, syscall.RawConn) error {
+	return dialer.ICMPControlWithOptions(destination, d.DialOptions()...)
+}
 
 type Direct struct {
 	*Base
@@ -26,7 +32,7 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 		return nil, err
 	}
 	opts := d.DialOptions()
-	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver))
+	opts = append(opts, dialer.WithResolver(resolver.DirectHostResolver), dialer.WithDirectDualStack(), dialer.WithDirectRacePreference(d.Name()))
 	c, err := dialer.DialContext(ctx, "tcp", metadata.RemoteAddress(), opts...)
 	if err != nil {
 		return nil, err
@@ -38,6 +44,9 @@ func (d *Direct) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn,
 func (d *Direct) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
 	if err := d.loopBack.CheckPacketConn(metadata); err != nil {
 		return nil, err
+	}
+	if metadata.Host != "" && d.prefer != C.IPv4Only && d.prefer != C.IPv6Only {
+		return d.listenPacketRaceContext(ctx, metadata)
 	}
 	if err := d.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err

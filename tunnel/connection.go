@@ -5,23 +5,49 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+	M "github.com/metacubex/sing/common/metadata"
 )
+
+type remoteDomainTarget struct {
+	// origin is the local synthetic address (normally FakeIP) that the TUN
+	// application used. ports maps every remote port requested for this FQDN to
+	// the sequence number of the most recent request, so an IP-only reply can be
+	// attributed to the domain that asked for that port last.
+	origin netip.Addr
+	ports  map[uint16]uint64
+}
+
+// maxLearnedTargets bounds the IP-learning table. A single association can fan
+// out to many trackers or DHT nodes; the cap keeps that bounded without
+// reintroducing the old "learn exactly one IP" restriction.
+const maxLearnedTargets = 512
 
 type packetSender struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	ch     chan C.PacketAdapter
 
-	// destination NAT mapping
-	originToTarget map[string]netip.Addr
-	targetToOrigin map[netip.Addr]netip.Addr
-	mappingMutex   sync.RWMutex
+	// UDP destination-identity mapping.
+	//
+	// Proxy UDP address fields are a tagged union: either FQDN or IP, never both.
+	// XUDP-capable servers can return the requested FQDN, while a standard
+	// Hysteria2 server normally resolves it and returns only the real IP. Keep
+	// the exact maps separate from the conservative HY2 IP-learning fallback so
+	// future protocol debugging does not accidentally turn ambiguity into a
+	// wrong TUN source address.
+	originToTarget        map[string]M.Socksaddr
+	targetToOrigin        map[netip.Addr]netip.Addr // exact locally-resolved IP -> origin
+	remoteDomains         map[string]*remoteDomainTarget
+	learnedTargetToOrigin map[netip.Addr]netip.Addr // HY2 real IP -> attributed origin
+	sendSeq               uint64                    // monotonic per-request counter
+	mappingMutex          sync.RWMutex
 }
 
 // newPacketSender return a chan based C.PacketSender
@@ -34,46 +60,211 @@ func newPacketSender() C.PacketSender {
 		cancel: cancel,
 		ch:     ch,
 
-		originToTarget: make(map[string]netip.Addr),
-		targetToOrigin: make(map[netip.Addr]netip.Addr),
+		originToTarget:        make(map[string]M.Socksaddr),
+		targetToOrigin:        make(map[netip.Addr]netip.Addr),
+		remoteDomains:         make(map[string]*remoteDomainTarget),
+		learnedTargetToOrigin: make(map[netip.Addr]netip.Addr),
 	}
+}
+
+func canonicalUDPDomain(domain string) string {
+	return strings.TrimSuffix(strings.ToLower(domain), ".")
+}
+
+func udpSocksaddrFromNet(addr net.Addr) M.Socksaddr {
+	// Preserve the old typed-nil *net.UDPAddr fallback. Passing a typed nil to
+	// sing's SocksaddrFromNet would dereference it before handleUDPToLocal can
+	// replace the source with the original TUN destination.
+	if addr == nil {
+		return M.Socksaddr{}
+	}
+	if udpAddr, isUDPAddr := addr.(*net.UDPAddr); isUDPAddr && udpAddr == nil {
+		return M.Socksaddr{}
+	}
+	return M.SocksaddrFromNet(addr).Unwrap()
+}
+
+func udpDestination(metadata *C.Metadata) M.Socksaddr {
+	if metadata.DstIP.IsValid() {
+		// Preserve upstream behavior for DIRECT and every locally resolved
+		// adapter. Host may remain populated for rules and logging after
+		// ResolveUDP, but a native UDP socket must receive the selected IP.
+		return M.SocksaddrFromNet(metadata.UDPAddr()).Unwrap()
+	}
+	if metadata.Host != "" {
+		// RemoteDNS adapters deliberately leave DstIP invalid so capable
+		// proxy protocols can carry the original FQDN to the server.
+		return M.ParseSocksaddrHostPort(metadata.Host, metadata.DstPort).Unwrap()
+	}
+	return M.Socksaddr{}
 }
 
 func (s *packetSender) AddMapping(originMetadata *C.Metadata, metadata *C.Metadata) {
 	s.mappingMutex.Lock()
 	defer s.mappingMutex.Unlock()
+
 	originKey := originMetadata.String()
-	originAddr := originMetadata.DstIP
-	targetAddr := metadata.DstIP
-	if addr := s.originToTarget[originKey]; !addr.IsValid() { // overwrite only if the record is illegal
-		s.originToTarget[originKey] = targetAddr
+	originAddr := originMetadata.DstIP.Unmap()
+	target := udpDestination(metadata)
+	if addr := s.originToTarget[originKey]; !addr.IsValid() && target.IsValid() { // overwrite only if the record is illegal
+		s.originToTarget[originKey] = target
 	}
+	if !originAddr.IsValid() || !target.IsValid() {
+		return
+	}
+
+	if target.IsFqdn() {
+		// Preserve the canonical domain separately from originToTarget: the
+		// latter is for outgoing packet reuse, whereas this map restores an
+		// incoming FQDN to the exact FakeIP expected by the TUN application.
+		domain := canonicalUDPDomain(target.Fqdn)
+		remoteTarget, loaded := s.remoteDomains[domain]
+		if !loaded {
+			remoteTarget = &remoteDomainTarget{
+				origin: originAddr,
+				ports:  make(map[uint16]uint64),
+			}
+			s.remoteDomains[domain] = remoteTarget
+		} else if remoteTarget.origin != originAddr {
+			// A recycled Fake-IP must never inherit an older association: forget
+			// what was learned for the superseded origin, then adopt the new one.
+			s.forgetLearnedForOriginLocked(remoteTarget.origin)
+			remoteTarget.origin = originAddr
+		}
+		if metadata.DstPort != 0 {
+			s.sendSeq++
+			remoteTarget.ports[metadata.DstPort] = s.sendSeq
+		}
+		return
+	}
+
+	targetAddr := target.Addr.Unmap()
 	if addr := s.targetToOrigin[targetAddr]; !addr.IsValid() { // overwrite only if the record is illegal
 		s.targetToOrigin[targetAddr] = originAddr
 	}
+	// An exact mapping supersedes anything guessed for the same IP.
+	delete(s.learnedTargetToOrigin, targetAddr)
 }
 
-func (s *packetSender) RestoreReadFrom(addr netip.Addr) netip.Addr {
-	s.mappingMutex.RLock()
-	defer s.mappingMutex.RUnlock()
-	if originAddr := s.targetToOrigin[addr]; originAddr.IsValid() {
+// forgetLearnedForOriginLocked drops every guessed mapping that points at a
+// superseded origin. The caller must hold mappingMutex.
+func (s *packetSender) forgetLearnedForOriginLocked(origin netip.Addr) {
+	if !origin.IsValid() {
+		return
+	}
+	for target, learned := range s.learnedTargetToOrigin {
+		if learned == origin {
+			delete(s.learnedTargetToOrigin, target)
+		}
+	}
+}
+
+// remoteOriginForPortLocked attributes an IP-only reply to a remote domain by
+// its port, preferring the domain that requested that port most recently.
+//
+// When several domains share one port the choice is a guess. That is deliberate:
+// a source port is one socket is one application flow, so a wrong guess only
+// costs that single packet — the application rejects it on its own source check,
+// exactly as it rejects the unrestored real IP today. Refusing to guess instead
+// breaks every destination after the first, which is fatal for any client that
+// fans out over one UDP port (BitTorrent trackers and DHT, HTTP/3 to several
+// origins). The caller must hold mappingMutex.
+func (s *packetSender) remoteOriginForPortLocked(port uint16) netip.Addr {
+	if port == 0 {
+		return netip.Addr{}
+	}
+	var (
+		origin netip.Addr
+		newest uint64
+	)
+	for _, target := range s.remoteDomains {
+		seq, loaded := target.ports[port]
+		if !loaded || !target.origin.IsValid() {
+			continue
+		}
+		if !origin.IsValid() || seq > newest {
+			origin, newest = target.origin, seq
+		}
+	}
+	return origin
+}
+
+func (s *packetSender) RestoreReadFrom(addr net.Addr) netip.Addr {
+	source := udpSocksaddrFromNet(addr)
+	if source.IsFqdn() {
+		s.mappingMutex.RLock()
+		target := s.remoteDomains[canonicalUDPDomain(source.Fqdn)]
+		var originAddr netip.Addr
+		if target != nil {
+			originAddr = target.origin
+		}
+		s.mappingMutex.RUnlock()
 		return originAddr
 	}
-	return addr
+
+	sourceAddr := source.Addr.Unmap()
+	if !sourceAddr.IsValid() {
+		return netip.Addr{}
+	}
+
+	s.mappingMutex.RLock()
+	if originAddr := s.targetToOrigin[sourceAddr]; originAddr.IsValid() {
+		s.mappingMutex.RUnlock()
+		return originAddr
+	}
+	if originAddr := s.learnedTargetToOrigin[sourceAddr]; originAddr.IsValid() {
+		s.mappingMutex.RUnlock()
+		return originAddr
+	}
+	originAddr := s.remoteOriginForPortLocked(source.Port)
+	canLearn := originAddr.IsValid() && len(s.learnedTargetToOrigin) < maxLearnedTargets
+	s.mappingMutex.RUnlock()
+	if !canLearn {
+		return sourceAddr
+	}
+
+	// Standard Hysteria2 returns the resolved IP instead of the requested FQDN.
+	// Bind each new (IP, port) reply to the domain that requested that port most
+	// recently, and keep the binding so later replies from the same IP stay
+	// stable. A domain with several A records therefore keeps working after the
+	// first reply, which the earlier single-entry table could not do.
+	s.mappingMutex.Lock()
+	defer s.mappingMutex.Unlock()
+	if originAddr = s.targetToOrigin[sourceAddr]; originAddr.IsValid() {
+		return originAddr
+	}
+	if originAddr = s.learnedTargetToOrigin[sourceAddr]; originAddr.IsValid() {
+		return originAddr
+	}
+	originAddr = s.remoteOriginForPortLocked(source.Port)
+	if originAddr.IsValid() && len(s.learnedTargetToOrigin) < maxLearnedTargets {
+		s.learnedTargetToOrigin[sourceAddr] = originAddr
+		return originAddr
+	}
+	return sourceAddr
 }
 
 func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 	defer packet.Drop()
 	metadata := packet.Metadata()
 
-	var addr *net.UDPAddr
+	var addr net.Addr
 
 	s.mappingMutex.RLock()
 	targetAddr := s.originToTarget[metadata.String()]
 	s.mappingMutex.RUnlock()
 
 	if targetAddr.IsValid() {
-		addr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(targetAddr, metadata.DstPort))
+		// A cached Socksaddr deliberately retains whether the target was an FQDN
+		// or an IP. Rebuilding it from DstIP would discard that identity.
+		targetAddr.Port = metadata.DstPort
+		if targetAddr.IsFqdn() {
+			addr = targetAddr
+		} else {
+			// Match upstream DIRECT behavior: native UDP sockets receive a
+			// *net.UDPAddr, never a domain-capable proxy address wrapper.
+			addr = net.UDPAddrFromAddrPort(targetAddr.AddrPort())
+		}
 	}
 
 	if addr == nil {
@@ -91,12 +282,17 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 			}
 		}
 
-		if !metadata.DstIP.IsValid() {
+		targetAddr = udpDestination(metadata)
+		if !targetAddr.IsValid() {
 			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
 			return
 		}
+		if targetAddr.IsFqdn() {
+			addr = targetAddr
+		} else {
+			addr = metadata.UDPAddr()
+		}
 		s.AddMapping(originMetadata, metadata)
-		addr = metadata.UDPAddr()
 	}
 	_ = handleUDPToRemote(packet, pc, addr)
 }
@@ -151,7 +347,7 @@ func (s *packetSender) Close() {
 
 func (s *packetSender) DoSniff(metadata *C.Metadata) error { return nil }
 
-func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr *net.UDPAddr) error {
+func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr net.Addr) error {
 	if addr == nil {
 		return errors.New("udp addr invalid")
 	}
@@ -180,24 +376,46 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
 			return
 		}
 
-		fromUDPAddr, isUDPAddr := from.(*net.UDPAddr)
-		if !isUDPAddr {
-			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
-			log.Warnln("server return a [%T](%s) which isn't a *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", from, from, oAddrPort)
-		} else if fromUDPAddr == nil {
-			fromUDPAddr = net.UDPAddrFromAddrPort(oAddrPort) // oAddrPort was Unmapped
-			log.Warnln("server return a nil *net.UDPAddr, force replace to (%s), this may be caused by a wrongly implemented server", oAddrPort)
+		source := udpSocksaddrFromNet(from)
+		fromPort := source.Port
+		if fromPort == 0 {
+			fromPort = oAddrPort.Port()
 		}
 
-		fromAddrPort := fromUDPAddr.AddrPort()
-		fromAddr := fromAddrPort.Addr().Unmap()
+		// Restore both locally resolved IP mappings and remote FQDN mappings.
+		fromAddr := sender.RestoreReadFrom(from).Unmap()
+		var writeBackAddr net.Addr
+		switch {
+		case fromAddr.IsValid() && fromPort != 0:
+			writeBackAddr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(fromAddr, fromPort))
+		case source.IsFqdn() && !oAddrPort.IsValid():
+			// Non-transparent inbounds such as SOCKS can preserve the domain
+			// directly even when there is no Fake-IP to restore.
+			writeBackAddr = source
+		case source.IsFqdn():
+			// A transparent inbound cannot write a domain as the packet source.
+			// Falling back to the association's first FakeIP would silently
+			// misattribute an unknown domain on a multi-destination EIM socket.
+			if put != nil {
+				put()
+			}
+			log.Warnln("server returned an unmapped UDP domain [%s], drop instead of guessing (%s)", source, oAddrPort)
+			return
+		case oAddrPort.IsValid():
+			// Retain the historical fallback for invalid/typed-nil server
+			// addresses; unlike an unknown domain, these carry no identity that
+			// could be incorrectly assigned to another destination.
+			writeBackAddr = net.UDPAddrFromAddrPort(oAddrPort)
+			log.Warnln("server returned an unrestorable [%T](%v), force replace to (%s)", from, from, oAddrPort)
+		default:
+			if put != nil {
+				put()
+			}
+			log.Warnln("server returned an invalid UDP source [%T](%v)", from, from)
+			return
+		}
 
-		// restore DestinationNAT
-		fromAddr = sender.RestoreReadFrom(fromAddr).Unmap()
-
-		fromAddrPort = netip.AddrPortFrom(fromAddr, fromAddrPort.Port())
-
-		_, err = writeBack.WriteBack(data, net.UDPAddrFromAddrPort(fromAddrPort))
+		_, err = writeBack.WriteBack(data, writeBackAddr)
 		if put != nil {
 			put()
 		}

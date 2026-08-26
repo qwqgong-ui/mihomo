@@ -304,11 +304,11 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 			if useEarly {
 				conn = v.client.DialEarlyXUDPPacketConn(c,
 					globalID,
-					M.SocksaddrFromNet(metadata.UDPAddr()))
+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 			} else {
 				conn, err = v.client.DialXUDPPacketConn(c,
 					globalID,
-					M.SocksaddrFromNet(metadata.UDPAddr()))
+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 			}
 		} else if v.option.PacketAddr {
 			if useEarly {
@@ -322,10 +322,10 @@ func (v *Vmess) streamConnContext(ctx context.Context, c net.Conn, metadata *C.M
 		} else {
 			if useEarly {
 				conn = v.client.DialEarlyPacketConn(c,
-					M.SocksaddrFromNet(metadata.UDPAddr()))
+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 			} else {
 				conn, err = v.client.DialPacketConn(c,
-					M.SocksaddrFromNet(metadata.UDPAddr()))
+					M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 			}
 		}
 	} else {
@@ -435,7 +435,7 @@ func (v *Vmess) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	if pc, ok := c.(net.PacketConn); ok {
 		return NewPacketConn(N.NewThreadSafePacketConn(pc), v), nil
 	}
-	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: metadata.UDPAddr()}, v), nil
+	return NewPacketConn(&vmessPacketConn{Conn: c, rAddr: M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)}, v), nil
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -504,6 +504,7 @@ func NewVmess(option VmessOption) (*Vmess, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		client: client,
 		option: &option,

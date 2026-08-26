@@ -1,4 +1,4 @@
-//go:build !(android && cmfa)
+//go:build !android
 
 package dns
 
@@ -17,37 +17,32 @@ func (c *systemClient) getDnsClients() ([]dnsClient, error) {
 	defer c.mu.Unlock()
 	var err error
 	if time.Since(c.lastFlush) > SystemDnsFlushTime {
-		var nameservers []string
+		var nameservers []systemNameServer
 		if nameservers, err = dnsReadConfig(); err == nil {
 			log.Debugln("[DNS] system dns update to %s", nameservers)
-			for _, addr := range nameservers {
-				if resolver.IsSystemDnsBlacklisted(addr) {
+			for _, nameserver := range nameservers {
+				if resolver.IsSystemDnsBlacklisted(nameserver.address) {
 					continue
 				}
-				if _, ok := c.dnsClients[addr]; !ok {
-					clients := transform(
-						[]NameServer{{
-							Addr: net.JoinHostPort(addr, "53"),
-							Net:  "udp",
-						}},
-						nil,
-					)
-					if len(clients) > 0 {
-						c.dnsClients[addr] = &systemDnsClient{
-							disableTimes: 0,
-							dnsClient:    clients[0],
-						}
+				key := nameserver.key()
+				if _, ok := c.dnsClients[key]; !ok {
+					c.dnsClients[key] = &systemDnsClient{
+						disableTimes: 0,
+						dnsClient: newSystemDNSClient(
+							net.JoinHostPort(nameserver.address, "53"),
+							nameserver.interfaceName,
+						),
 					}
 				}
 			}
 			available := 0
-			for nameserver, sdc := range c.dnsClients {
-				if slices.Contains(nameservers, nameserver) {
+			for key, sdc := range c.dnsClients {
+				if slices.ContainsFunc(nameservers, func(nameserver systemNameServer) bool { return nameserver.key() == key }) {
 					sdc.disableTimes = 0 // enable
 					available++
 				} else {
 					if sdc.disableTimes > SystemDnsDeleteTimes {
-						delete(c.dnsClients, nameserver) // drop too old dnsClient
+						delete(c.dnsClients, key) // drop too old dnsClient
 					} else {
 						sdc.disableTimes++
 					}

@@ -16,6 +16,18 @@ func Tags() (tags []string) {
 	if NoZeroTier {
 		tags = append(tags, "no_zerotier")
 	}
+	if NoWireGuard {
+		tags = append(tags, "no_wireguard")
+	}
+	if NoOpenVPN {
+		tags = append(tags, "no_openvpn")
+	}
+	if NoMieru {
+		tags = append(tags, "no_mieru")
+	}
+	if NoSudoku {
+		tags = append(tags, "no_sudoku")
+	}
 	if WithGVisor {
 		tags = append(tags, "with_gvisor")
 	}

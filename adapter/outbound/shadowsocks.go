@@ -260,7 +260,7 @@ func (ss *ShadowSocks) ListenPacketContext(ctx context.Context, metadata *C.Meta
 		if err = ss.ResolveUDP(ctx, metadata); err != nil {
 			return nil, err
 		}
-		destination := M.SocksaddrFromNet(metadata.UDPAddr())
+		destination := M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort)
 		if ss.option.UDPOverTCPVersion == uot.LegacyVersion {
 			return NewPacketConn(N.NewThreadSafePacketConn(uot.NewConn(c, uot.Request{Destination: destination})), ss), nil
 		} else {
@@ -507,6 +507,7 @@ func NewShadowSocks(option ShadowSocksOption) (*ShadowSocks, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		method: method,
 

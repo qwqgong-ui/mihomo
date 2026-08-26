@@ -116,6 +116,24 @@ func (t tunnel) NatTable() C.NatTable {
 	return natTable
 }
 
+// ResolveICMPDirect runs the normal rule engine without opening a connection
+// and returns the final adapter only when proxy-group unwrapping ends at
+// DIRECT. TUN ICMP uses this optional method to avoid bypassing proxy rules.
+func (t tunnel) ResolveICMPDirect(metadata *C.Metadata) C.ProxyAdapter {
+	metadata = metadata.Clone()
+	proxy, _, err := resolveMetadata(metadata)
+	if err != nil || proxy == nil {
+		return nil
+	}
+	for next := proxy.Unwrap(metadata, false); next != nil; next = proxy.Unwrap(metadata, false) {
+		proxy = next
+	}
+	if proxy.Type() != C.Direct {
+		return nil
+	}
+	return proxy.Adapter()
+}
+
 func (t tunnel) Proxies() map[string]C.Proxy {
 	return proxies
 }
@@ -314,6 +332,107 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
+func processLookupEndpoints(metadata *C.Metadata) (src, dst netip.AddrPort) {
+	src = metadata.SourceAddrPort()
+	if rawSrc, ok := addrPortFromNetAddr(metadata.RawSrcAddr); ok {
+		src = rawSrc
+	}
+	dst, _ = addrPortFromNetAddr(metadata.RawDstAddr)
+	return
+}
+
+func addrPortFromNetAddr(addr net.Addr) (netip.AddrPort, bool) {
+	if addr == nil {
+		return netip.AddrPort{}, false
+	}
+	if rawAddr, ok := addr.(interface{ RawAddr() net.Addr }); ok {
+		if raw := rawAddr.RawAddr(); raw != nil {
+			if _, ok := raw.(interface{ AddrPort() netip.AddrPort }); ok {
+				addr = raw
+			}
+		}
+	}
+	addrPorter, ok := addr.(interface{ AddrPort() netip.AddrPort })
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	addrPort := addrPorter.AddrPort()
+	if !addrPort.IsValid() || addrPort.Port() == 0 {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
+}
+
+type rulesProcessMatcher []process.RuleProcessMatcher
+
+func (m rulesProcessMatcher) MatchProcess(path string) bool {
+	for _, matcher := range m {
+		if matcher.MatchProcess(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m rulesProcessMatcher) MatchProcessName(name string) bool {
+	for _, matcher := range m {
+		if matcher.MatchProcessName(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func processMatcherForRules(rules []C.Rule) process.ProcessMatcher {
+	matchers := make(rulesProcessMatcher, 0)
+	for _, rule := range rules {
+		matcher, ok := rule.(process.RuleProcessMatcher)
+		if ok && matcher.HasProcessRule() {
+			matchers = append(matchers, matcher)
+		}
+	}
+	if len(matchers) == 0 {
+		return nil
+	}
+	return matchers
+}
+
+func fakeIPRuleResolver(metadata *C.Metadata, resolveIP func()) func() {
+	if metadata.DNSMode == C.DNSFakeIP {
+		// Fake-IP routing must not ask nameserver for a real address. DIRECT
+		// resolves later through DirectHostResolver; proxies keep the FQDN.
+		return nil
+	}
+	return resolveIP
+}
+
+func keepResolvedFakeIP(adapterType C.AdapterType) bool {
+	switch adapterType {
+	case C.Direct, C.Reject, C.RejectDrop:
+		return true
+	default:
+		return false
+	}
+}
+
+func preserveFakeIPDomain(metadata *C.Metadata, proxy C.Proxy) {
+	if metadata.DNSMode != C.DNSFakeIP || metadata.Host == "" || !metadata.DstIP.IsValid() || proxy == nil {
+		return
+	}
+
+	// Inspect the selected leaf without changing group state. DIRECT keeps the
+	// locally resolved address, and REJECT retains its historical metadata.
+	// Every other outbound receives the original FQDN instead of the address
+	// resolved while evaluating IP-based rules.
+	leaf := proxy
+	for next := leaf.Unwrap(metadata, false); next != nil; next = leaf.Unwrap(metadata, false) {
+		leaf = next
+	}
+	if !keepResolvedFakeIP(leaf.Type()) {
+		metadata.DstIP = netip.Addr{}
+	}
+}
+
 func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
 	if metadata.SpecialProxy != "" {
 		var exist bool
@@ -321,6 +440,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		if !exist {
 			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
 		}
+		preserveFakeIPDomain(metadata, proxy)
 		return
 	}
 	var (
@@ -352,8 +472,13 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 			if attemptProcessLookup {
 				attemptProcessLookup = false
 				if !features.CMFA {
+					matcher := processMatcherForRules(getRules(metadata))
+					if matcher == nil {
+						return
+					}
 					// normal check for process
-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+					src, dst := processLookupEndpoints(metadata)
+					uid, path, err := process.FindProcessNameByAddrWithMatcher(metadata.NetWork.String(), src, dst, matcher)
 					if err != nil {
 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
 					} else {
@@ -370,6 +495,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 					pkg, err := process.FindPackageName(metadata)
 					if err != nil {
 						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+					} else if matcher := processMatcherForRules(getRules(metadata)); matcher != nil && !matcher.MatchProcessName(pkg) {
+						return
 					} else {
 						metadata.Process = pkg
 					}
@@ -389,10 +516,13 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 			return false
 		},
 	}
+	helper.ResolveIP = fakeIPRuleResolver(metadata, helper.ResolveIP)
 
 	switch FindProcessMode() {
 	case process.FindProcessAlways:
+		configMux.RLock()
 		helper.FindProcess()
+		configMux.RUnlock()
 		helper.FindProcess = nil
 	case process.FindProcessOff:
 		helper.FindProcess = nil
@@ -407,6 +537,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 	default:
 		proxy, rule, err = match(metadata, helper)
 	}
+	preserveFakeIPDomain(metadata, proxy)
 	return
 }
 
@@ -430,6 +561,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 		return
 	}
 	fixMetadata(metadata) // fix some metadata not set via metadata.SetRemoteAddr or metadata.SetRemoteAddress
+	originalAddrPort := metadata.AddrPort()
 
 	if err := preHandleMetadata(metadata.Clone()); err != nil { // precheck without modify metadata
 		packet.Drop()
@@ -463,6 +595,19 @@ func handleUDPConn(packet C.PacketAdapter) {
 				return nil, nil, err
 			}
 
+			// Fast path for reject rules: absorb the whole session in the nat
+			// table so every following packet is dropped by sender.Send()
+			// without rematching rules, dialing or spawning a read loop.
+			if _, chains, isReject := rejectAdapter(proxy, metadata); isReject {
+				logMetadata(metadata, rule, chains)
+				sender.Close() // a closed sender drops everything handed to it
+				defaultDropParker.Park(udpTimeout, func() {
+					closeAllLocalCoon(key)
+					natTable.Delete(key)
+				})
+				return nil, nil, errRejectAbsorbed
+			}
+
 			dialMetadata := metadata.Pure()
 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 			defer cancel()
@@ -474,12 +619,15 @@ func handleUDPConn(packet C.PacketAdapter) {
 			if err != nil {
 				return nil, nil, err
 			}
-			logMetadata(metadata, rule, rawPc)
+			logMetadata(metadata, rule, rawPc.Chains())
 
 			pc := statistic.NewUDPTracker(rawPc, statistic.DefaultManager, metadata, rule, 0, 0, true)
 
 			sender.AddMapping(originMetadata, dialMetadata)
 			oAddrPort := dialMetadata.AddrPort()
+			if !oAddrPort.IsValid() {
+				oAddrPort = originalAddrPort
+			}
 			writeBackProxy := nat.NewWriteBackProxy(packet)
 
 			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
@@ -489,8 +637,10 @@ func handleUDPConn(packet C.PacketAdapter) {
 		go func() {
 			pc, proxy, err := dial()
 			if err != nil {
-				sender.Close()
-				natTable.Delete(key)
+				if !errors.Is(err, errRejectAbsorbed) { // the parker owns the entry now
+					sender.Close()
+					natTable.Delete(key)
+				}
 				return
 			}
 			sender.Process(pc, proxy)
@@ -505,8 +655,11 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
+	parked := false
 	defer func(conn net.Conn) {
-		_ = conn.Close()
+		if !parked { // ownership was handed over to the drop parker
+			_ = conn.Close()
+		}
 	}(connCtx.Conn())
 
 	metadata := connCtx.Metadata()
@@ -554,6 +707,23 @@ func handleTCPConn(connCtx C.ConnContext) {
 	proxy, rule, err := resolveMetadata(metadata)
 	if err != nil {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
+		return
+	}
+
+	// Fast path for reject rules: there is nothing to dial, so skip the
+	// outbound, the traffic tracker and the relay loop entirely.
+	if rejectProxy, chains, isReject := rejectAdapter(proxy, metadata); isReject {
+		logMetadata(metadata, rule, chains)
+		_ = conn.SetReadDeadline(time.Now()) // stop unfinished peek
+		peekMutex.Lock()
+		defer peekMutex.Unlock()
+		_ = conn.SetReadDeadline(time.Time{}) // reset
+		if rejectProxy.Type() == C.RejectDrop {
+			// Keep the client hanging like a dropped packet would, but park
+			// the connection instead of holding a goroutine and a timer on it.
+			parked = true
+			defaultDropParker.Park(C.DefaultDropTime, func() { _ = conn.Close() })
+		}
 		return
 	}
 
@@ -610,7 +780,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if err != nil {
 		return
 	}
-	logMetadata(metadata, rule, remoteConn)
+	logMetadata(metadata, rule, remoteConn.Chains())
 
 	remoteConn = statistic.NewTCPTracker(remoteConn, statistic.DefaultManager, metadata, rule, int64(peekLen), 0, true)
 	defer func(remoteConn C.Conn) {
@@ -632,22 +802,22 @@ func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err
 	}
 }
 
-func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
+func logMetadata(metadata *C.Metadata, rule C.Rule, chains C.Chain) {
 	switch {
 	case metadata.SpecialProxy != "":
-		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
+		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), chains.String())
 	case rule != nil:
 		if rule.Payload() != "" {
-			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), remoteConn.Chains().String())
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), fmt.Sprintf("%s(%s)", rule.RuleType().String(), rule.Payload()), chains.String())
 		} else {
-			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
+			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), chains.String())
 		}
 	case mode == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	case mode == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
-		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
+		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), chains.String())
 	}
 }
 

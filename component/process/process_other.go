@@ -8,6 +8,13 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 	return 0, "", ErrPlatformNotSupport
 }
 
+func findProcessNameByAddr(network string, src, _ netip.AddrPort, _ ProcessMatcher) (uint32, string, error) {
+	if !src.IsValid() {
+		return 0, "", ErrNotFound
+	}
+	return findProcessName(network, src.Addr(), int(src.Port()))
+}
+
 func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uint32, uint32, error) {
 	return 0, 0, ErrPlatformNotSupport
 }

@@ -138,6 +138,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option: &option,
 	}
@@ -199,6 +200,11 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 	}
 
 	quicConfig := &quic.Config{
+		// Dial with QUIC v2 (RFC 9369). This must stay a single version:
+		// hysteria2 authenticates over HTTP/3, and http3.Transport rejects a
+		// quic.Config carrying more than one version, so quic-go's Version
+		// Negotiation fallback is not available here. Servers must support v2.
+		Versions:                       []quic.Version{quic.Version2},
 		InitialStreamReceiveWindow:     option.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         option.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: option.InitialConnectionReceiveWindow,

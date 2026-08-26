@@ -11,6 +11,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/picker"
 	"github.com/metacubex/mihomo/component/ech/echparser"
+	"github.com/metacubex/mihomo/component/ecs"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/log"
 
@@ -240,13 +241,26 @@ func wrapClientWithDisableTypes(c dnsClient, params map[string]string) dnsClient
 
 type clientWithEdns0Subnet struct {
 	dnsClient
-	ecsPrefix   netip.Prefix
+	ecsPrefix   netip.Prefix // zero when ecsAuto is set
+	ecsAuto     bool         // take the prefix from the STUN discovered egress address
 	ecsOverride bool
 }
 
 func (c clientWithEdns0Subnet) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
+	ecsPrefix := c.ecsPrefix
+	if c.ecsAuto {
+		// answer an A question with an IPv4 subnet and an AAAA one with an
+		// IPv6 subnet; discovery is asynchronous, so an invalid prefix here
+		// just means it has not succeeded (yet) and the query goes out
+		// without ECS
+		ipv4 := len(m.Question) == 0 || m.Question[0].Qtype != D.TypeAAAA
+		ecsPrefix = ecs.Prefix(ipv4)
+		if !ecsPrefix.IsValid() {
+			return c.dnsClient.ExchangeContext(ctx, m)
+		}
+	}
 	m = m.Copy()
-	setEdns0Subnet(m, c.ecsPrefix, c.ecsOverride)
+	setEdns0Subnet(m, ecsPrefix, c.ecsOverride)
 	return c.dnsClient.ExchangeContext(ctx, m)
 }
 
@@ -263,27 +277,31 @@ func isEdns0SubnetParam(key string) bool {
 
 func wrapClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient {
 	var ecsPrefix netip.Prefix
+	var ecsAuto bool
 	var ecsOverride bool
-	if ecs := params["ecs"]; ecs != "" {
-		prefix, err := netip.ParsePrefix(ecs)
-		if err != nil {
-			addr, err := netip.ParseAddr(ecs)
-			if err != nil {
-				log.Warnln("DNS [%s] config with invalid ecs: %s", c.Address(), ecs)
-			} else {
-				ecsPrefix = netip.PrefixFrom(addr, addr.BitLen())
-			}
-		} else {
+	if value := params["ecs"]; value != "" {
+		if value == "auto" {
+			// the prefix is discovered at runtime, see [ecs.Prefix]
+			ecsAuto = true
+		} else if prefix, err := netip.ParsePrefix(value); err == nil {
 			ecsPrefix = prefix
+		} else if addr, err := netip.ParseAddr(value); err == nil {
+			ecsPrefix = netip.PrefixFrom(addr, addr.BitLen())
+		} else {
+			log.Warnln("DNS [%s] config with invalid ecs: %s", c.Address(), value)
 		}
 	}
 
-	if ecsPrefix.IsValid() {
-		log.Debugln("DNS [%s] config with ecs: %s", c.Address(), ecsPrefix)
+	if ecsAuto || ecsPrefix.IsValid() {
+		if ecsAuto {
+			log.Debugln("DNS [%s] config with auto ecs", c.Address())
+		} else {
+			log.Debugln("DNS [%s] config with ecs: %s", c.Address(), ecsPrefix)
+		}
 		if params["ecs-override"] == "true" {
 			ecsOverride = true
 		}
-		return clientWithEdns0Subnet{c, ecsPrefix, ecsOverride}
+		return clientWithEdns0Subnet{c, ecsPrefix, ecsAuto, ecsOverride}
 	}
 	return c
 }

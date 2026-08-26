@@ -29,6 +29,33 @@ func (c *classicalStrategy) Match(metadata *C.Metadata, helper C.RuleMatchHelper
 	return false
 }
 
+func (c *classicalStrategy) HasProcessRule() bool {
+	for _, rule := range c.rules {
+		if matcher, ok := rule.(interface{ HasProcessRule() bool }); ok && matcher.HasProcessRule() {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *classicalStrategy) MatchProcess(path string) bool {
+	for _, rule := range c.rules {
+		if matcher, ok := rule.(interface{ MatchProcess(string) bool }); ok && matcher.MatchProcess(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *classicalStrategy) MatchProcessName(name string) bool {
+	for _, rule := range c.rules {
+		if matcher, ok := rule.(interface{ MatchProcessName(string) bool }); ok && matcher.MatchProcessName(name) {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *classicalStrategy) Count() int {
 	return c.count
 }

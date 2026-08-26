@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/metacubex/mihomo/adapter/outboundgroup"
 	"github.com/metacubex/mihomo/common/structure"
@@ -202,22 +203,71 @@ func validateDialerProxiesHasCycle(current string, graph map[string]string, visi
 	return false
 }
 
-func verifyIP6() bool {
+var verifyIP6 = detectIPv6
+
+// SystemIPv6Available reports whether a non-tunnel, active system interface
+// currently owns a usable global IPv6 address. It is exported so callers
+// outside this package (e.g. hub/executor's runtime IPv6 availability
+// monitor) can reuse the exact same detection logic used at config-parse
+// time instead of maintaining a second, potentially drifting copy.
+func SystemIPv6Available() bool {
+	return verifyIP6()
+}
+
+func detectIPv6() bool {
 	if skip, _ := strconv.ParseBool(os.Getenv("SKIP_SYSTEM_IPV6_CHECK")); skip {
 		return true
 	}
-	if iAddrs, err := net.InterfaceAddrs(); err == nil {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		// eg: Calling net.Interfaces() fails on Android SDK 30
+		// https://github.com/golang/go/issues/40569
+		return true // just ignore
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 || isIPv6TunnelInterface(iface.Name) {
+			continue
+		}
+		iAddrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
 		for _, addr := range iAddrs {
 			if prefix, err := netip.ParsePrefix(addr.String()); err == nil {
-				if addr := prefix.Addr().Unmap(); addr.Is6() && addr.IsGlobalUnicast() {
+				if isUsableSystemIPv6(prefix.Addr().Unmap()) {
 					return true
 				}
 			}
 		}
-	} else {
-		// eg: Calling net.InterfaceAddrs() fails on Android SDK 30
-		// https://github.com/golang/go/issues/40569
-		return true // just ignore
 	}
 	return false
+}
+
+func isIPv6TunnelInterface(name string) bool {
+	name = strings.ToLower(name)
+	if name == "meta" {
+		return true
+	}
+	for _, marker := range []string{"teredo", "wintun", "tailscale", "zerotier"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return strings.HasPrefix(name, "tun") || strings.HasPrefix(name, "tap") || strings.HasPrefix(name, "utun")
+}
+
+func isUsableSystemIPv6(addr netip.Addr) bool {
+	if !addr.Is6() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLinkLocalUnicast() {
+		return false
+	}
+	// Transition and special-purpose ranges do not prove that native IPv6 is usable.
+	for _, prefix := range []netip.Prefix{
+		netip.MustParsePrefix("2001::/23"), // Teredo and other IETF protocol assignments
+		netip.MustParsePrefix("2002::/16"), // 6to4
+	} {
+		if prefix.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }

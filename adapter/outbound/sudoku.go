@@ -1,3 +1,5 @@
+//go:build !no_sudoku
+
 package outbound
 
 import (
@@ -237,6 +239,7 @@ func NewSudoku(option SudokuOption) (*Sudoku, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:   &option,
 		baseConf: baseConf,

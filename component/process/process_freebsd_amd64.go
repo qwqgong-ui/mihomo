@@ -59,6 +59,13 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 	return 0, pp, err
 }
 
+func findProcessNameByAddr(network string, src, _ netip.AddrPort, _ ProcessMatcher) (uint32, string, error) {
+	if !src.IsValid() {
+		return 0, "", ErrNotFound
+	}
+	return findProcessName(network, src.Addr(), int(src.Port()))
+}
+
 func getExecPathFromPID(pid uint32) (string, error) {
 	buf := make([]byte, 2048)
 	size := uint64(len(buf))

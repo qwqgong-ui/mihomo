@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux && !android
 
 package dns
 
@@ -12,7 +12,7 @@ import (
 
 const resolvConf = "/etc/resolv.conf"
 
-func dnsReadConfig() (servers []string, err error) {
+func dnsReadConfig() (servers []systemNameServer, err error) {
 	file, err := os.Open(resolvConf)
 	if err != nil {
 		err = fmt.Errorf("failed to read %s: %w", resolvConf, err)
@@ -34,7 +34,7 @@ func dnsReadConfig() (servers []string, err error) {
 		case "nameserver": // add one name server
 			if len(f) > 1 {
 				if addr, err := netip.ParseAddr(f[1]); err == nil {
-					servers = append(servers, addr.String())
+					servers = append(servers, systemNameServer{address: addr.String()})
 				}
 			}
 		}

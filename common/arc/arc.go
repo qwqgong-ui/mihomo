@@ -239,3 +239,31 @@ func max(a int, b int) int {
 	}
 	return a
 }
+
+// Snapshot returns every live (non-ghost) entry together with its expiry.
+// Ghost entries are ARC's eviction bookkeeping: they keep a key to detect a
+// recent eviction but carry no value, so they are skipped.
+//
+// The returned slice is a copy; callers may hold it after the cache mutates.
+// Iteration order is unspecified and does not affect ARC's replacement state
+// (unlike Get, Snapshot is side-effect free).
+func (a *ARC[K, V]) Snapshot() []Item[K, V] {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	items := make([]Item[K, V], 0, a.len)
+	for key, ent := range a.cache {
+		if ent.ghost {
+			continue
+		}
+		items = append(items, Item[K, V]{Key: key, Value: ent.value, Expires: time.Unix(ent.expires, 0)})
+	}
+	return items
+}
+
+// Item is one live cache entry as returned by Snapshot.
+type Item[K comparable, V any] struct {
+	Key     K
+	Value   V
+	Expires time.Time
+}

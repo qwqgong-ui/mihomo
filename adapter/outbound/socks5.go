@@ -201,6 +201,7 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:         &option,
 		user:           option.UserName,

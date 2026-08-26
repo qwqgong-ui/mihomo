@@ -146,7 +146,7 @@ func withMapping(mapping *lru.LruCache[netip.Addr, string]) middleware {
 	}
 }
 
-func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int) middleware {
+func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakeip.Pool, fakeIPTTL int, serviceResolver resolver.Resolver) middleware {
 	return func(next handler) handler {
 		return func(ctx *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
 			q := r.Question[0]
@@ -177,7 +177,23 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 					AAAA: ip.AsSlice(),
 				}
 			case D.TypeSVCB, D.TypeHTTPS:
-				return handleMsgWithEmptyAnswer(r), nil
+				var msg *D.Msg
+				var err error
+				if serviceResolver == nil {
+					msg, err = next(ctx, r)
+				} else {
+					ctx.SetType(icontext.DNSTypeRaw)
+					msg, err = serviceResolver.ExchangeContext(ctx, r)
+				}
+				if err != nil {
+					return msg, err
+				}
+				msg = msg.Copy()
+				msg.SetRcode(r, msg.Rcode)
+				if rewriteFakeIPServiceBindings(msg, fakePool, fakePool6, fakeIPTTL) {
+					ctx.SetType(icontext.DNSTypeFakeIP)
+				}
+				return msg, nil
 			default:
 				return next(ctx, r)
 			}
@@ -230,7 +246,7 @@ func compose(middlewares []middleware, endpoint handler) handler {
 	return h
 }
 
-func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
+func newHandler(resolver resolver.Resolver, serviceResolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	var middlewares []middleware
 
 	if mapper.useHosts {
@@ -238,7 +254,7 @@ func newHandler(resolver resolver.Resolver, mapper *ResolverEnhancer) handler {
 	}
 
 	if mapper.mode == C.DNSFakeIP {
-		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL))
+		middlewares = append(middlewares, withFakeIP(mapper.fakeIPSkipper, mapper.fakeIPPool, mapper.fakeIPPool6, mapper.fakeIPTTL, serviceResolver))
 	}
 
 	if mapper.mode != C.DNSNormal {

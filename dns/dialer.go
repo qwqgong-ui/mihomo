@@ -9,3 +9,4 @@ const RespectRules = tunnel.DnsRespectRules
 type dnsDialer = tunnel.DNSDialer
 
 var newDNSDialer = tunnel.NewDNSDialer
+var newSystemDNSDialer = tunnel.NewSystemDNSDialer

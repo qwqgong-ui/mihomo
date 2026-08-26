@@ -51,6 +51,7 @@ type General struct {
 	UnifiedDelay      bool                    `json:"unified-delay"`
 	LogLevel          log.LogLevel            `json:"log-level"`
 	IPv6              bool                    `json:"ipv6"`
+	IPv6Active        bool                    `json:"-"`
 	Interface         string                  `json:"interface-name"`
 	RoutingMark       int                     `json:"routing-mark"`
 	GeoXUrl           GeoXUrl                 `json:"geox-url"`
@@ -567,11 +568,7 @@ func DefaultRawConfig() *RawConfig {
 			Bypass:           []string{},
 			DnsRedirect:      true,
 		},
-		Experimental: RawExperimental{
-			// https://github.com/quic-go/quic-go/issues/4178
-			// Quic-go currently cannot automatically fall back on platforms that do not support ecn, so this feature is turned off by default.
-			QUICGoDisableECN: true,
-		},
+		Experimental: RawExperimental{},
 		Profile: RawProfile{
 			StoreSelected: true,
 		},
@@ -625,6 +622,7 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	parseIPV6(rawCfg, general) // must before temporary general, DNS and Tun
 	config.General = general
 
 	// We need to temporarily apply some configuration in general and roll back after parsing the complete configuration.
@@ -707,8 +705,6 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 		return nil, err
 	}
 	config.Hosts = hosts
-
-	parseIPV6(rawCfg) // must before DNS and Tun
 
 	dnsCfg, err := parseDNS(rawCfg, ruleProviders)
 	if err != nil {
@@ -1194,6 +1190,24 @@ func hostWithDefaultPort(host string, defPort string) (string, error) {
 	return net.JoinHostPort(hostname, port), nil
 }
 
+// markAutoEdns0Subnet turns on the STUN discovered EDNS Client Subnet for
+// every direct nameserver. Only the direct ones get it: those are the queries
+// leaving through the direct egress, so its public address is the subnet the
+// upstream should optimize for. A nameserver carrying an explicit `ecs=`
+// keeps that value, and no `ecs-override` is added, so a client that sent its
+// own subnet still wins.
+func markAutoEdns0Subnet(nameservers []dns.NameServer) {
+	for _, ns := range nameservers {
+		if ns.Params == nil {
+			continue // parseNameServer always allocates, keep the nil check defensive
+		}
+		if _, exist := ns.Params["ecs"]; exist {
+			continue
+		}
+		ns.Params["ecs"] = "auto"
+	}
+}
+
 func parseNameServer(servers []string, respectRules bool, preferH3 bool) ([]dns.NameServer, error) {
 	var nameservers []dns.NameServer
 
@@ -1451,6 +1465,7 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		return nil, err
 	}
 	dnsCfg.DirectFollowPolicy = cfg.DirectNameServerFollowPolicy
+	markAutoEdns0Subnet(dnsCfg.DirectNameServer)
 
 	if len(cfg.DefaultNameserver) == 0 {
 		return nil, errors.New("default nameserver should have at least one nameserver")
@@ -1665,11 +1680,16 @@ func parseAuthentication(rawRecords []string) []auth.AuthUser {
 	return users
 }
 
-func parseIPV6(rawCfg *RawConfig) {
-	if !rawCfg.IPv6 || !verifyIP6() {
-		rawCfg.DNS.FakeIPRange6 = ""
-		rawCfg.Tun.Inet6Address = nil
-	}
+func parseIPV6(rawCfg *RawConfig, general *General) {
+	// Keep the configured IPv6 intent and all IPv6-specific DNS/TUN values
+	// untouched here. Runtime availability can change later (e.g. a
+	// Wi-Fi/mobile-network switch or the runtime IPv6 availability monitor),
+	// so destructively clearing these values would make it impossible for
+	// hub/executor to restore them without a full config reload. The actual
+	// effective gating for the current process lifetime is IPv6Active, which
+	// downstream consumers (updateDNS/updateTun) combine with the raw
+	// configured values.
+	general.IPv6Active = rawCfg.IPv6 && verifyIP6()
 }
 
 func parseTun(rawTun RawTun, dns *DNS, general *General) error {

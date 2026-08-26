@@ -17,6 +17,7 @@ import (
 
 const (
 	packetQueueSize = 1024
+	oobBufferSize   = 256
 )
 
 // ObfsUDPHopClientPacketConn is the UDP port-hopping packet connection for client side.
@@ -29,9 +30,9 @@ type ObfsUDPHopClientPacketConn struct {
 	obfs obfs.Obfuscator
 
 	connMutex   sync.RWMutex
-	prevConn    net.PacketConn
 	currentConn net.PacketConn
 	addrIndex   int
+	remoteAddr  *net.UDPAddr
 
 	readBufferSize  int
 	writeBufferSize int
@@ -41,6 +42,7 @@ type ObfsUDPHopClientPacketConn struct {
 	closed    bool
 
 	bufPool sync.Pool
+	oobPool sync.Pool
 }
 
 type udpHopAddr string
@@ -54,9 +56,12 @@ func (a *udpHopAddr) String() string {
 }
 
 type udpPacket struct {
-	buf  []byte
-	n    int
-	addr net.Addr
+	buf   []byte
+	n     int
+	oob   []byte
+	oobn  int
+	flags int
+	addr  net.Addr
 }
 
 func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterval time.Duration, obfs obfs.Obfuscator, dialer utils.PacketDialer) (net.PacketConn, error) {
@@ -68,6 +73,13 @@ func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterva
 	rAddr, err := dialer.RemoteAddr(server)
 	if err != nil {
 		return nil, err
+	}
+	remoteAddr, ok := rAddr.(*net.UDPAddr)
+	if !ok {
+		remoteAddr, err = net.ResolveUDPAddr("udp", rAddr.String())
+		if err != nil {
+			return nil, err
+		}
 	}
 	ip, _, err := net.SplitHostPort(rAddr.String())
 	if err != nil {
@@ -87,11 +99,17 @@ func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterva
 		hopInterval: hopInterval,
 		obfs:        obfs,
 		addrIndex:   randv2.IntN(len(serverAddrs)),
+		remoteAddr:  remoteAddr,
 		recvQueue:   make(chan *udpPacket, packetQueueSize),
 		closeChan:   make(chan struct{}),
 		bufPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, udpBufferSize)
+			},
+		},
+		oobPool: sync.Pool{
+			New: func() interface{} {
+				return make([]byte, oobBufferSize)
 			},
 		},
 	}
@@ -105,14 +123,18 @@ func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterva
 		conn.currentConn = curConn
 	}
 	go conn.recvRoutine(conn.currentConn)
-	go conn.hopRoutine(dialer, rAddr)
-	if _, ok := conn.currentConn.(syscall.Conn); ok {
-		return &ObfsUDPHopClientPacketConnWithSyscall{conn}, nil
+	go conn.hopRoutine()
+	if _, ok := conn.currentConn.(oobCapablePacketConn); ok {
+		return &ObfsUDPHopClientPacketConnWithOOB{conn}, nil
 	}
 	return conn, nil
 }
 
 func (c *ObfsUDPHopClientPacketConn) recvRoutine(conn net.PacketConn) {
+	if oobConn, ok := conn.(oobCapablePacketConn); ok {
+		c.recvRoutineOOB(oobConn)
+		return
+	}
 	for {
 		buf := c.bufPool.Get().([]byte)
 		n, addr, err := conn.ReadFrom(buf)
@@ -120,7 +142,7 @@ func (c *ObfsUDPHopClientPacketConn) recvRoutine(conn net.PacketConn) {
 			return
 		}
 		select {
-		case c.recvQueue <- &udpPacket{buf, n, addr}:
+		case c.recvQueue <- &udpPacket{buf: buf, n: n, addr: addr}:
 		default:
 			// Drop the packet if the queue is full
 			c.bufPool.Put(buf)
@@ -128,86 +150,58 @@ func (c *ObfsUDPHopClientPacketConn) recvRoutine(conn net.PacketConn) {
 	}
 }
 
-func (c *ObfsUDPHopClientPacketConn) hopRoutine(dialer utils.PacketDialer, rAddr net.Addr) {
+func (c *ObfsUDPHopClientPacketConn) recvRoutineOOB(conn oobCapablePacketConn) {
+	for {
+		buf := c.bufPool.Get().([]byte)
+		oob := c.oobPool.Get().([]byte)
+		n, oobn, flags, addr, err := conn.ReadMsgUDP(buf, oob)
+		if err != nil {
+			c.bufPool.Put(buf)
+			c.oobPool.Put(oob)
+			return
+		}
+		select {
+		case c.recvQueue <- &udpPacket{buf: buf, n: n, oob: oob, oobn: oobn, flags: flags, addr: addr}:
+		default:
+			c.bufPool.Put(buf)
+			c.oobPool.Put(oob)
+		}
+	}
+}
+
+func (c *ObfsUDPHopClientPacketConn) hopRoutine() {
 	ticker := time.NewTicker(c.hopInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			c.hop(dialer, rAddr)
+			c.hop()
 		case <-c.closeChan:
 			return
 		}
 	}
 }
 
-func (c *ObfsUDPHopClientPacketConn) hop(dialer utils.PacketDialer, rAddr net.Addr) {
+func (c *ObfsUDPHopClientPacketConn) hop() {
 	c.connMutex.Lock()
 	defer c.connMutex.Unlock()
 	if c.closed {
 		return
 	}
-	newConn, err := dialer.ListenPacket(rAddr)
-	if err != nil {
-		// Skip this hop if failed to listen
-		return
-	}
-	// Close prevConn,
-	// prevConn <- currentConn
-	// currentConn <- newConn
-	// update addrIndex
-	//
-	// We need to keep receiving packets from the previous connection,
-	// because otherwise there will be packet loss due to the time gap
-	// between we hop to a new port and the server acknowledges this change.
-	if c.prevConn != nil {
-		_ = c.prevConn.Close() // recvRoutine will exit on error
-	}
-	c.prevConn = c.currentConn
-	if c.obfs != nil {
-		c.currentConn = NewObfsUDPConn(newConn, c.obfs)
-	} else {
-		c.currentConn = newConn
-	}
-	// Set buffer sizes if previously set
-	if c.readBufferSize > 0 {
-		_ = trySetPacketConnReadBuffer(c.currentConn, c.readBufferSize)
-	}
-	if c.writeBufferSize > 0 {
-		_ = trySetPacketConnWriteBuffer(c.currentConn, c.writeBufferSize)
-	}
-	go c.recvRoutine(c.currentConn)
+	// Keep the local UDP socket so the OOB socket options installed by
+	// quic-go remain active. Port hopping only needs to change the remote
+	// destination port.
 	c.addrIndex = randv2.IntN(len(c.serverAddrs))
 }
 
 func (c *ObfsUDPHopClientPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	for {
-		select {
-		case p := <-c.recvQueue:
-			/*
-				// Check if the packet is from one of the server addresses
-				for _, addr := range c.serverAddrs {
-					if addr.String() == p.addr.String() {
-						// Copy the packet to the buffer
-						n := copy(b, p.buf[:p.n])
-						c.bufPool.Put(p.buf)
-						return n, c.serverAddr, nil
-					}
-				}
-				// Drop the packet, continue
-				c.bufPool.Put(p.buf)
-			*/
-			// The above code was causing performance issues when the range is large,
-			// so we skip the check for now. Should probably still check by using a map
-			// or something in the future.
-			n := copy(b, p.buf[:p.n])
-			c.bufPool.Put(p.buf)
-			return n, c.serverAddr, nil
-		case <-c.closeChan:
-			return 0, nil, net.ErrClosed
-		}
-		// Ignore packets from other addresses
+	p, err := c.readPacket()
+	if err != nil {
+		return 0, nil, err
 	}
+	n := copy(b, p.buf[:p.n])
+	c.releasePacket(p)
+	return n, c.serverAddr, nil
 }
 
 func (c *ObfsUDPHopClientPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -232,12 +226,9 @@ func (c *ObfsUDPHopClientPacketConn) Close() error {
 	if c.closed {
 		return nil
 	}
-	// Close prevConn and currentConn
+	// Close currentConn
 	// Close closeChan to unblock ReadFrom & hopRoutine
 	// Set closed flag to true to prevent double close
-	if c.prevConn != nil {
-		_ = c.prevConn.Close()
-	}
 	err := c.currentConn.Close()
 	close(c.closeChan)
 	c.closed = true
@@ -273,9 +264,6 @@ func (c *ObfsUDPHopClientPacketConn) SetReadBuffer(bytes int) error {
 	c.connMutex.Lock()
 	defer c.connMutex.Unlock()
 	c.readBufferSize = bytes
-	if c.prevConn != nil {
-		_ = trySetPacketConnReadBuffer(c.prevConn, bytes)
-	}
 	return trySetPacketConnReadBuffer(c.currentConn, bytes)
 }
 
@@ -283,9 +271,6 @@ func (c *ObfsUDPHopClientPacketConn) SetWriteBuffer(bytes int) error {
 	c.connMutex.Lock()
 	defer c.connMutex.Unlock()
 	c.writeBufferSize = bytes
-	if c.prevConn != nil {
-		_ = trySetPacketConnWriteBuffer(c.prevConn, bytes)
-	}
 	return trySetPacketConnWriteBuffer(c.currentConn, bytes)
 }
 
@@ -309,11 +294,11 @@ func trySetPacketConnWriteBuffer(pc net.PacketConn, bytes int) error {
 	return nil
 }
 
-type ObfsUDPHopClientPacketConnWithSyscall struct {
+type ObfsUDPHopClientPacketConnWithOOB struct {
 	*ObfsUDPHopClientPacketConn
 }
 
-func (c *ObfsUDPHopClientPacketConnWithSyscall) SyscallConn() (syscall.RawConn, error) {
+func (c *ObfsUDPHopClientPacketConnWithOOB) SyscallConn() (syscall.RawConn, error) {
 	c.connMutex.RLock()
 	defer c.connMutex.RUnlock()
 	sc, ok := c.currentConn.(syscall.Conn)
@@ -322,6 +307,53 @@ func (c *ObfsUDPHopClientPacketConnWithSyscall) SyscallConn() (syscall.RawConn, 
 	}
 	return sc.SyscallConn()
 }
+
+func (c *ObfsUDPHopClientPacketConnWithOOB) ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error) {
+	p, err := c.readPacket()
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	n = copy(b, p.buf[:p.n])
+	oobn = copy(oob, p.oob[:p.oobn])
+	flags = p.flags
+	c.releasePacket(p)
+	return n, oobn, flags, c.remoteAddr, nil
+}
+
+func (c *ObfsUDPHopClientPacketConnWithOOB) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (n, oobn int, err error) {
+	c.connMutex.RLock()
+	defer c.connMutex.RUnlock()
+	if c.closed {
+		return 0, 0, net.ErrClosed
+	}
+	oobConn, ok := c.currentConn.(oobCapablePacketConn)
+	if !ok {
+		return 0, 0, errors.New("OOB packet I/O is not supported")
+	}
+	addr, ok := c.serverAddrs[c.addrIndex].(*net.UDPAddr)
+	if !ok {
+		return 0, 0, errors.New("server address is not UDP")
+	}
+	return oobConn.WriteMsgUDP(b, oob, addr)
+}
+
+func (c *ObfsUDPHopClientPacketConn) readPacket() (*udpPacket, error) {
+	select {
+	case p := <-c.recvQueue:
+		return p, nil
+	case <-c.closeChan:
+		return nil, net.ErrClosed
+	}
+}
+
+func (c *ObfsUDPHopClientPacketConn) releasePacket(p *udpPacket) {
+	c.bufPool.Put(p.buf)
+	if p.oob != nil {
+		c.oobPool.Put(p.oob)
+	}
+}
+
+var _ oobCapablePacketConn = (*ObfsUDPHopClientPacketConnWithOOB)(nil)
 
 // parsePorts parses the multi-port server address and returns the host and ports.
 // Supports both comma-separated single ports and dash-separated port ranges.

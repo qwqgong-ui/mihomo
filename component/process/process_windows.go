@@ -197,6 +197,13 @@ func readNativeUint32(b []byte) uint32 {
 	return *(*uint32)(unsafe.Pointer(&b[0]))
 }
 
+func findProcessNameByAddr(network string, src, _ netip.AddrPort, _ ProcessMatcher) (uint32, string, error) {
+	if !src.IsValid() {
+		return 0, "", ErrNotFound
+	}
+	return findProcessName(network, src.Addr(), int(src.Port()))
+}
+
 func getExecPathFromPID(pid uint32) (string, error) {
 	// kernel process starts with a colon in order to distinguish with normal processes
 	switch pid {

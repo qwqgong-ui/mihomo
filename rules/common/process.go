@@ -1,6 +1,7 @@
 package common
 
 import (
+	"path/filepath"
 	"strings"
 
 	"github.com/metacubex/mihomo/component/wildcard"
@@ -40,15 +41,43 @@ func (ps *Process) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, 
 	default:
 		target = metadata.ProcessPath
 	}
+	return ps.matchTarget(target), ps.adapter
+}
 
+func (ps *Process) matchTarget(target string) bool {
 	switch ps.ruleType {
 	case C.ProcessNameRegex, C.ProcessPathRegex:
 		match, _ := ps.regexp.MatchString(target)
-		return match, ps.adapter
+		return match
 	case C.ProcessNameWildcard, C.ProcessPathWildcard:
-		return wildcard.Match(strings.ToLower(ps.pattern), strings.ToLower(target)), ps.adapter
+		return wildcard.Match(strings.ToLower(ps.pattern), strings.ToLower(target))
 	default:
-		return strings.EqualFold(target, ps.pattern), ps.adapter
+		return strings.EqualFold(target, ps.pattern)
+	}
+}
+
+func (ps *Process) HasProcessRule() bool { return true }
+
+// MatchProcess checks an executable path against this process rule without
+// resolving socket ownership. Linux uses it to avoid scanning fd directories
+// of processes that cannot possibly match the rule.
+func (ps *Process) MatchProcess(processPath string) bool {
+	target := processPath
+	switch ps.ruleType {
+	case C.ProcessName, C.ProcessNameRegex, C.ProcessNameWildcard:
+		target = filepath.Base(processPath)
+	}
+	return ps.matchTarget(target)
+}
+
+// MatchProcessName checks an already resolved Android package/process name.
+// Path rules conservatively return true so they retain the old path lookup.
+func (ps *Process) MatchProcessName(name string) bool {
+	switch ps.ruleType {
+	case C.ProcessName, C.ProcessNameRegex, C.ProcessNameWildcard:
+		return ps.matchTarget(name)
+	default:
+		return true
 	}
 }
 

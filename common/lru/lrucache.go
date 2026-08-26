@@ -289,3 +289,29 @@ type entry[K comparable, V any] struct {
 	value   V
 	expires int64
 }
+
+// Snapshot returns every entry together with its expiry, ordered
+// least-recently-used first so a restore replays the same recency order.
+//
+// The returned slice is a copy; callers may hold it after the cache mutates.
+// Unlike Get, Snapshot does not refresh recency or drop expired entries — a
+// caller persisting the cache needs the stale ones too, along with the expiry
+// that says they are stale.
+func (c *LruCache[K, V]) Snapshot() []Item[K, V] {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	items := make([]Item[K, V], 0, len(c.cache))
+	for e := c.lru.Front(); e != nil; e = e.Next() {
+		elm := e.Value
+		items = append(items, Item[K, V]{Key: elm.key, Value: elm.value, Expires: time.Unix(elm.expires, 0)})
+	}
+	return items
+}
+
+// Item is one cache entry as returned by Snapshot.
+type Item[K comparable, V any] struct {
+	Key     K
+	Value   V
+	Expires time.Time
+}

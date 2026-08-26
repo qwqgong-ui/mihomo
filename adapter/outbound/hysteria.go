@@ -252,6 +252,7 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 			Interface:    option.Interface,
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
+			RemoteDNS:    true,
 		}),
 		option:    &option,
 		client:    client,
@@ -281,7 +282,7 @@ func (c *hyPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		return
 	}
 	n = copy(p, b)
-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
+	addr = hysteriaPacketAddr(addrStr)
 	return
 }
 
@@ -291,8 +292,16 @@ func (c *hyPacketConn) WaitReadFrom() (data []byte, put func(), addr net.Addr, e
 		return
 	}
 	data = b
-	addr = M.ParseSocksaddr(addrStr).UDPAddr()
+	addr = hysteriaPacketAddr(addrStr)
 	return
+}
+
+func hysteriaPacketAddr(addr string) net.Addr {
+	destination := M.ParseSocksaddr(addr)
+	if destination.IsFqdn() {
+		return destination
+	}
+	return destination.UDPAddr()
 }
 
 func (c *hyPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
