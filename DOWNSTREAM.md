@@ -37,6 +37,9 @@ Patches:
 ## Optional Protocol Build Tags
 
 为 WireGuard、OpenVPN、Mieru 和 Sudoku 增加可选构建标签及 parser-compatible stub，并保留共享 IP stack 所需实现。
+WireGuard 实现只在未使用 `no_wireguard` 时编译；裁剪构建使用同名 stub 保留配置解析类型，
+但会在实例化时返回明确的功能已禁用错误。IP stack 实现独立于 `wireguard.go`，
+以便 `no_wireguard` 和 `with_gvisor` 能独立组合验证。
 
 Patches:
 
