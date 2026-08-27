@@ -328,6 +328,17 @@ Patches:
   再关。补上该调用。mihomo 侧 `PrepareConnection` 对 TCP 仍返回 nil，行为
   不变，但拒绝能力就位了。UDP 未接：上游挂在自己的 udpnat2 上，本 fork 栈内
   没有 UDP 会话表，mihomo 的 NAT 在 tunnel 里，为找首包再建一张表得不偿失。
+- `0010` UDP 流的数据报送不出去时没有任何东西能告诉发送方，因为它面对的是一个
+  收下了包的 tun 设备。栈正站在那台无法转发的路由器的位置上，也是唯一还留着差错
+  必须引用的 IP 与 UDP 头的地方，所以给 handler 一个 `ReportICMPError`：Packet Too
+  Big、端口/主机/网络不可达。源地址取发送方路由指向的下一跳（栈自己的 next address），
+  该族没有地址时退回发送方本来要去的地址。只做 system 栈，gvisor 的写回走的是栈内
+  路由而不是手搓包。
+- `0011` handler 用自己的 socket 重发载荷，丢掉了发送方 IP 头里的 DF 位，于是做
+  PMTU 探测的发送方（QUIC）超长探测被本机内核静默分片当成成功。把该位从引用头里
+  报给 handler，让它在自己的 socket 上照办；IPv6 无条件，因为端点之间没有任何节点
+  被允许分片。
+
 - `0006` Go 1.24 起 listener 默认开 MPTCP，而 redirect server 从不显式设置，
   于是跟随默认值。MPTCP socket 上 `getsockopt(SOL_IP, SO_ORIGINAL_DST)` 返回
   `EOPNOTSUPP`，`loopIn()` 取不到目的地会把 MPTCP 客户端的每条重定向连接直接丢弃。

@@ -1,0 +1,412 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 27 Aug 2026 14:40:18 +0800
+Subject: [PATCH] system: let the handler report an ICMP error for a UDP
+ flow
+
+A datagram the handler cannot forward produces no signal of its own. The
+sender is talking to a tun device that accepted the packet, so nothing
+tells it the path could not carry it: it keeps sending the same size, or
+waits out a timeout that a Destination Unreachable would have ended
+immediately. Path MTU discovery is the case that matters - IPv6 has no
+in-network fragmentation, so a path smaller than what the sender picked
+is a blackhole until the sender's own probing gives up.
+
+The stack is exactly where a router that could not forward the datagram
+stands, and it is the only place that still holds the IP and UDP headers
+such an error has to quote, so give the handler a way to ask for one:
+ReportICMPError on the packet writer it already holds, with the four
+conditions worth reporting. The error is sent from the address the
+sender's own route points at - the stack's own next address, the first
+hop as far as the sender is concerned - falling back to the address the
+sender was trying to reach when the stack has none on that family.
+
+Only the system stack implements it; gvisor builds its write back through
+a stack route rather than by hand.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ stack_system.go        |   4 +
+ udp_icmp_error.go      | 180 +++++++++++++++++++++++++++++++++++++++++
+ udp_icmp_error_test.go | 149 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 333 insertions(+)
+ create mode 100644 udp_icmp_error.go
+ create mode 100644 udp_icmp_error_test.go
+
+diff --git a/stack_system.go b/stack_system.go
+index 43fe9fd..36b00e5 100644
+--- a/stack_system.go
++++ b/stack_system.go
+@@ -621,6 +621,7 @@ func (s *System) processIPv4UDP(ipHdr header.IPv4, udpHdr header.UDP) error {
+ 			s.frontHeadroom + PacketOffset,
+ 			headerCopy,
+ 			source,
++			s.inet4NextAddress,
+ 			s.txChecksumOffload,
+ 		}
+ 	})
+@@ -650,6 +651,7 @@ func (s *System) processIPv6UDP(ipHdr header.IPv6, udpHdr header.UDP) error {
+ 			s.frontHeadroom + PacketOffset,
+ 			headerCopy,
+ 			source,
++			s.inet6NextAddress,
+ 			s.txChecksumOffload,
+ 		}
+ 	})
+@@ -817,6 +819,7 @@ type systemUDPPacketWriter4 struct {
+ 	frontHeadroom     int
+ 	header            []byte
+ 	source            netip.AddrPort
++	gateway           netip.Addr
+ 	txChecksumOffload bool
+ }
+ 
+@@ -855,6 +858,7 @@ type systemUDPPacketWriter6 struct {
+ 	frontHeadroom     int
+ 	header            []byte
+ 	source            netip.AddrPort
++	gateway           netip.Addr
+ 	txChecksumOffload bool
+ }
+ 
+diff --git a/udp_icmp_error.go b/udp_icmp_error.go
+new file mode 100644
+index 0000000..fec82bb
+--- /dev/null
++++ b/udp_icmp_error.go
+@@ -0,0 +1,180 @@
++package tun
++
++import (
++	"net/netip"
++
++	"github.com/metacubex/sing-tun/internal/gtcpip/checksum"
++	"github.com/metacubex/sing-tun/internal/gtcpip/header"
++	"github.com/metacubex/sing/common"
++	"github.com/metacubex/sing/common/buf"
++	E "github.com/metacubex/sing/common/exceptions"
++)
++
++// ICMPError is a condition the handler can ask the stack to report back to the
++// source of a UDP flow, as the ICMP error a router in the stack's position
++// would have sent.
++type ICMPError int
++
++const (
++	ICMPErrorPacketTooBig ICMPError = iota
++	ICMPErrorPortUnreachable
++	ICMPErrorHostUnreachable
++	ICMPErrorNetworkUnreachable
++)
++
++// UDPErrorReporter is implemented by the packet writers the system stack hands
++// to the handler for a UDP flow.
++//
++// A datagram the handler cannot forward produces no signal of its own: the
++// sender is talking to a tun device that accepted the packet, so nothing tells
++// it that the path could not carry it, and it keeps sending the same size or
++// waits out a timeout. Reporting the error has to happen here, where the IP and
++// UDP headers the error must quote are still at hand.
++//
++// mtu is only read for ICMPErrorPacketTooBig, and is the largest datagram the
++// source may send, measured the way the source measures it.
++type UDPErrorReporter interface {
++	ReportICMPError(icmpError ICMPError, mtu uint32) error
++}
++
++var (
++	_ UDPErrorReporter = (*systemUDPPacketWriter4)(nil)
++	_ UDPErrorReporter = (*systemUDPPacketWriter6)(nil)
++)
++
++func (w *systemUDPPacketWriter4) ReportICMPError(icmpError ICMPError, mtu uint32) error {
++	newPacket, err := buildUDPICMPErrorV4(w.header, w.gateway, icmpError, mtu, w.frontHeadroom)
++	if err != nil {
++		return err
++	}
++	defer newPacket.Release()
++	if PacketOffset > 0 {
++		PacketFillHeader(newPacket.ExtendHeader(PacketOffset), header.IPv4Version)
++	} else {
++		newPacket.Advance(-w.frontHeadroom)
++	}
++	return common.Error(w.tun.Write(newPacket.Bytes()))
++}
++
++func buildUDPICMPErrorV4(quoted []byte, gateway netip.Addr, icmpError ICMPError, mtu uint32, frontHeadroom int) (*buf.Buffer, error) {
++	if len(quoted) < header.IPv4MinimumSize+header.UDPMinimumSize {
++		return nil, E.New("invalid quoted header")
++	}
++	var icmpCode header.ICMPv4Code
++	switch icmpError {
++	case ICMPErrorPacketTooBig:
++		icmpCode = header.ICMPv4FragmentationNeeded
++	case ICMPErrorPortUnreachable:
++		icmpCode = header.ICMPv4PortUnreachable
++	case ICMPErrorHostUnreachable:
++		icmpCode = header.ICMPv4HostUnreachable
++	case ICMPErrorNetworkUnreachable:
++		icmpCode = header.ICMPv4NetUnreachable
++	default:
++		return nil, E.New("unknown ICMP error: ", int(icmpError))
++	}
++	// RFC 792 asks for the internet header plus the first 64 bits of the
++	// datagram, which for UDP is exactly the header kept for the write back.
++	quotedIPHdr := header.IPv4(quoted)
++	newPacket := buf.NewSize(frontHeadroom + header.IPv4MinimumSize + header.ICMPv4MinimumSize + len(quoted))
++	newPacket.Resize(frontHeadroom, header.IPv4MinimumSize+header.ICMPv4MinimumSize+len(quoted))
++	newIPHdr := header.IPv4(newPacket.Bytes())
++	newIPHdr.Encode(&header.IPv4Fields{
++		TotalLength: uint16(newPacket.Len()),
++		TTL:         defaultICMPErrorTTL,
++		Protocol:    uint8(header.ICMPv4ProtocolNumber),
++		// The error comes from the first hop the sender's own route points at,
++		// which is what the stack is: a sender that reads the source address
++		// then sees an error from the router it was handing the datagram to.
++		SrcAddr: icmpErrorSource(gateway, quotedIPHdr.DestinationAddr()),
++		DstAddr: quotedIPHdr.SourceAddr(),
++	})
++	newIPHdr.SetChecksum(^newIPHdr.CalculateChecksum())
++	icmpHdr := header.ICMPv4(newIPHdr.Payload())
++	icmpHdr.SetType(header.ICMPv4DstUnreachable)
++	icmpHdr.SetCode(icmpCode)
++	icmpHdr.SetMTU(0)
++	if icmpError == ICMPErrorPacketTooBig {
++		icmpHdr.SetMTU(uint16(mtu))
++	}
++	copy(icmpHdr.Payload(), quoted)
++	icmpHdr.SetChecksum(0)
++	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr[:header.ICMPv4MinimumSize], checksum.Checksum(quoted, 0)))
++	return newPacket, nil
++}
++
++func (w *systemUDPPacketWriter6) ReportICMPError(icmpError ICMPError, mtu uint32) error {
++	newPacket, err := buildUDPICMPErrorV6(w.header, w.gateway, icmpError, mtu, w.frontHeadroom)
++	if err != nil {
++		return err
++	}
++	defer newPacket.Release()
++	if PacketOffset > 0 {
++		PacketFillHeader(newPacket.ExtendHeader(PacketOffset), header.IPv6Version)
++	} else {
++		newPacket.Advance(-w.frontHeadroom)
++	}
++	return common.Error(w.tun.Write(newPacket.Bytes()))
++}
++
++func buildUDPICMPErrorV6(quoted []byte, gateway netip.Addr, icmpError ICMPError, mtu uint32, frontHeadroom int) (*buf.Buffer, error) {
++	if len(quoted) < header.IPv6MinimumSize+header.UDPMinimumSize {
++		return nil, E.New("invalid quoted header")
++	}
++	var (
++		icmpType header.ICMPv6Type
++		icmpCode header.ICMPv6Code
++	)
++	switch icmpError {
++	case ICMPErrorPacketTooBig:
++		icmpType = header.ICMPv6PacketTooBig
++	case ICMPErrorPortUnreachable:
++		icmpType, icmpCode = header.ICMPv6DstUnreachable, header.ICMPv6PortUnreachable
++	case ICMPErrorHostUnreachable:
++		icmpType, icmpCode = header.ICMPv6DstUnreachable, header.ICMPv6AddressUnreachable
++	case ICMPErrorNetworkUnreachable:
++		icmpType, icmpCode = header.ICMPv6DstUnreachable, header.ICMPv6NetworkUnreachable
++	default:
++		return nil, E.New("unknown ICMP error: ", int(icmpError))
++	}
++	quotedIPHdr := header.IPv6(quoted)
++	newPacket := buf.NewSize(frontHeadroom + header.IPv6MinimumSize + header.ICMPv6MinimumSize + len(quoted))
++	newPacket.Resize(frontHeadroom, header.IPv6MinimumSize+header.ICMPv6MinimumSize+len(quoted))
++	newIPHdr := header.IPv6(newPacket.Bytes())
++	newIPHdr.Encode(&header.IPv6Fields{
++		PayloadLength:     uint16(header.ICMPv6MinimumSize + len(quoted)),
++		TransportProtocol: header.ICMPv6ProtocolNumber,
++		HopLimit:          defaultICMPErrorTTL,
++		SrcAddr:           icmpErrorSource(gateway, quotedIPHdr.DestinationAddr()),
++		DstAddr:           quotedIPHdr.SourceAddr(),
++	})
++	icmpHdr := header.ICMPv6(newIPHdr.Payload())
++	icmpHdr.SetType(icmpType)
++	icmpHdr.SetCode(icmpCode)
++	icmpHdr.SetTypeSpecific(0)
++	if icmpError == ICMPErrorPacketTooBig {
++		icmpHdr.SetMTU(mtu)
++	}
++	copy(icmpHdr.Payload(), quoted)
++	icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
++		Header:      icmpHdr[:header.ICMPv6MinimumSize],
++		Src:         newIPHdr.SourceAddressSlice(),
++		Dst:         newIPHdr.DestinationAddressSlice(),
++		PayloadCsum: checksum.Checksum(quoted, 0),
++		PayloadLen:  len(quoted),
++	}))
++	return newPacket, nil
++}
++
++// icmpErrorSource falls back to the address the sender was trying to reach when
++// the stack has no address of its own on that family.
++func icmpErrorSource(gateway netip.Addr, destination netip.Addr) netip.Addr {
++	if gateway.IsValid() {
++		return gateway
++	}
++	return destination
++}
++
++// defaultICMPErrorTTL is what a first-hop router would put in an error it
++// originates; the value is not inspected by anything that receives it locally.
++const defaultICMPErrorTTL = 64
+diff --git a/udp_icmp_error_test.go b/udp_icmp_error_test.go
+new file mode 100644
+index 0000000..043d2ad
+--- /dev/null
++++ b/udp_icmp_error_test.go
+@@ -0,0 +1,149 @@
++package tun
++
++import (
++	"encoding/binary"
++	"net/netip"
++	"testing"
++
++	"github.com/metacubex/sing-tun/internal/gtcpip/header"
++
++	"github.com/stretchr/testify/require"
++)
++
++func quotedUDPHeaderV4(t *testing.T, source, destination netip.AddrPort, payloadLen int) []byte {
++	t.Helper()
++	quoted := make([]byte, header.IPv4MinimumSize+header.UDPMinimumSize)
++	ipHdr := header.IPv4(quoted)
++	ipHdr.Encode(&header.IPv4Fields{
++		TotalLength: uint16(header.IPv4MinimumSize + header.UDPMinimumSize + payloadLen),
++		TTL:         64,
++		Protocol:    uint8(header.UDPProtocolNumber),
++		SrcAddr:     source.Addr(),
++		DstAddr:     destination.Addr(),
++	})
++	ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
++	// Payload() would run off the end here: the quoted header keeps the total
++	// length of the datagram it was cut from.
++	udpHdr := header.UDP(quoted[header.IPv4MinimumSize:])
++	udpHdr.SetSourcePort(source.Port())
++	udpHdr.SetDestinationPort(destination.Port())
++	udpHdr.SetLength(uint16(header.UDPMinimumSize + payloadLen))
++	return quoted
++}
++
++func TestBuildUDPICMPErrorV4(t *testing.T) {
++	source := netip.MustParseAddrPort("192.0.2.100:51000")
++	destination := netip.MustParseAddrPort("198.18.0.31:443")
++	quoted := quotedUDPHeaderV4(t, source, destination, 1400)
++
++	packet, err := buildUDPICMPErrorV4(quoted, netip.MustParseAddr("198.18.0.2"), ICMPErrorPacketTooBig, 1480, 0)
++	require.NoError(t, err)
++	defer packet.Release()
++	ipHdr := header.IPv4(packet.Bytes())
++	require.True(t, ipHdr.IsValid(packet.Len()))
++	require.Equal(t, netip.MustParseAddr("198.18.0.2"), ipHdr.SourceAddr(), "the error comes from the first hop, not the destination")
++	require.Equal(t, source.Addr(), ipHdr.DestinationAddr())
++	require.Equal(t, uint8(header.ICMPv4ProtocolNumber), ipHdr.Protocol())
++	require.Equal(t, ipHdr.Checksum(), ^ipHdr.CalculateChecksum(), "header checksum must verify")
++
++	icmpHdr := header.ICMPv4(ipHdr.Payload())
++	require.Equal(t, header.ICMPv4DstUnreachable, icmpHdr.Type())
++	require.Equal(t, header.ICMPv4FragmentationNeeded, icmpHdr.Code())
++	require.Equal(t, uint16(1480), icmpHdr.MTU())
++	require.Equal(t, quoted, []byte(icmpHdr.Payload()))
++	require.Equal(t, uint16(0), icmpChecksumV4(icmpHdr))
++
++	// The embedded datagram is what lets the sender find the socket to fix.
++	embedded := header.IPv4(icmpHdr.Payload())
++	require.Equal(t, destination.Addr(), embedded.DestinationAddr())
++	embeddedUDP := header.UDP(icmpHdr.Payload()[header.IPv4MinimumSize:])
++	require.Equal(t, source.Port(), embeddedUDP.SourcePort())
++	require.Equal(t, destination.Port(), embeddedUDP.DestinationPort())
++
++	// With no address of its own the stack still answers, as the destination.
++	fallback, err := buildUDPICMPErrorV4(quoted, netip.Addr{}, ICMPErrorPacketTooBig, 1480, 0)
++	require.NoError(t, err)
++	require.Equal(t, destination.Addr(), header.IPv4(fallback.Bytes()).SourceAddr())
++	fallback.Release()
++
++	unreachable, err := buildUDPICMPErrorV4(quoted, netip.MustParseAddr("198.18.0.2"), ICMPErrorPortUnreachable, 0, 0)
++	require.NoError(t, err)
++	defer unreachable.Release()
++	unreachableICMP := header.ICMPv4(header.IPv4(unreachable.Bytes()).Payload())
++	require.Equal(t, header.ICMPv4PortUnreachable, unreachableICMP.Code())
++	require.Equal(t, uint16(0), unreachableICMP.MTU())
++	require.Equal(t, uint16(0), icmpChecksumV4(unreachableICMP))
++
++	_, err = buildUDPICMPErrorV4(quoted[:20], netip.MustParseAddr("198.18.0.2"), ICMPErrorPacketTooBig, 1480, 0)
++	require.Error(t, err)
++}
++
++func TestBuildUDPICMPErrorV6(t *testing.T) {
++	source := netip.MustParseAddrPort("[2001:db8::100]:51000")
++	destination := netip.MustParseAddrPort("[2001:2::d7]:443")
++	quoted := make([]byte, header.IPv6MinimumSize+header.UDPMinimumSize)
++	ipHdr := header.IPv6(quoted)
++	ipHdr.Encode(&header.IPv6Fields{
++		PayloadLength:     uint16(header.UDPMinimumSize + 1400),
++		TransportProtocol: header.UDPProtocolNumber,
++		HopLimit:          64,
++		SrcAddr:           source.Addr(),
++		DstAddr:           destination.Addr(),
++	})
++	udpHdr := header.UDP(quoted[header.IPv6MinimumSize:])
++	udpHdr.SetSourcePort(source.Port())
++	udpHdr.SetDestinationPort(destination.Port())
++	udpHdr.SetLength(uint16(header.UDPMinimumSize + 1400))
++
++	packet, err := buildUDPICMPErrorV6(quoted, netip.MustParseAddr("2001:2::1"), ICMPErrorPacketTooBig, 1480, 0)
++	require.NoError(t, err)
++	defer packet.Release()
++	newIPHdr := header.IPv6(packet.Bytes())
++	require.True(t, newIPHdr.IsValid(packet.Len()))
++	require.Equal(t, netip.MustParseAddr("2001:2::1"), newIPHdr.SourceAddr(), "the error comes from the first hop, not the destination")
++	require.Equal(t, source.Addr(), newIPHdr.DestinationAddr())
++
++	icmpHdr := header.ICMPv6(newIPHdr.Payload())
++	require.Equal(t, header.ICMPv6PacketTooBig, icmpHdr.Type())
++	require.Equal(t, uint32(1480), icmpHdr.MTU())
++	require.Equal(t, quoted, []byte(icmpHdr.Payload()))
++	require.Equal(t, uint16(0), icmpChecksumV6(newIPHdr, icmpHdr))
++
++	unreachable, err := buildUDPICMPErrorV6(quoted, netip.MustParseAddr("2001:2::1"), ICMPErrorPortUnreachable, 0, 0)
++	require.NoError(t, err)
++	defer unreachable.Release()
++	unreachableIPHdr := header.IPv6(unreachable.Bytes())
++	unreachableICMP := header.ICMPv6(unreachableIPHdr.Payload())
++	require.Equal(t, header.ICMPv6DstUnreachable, unreachableICMP.Type())
++	require.Equal(t, header.ICMPv6PortUnreachable, unreachableICMP.Code())
++	require.Equal(t, uint16(0), icmpChecksumV6(unreachableIPHdr, unreachableICMP))
++}
++
++// icmpChecksumV4 recomputes the checksum over the message as received; a valid
++// one leaves zero.
++func icmpChecksumV4(icmpHdr header.ICMPv4) uint16 {
++	return ^onesComplementSum(icmpHdr)
++}
++
++func icmpChecksumV6(ipHdr header.IPv6, icmpHdr header.ICMPv6) uint16 {
++	pseudo := make([]byte, 40)
++	copy(pseudo[:16], ipHdr.SourceAddressSlice())
++	copy(pseudo[16:32], ipHdr.DestinationAddressSlice())
++	binary.BigEndian.PutUint32(pseudo[32:36], uint32(len(icmpHdr)))
++	pseudo[39] = uint8(header.ICMPv6ProtocolNumber)
++	return ^onesComplementSum(append(pseudo, icmpHdr...))
++}
++
++func onesComplementSum(data []byte) uint16 {
++	var sum uint32
++	for index := 0; index+1 < len(data); index += 2 {
++		sum += uint32(binary.BigEndian.Uint16(data[index : index+2]))
++	}
++	if len(data)%2 == 1 {
++		sum += uint32(data[len(data)-1]) << 8
++	}
++	for sum>>16 != 0 {
++		sum = sum&0xffff + sum>>16
++	}
++	return uint16(sum)
++}
