@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 27 Aug 2026 12:07:04 +0800
+Subject: [PATCH] ping: return ICMPv6 errors as well
+
+The v0.9.0-beta.2 rework upstream only handles ICMPv4 errors: the BPF
+program already lets the ICMPv6 error types through, but loopRead still
+drops everything that is not an echo reply, so an IPv6 traceroute through
+the tunnel shows nothing but stars.
+
+Handle Time Exceeded, Destination Unreachable and Packet Too Big the same
+way as the v4 side. The embedded datagram is a full IPv6 header plus the
+echo request, and both checksums are pseudo-header ones, so they are
+recomputed from the addresses in place rather than updated incrementally.
+
+ReadIP unmapped the wire identifier on every ICMPv6 message it received.
+For an error message those two bytes are not an identifier at all - they
+are the unused field, or the MTU of a Packet Too Big - so the unmapping
+now only applies to echo replies.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ ping/destination.go | 82 +++++++++++++++++++++++++++++++++++++--------
+ ping/ping.go        |  2 +-
+ 2 files changed, 69 insertions(+), 15 deletions(-)
+
+diff --git a/ping/destination.go b/ping/destination.go
+index cb3cd20..1791ee4 100644
+--- a/ping/destination.go
++++ b/ping/destination.go
+@@ -142,23 +142,31 @@ func (d *Destination) loopRead() {
+ 			}
+ 			icmpHdr := header.ICMPv6(ipHdr.Payload())
+ 			if d.needFilter() {
+-				if icmpHdr.Type() != header.ICMPv6EchoReply {
+-					continue
+-				}
+-				var requestExists bool
+-				request := pingRequest{Source: ipHdr.DestinationAddr(), Destination: ipHdr.SourceAddr(), Identifier: icmpHdr.Ident(), Sequence: icmpHdr.Sequence()}
+-				d.requestAccess.Lock()
+-				_, loaded := d.requests[request]
+-				if loaded {
+-					requestExists = true
+-					delete(d.requests, request)
+-				}
+-				d.requestAccess.Unlock()
+-				if !requestExists {
++				switch icmpHdr.Type() {
++				case header.ICMPv6EchoReply:
++					var requestExists bool
++					request := pingRequest{Source: ipHdr.DestinationAddr(), Destination: ipHdr.SourceAddr(), Identifier: icmpHdr.Ident(), Sequence: icmpHdr.Sequence()}
++					d.requestAccess.Lock()
++					_, loaded := d.requests[request]
++					if loaded {
++						requestExists = true
++						delete(d.requests, request)
++					}
++					d.requestAccess.Unlock()
++					if !requestExists {
++						continue
++					}
++					d.logger.TraceContext(d.ctx, "read ICMPv6 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
++				case header.ICMPv6TimeExceeded, header.ICMPv6DstUnreachable, header.ICMPv6PacketTooBig:
++					if !d.rewriteICMPv6Error(ipHdr, icmpHdr) {
++						continue
++					}
++				default:
+ 					continue
+ 				}
++			} else {
++				d.logger.TraceContext(d.ctx, "read ICMPv6 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
+ 			}
+-			d.logger.TraceContext(d.ctx, "read ICMPv6 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
+ 		}
+ 		err = d.routeContext.WritePacket(buffer.Bytes())
+ 		if err != nil {
+@@ -244,6 +252,52 @@ func (d *Destination) rewriteICMPv4Error(ipHdr header.IPv4, icmpHdr header.ICMPv
+ 	return true
+ }
+ 
++// rewriteICMPv6Error is rewriteICMPv4Error for ICMPv6: the embedded datagram is
++// a full IPv6 header followed by the echo request this destination sent, and
++// both checksums are pseudo-header ones, so they are recomputed from the
++// addresses left in place rather than incrementally.
++func (d *Destination) rewriteICMPv6Error(ipHdr header.IPv6, icmpHdr header.ICMPv6) bool {
++	inner := icmpHdr.Payload()
++	if len(inner) < header.IPv6MinimumSize+header.ICMPv6MinimumSize {
++		return false
++	}
++	innerIPHdr := header.IPv6(inner)
++	if innerIPHdr.TransportProtocol() != header.ICMPv6ProtocolNumber {
++		return false
++	}
++	innerICMP := header.ICMPv6(inner[header.IPv6MinimumSize:])
++	if innerICMP.Type() != header.ICMPv6EchoRequest {
++		return false
++	}
++	originalIdent := ^innerICMP.Ident()
++	request := pingRequest{
++		Source:      ipHdr.DestinationAddr(),
++		Destination: innerIPHdr.DestinationAddr(),
++		Identifier:  originalIdent,
++		Sequence:    innerICMP.Sequence(),
++	}
++	d.requestAccess.Lock()
++	_, loaded := d.requests[request]
++	d.requestAccess.Unlock()
++	if !loaded {
++		return false
++	}
++	innerICMP.SetIdent(originalIdent)
++	innerIPHdr.SetSourceAddr(ipHdr.DestinationAddr())
++	innerICMP.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
++		Header: innerICMP,
++		Src:    innerIPHdr.SourceAddressSlice(),
++		Dst:    innerIPHdr.DestinationAddressSlice(),
++	}))
++	icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
++		Header: icmpHdr,
++		Src:    ipHdr.SourceAddressSlice(),
++		Dst:    ipHdr.DestinationAddressSlice(),
++	}))
++	d.logger.TraceContext(d.ctx, "read ICMPv6 error type ", int(icmpHdr.Type()), " from ", ipHdr.SourceAddr(), " seq ", innerICMP.Sequence())
++	return true
++}
++
+ func (d *Destination) needFilter() bool {
+ 	return !d.conn.isLinuxUnprivileged()
+ }
+diff --git a/ping/ping.go b/ping/ping.go
+index 63d0981..a1b47fb 100644
+--- a/ping/ping.go
++++ b/ping/ping.go
+@@ -149,7 +149,7 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
+ 				trafficClass = controlMessage.TrafficClass
+ 			}
+ 			icmpHdr := header.ICMPv6(buffer.Bytes())
+-			if !c.isLinuxUnprivileged() {
++			if !c.isLinuxUnprivileged() && icmpHdr.Type() == header.ICMPv6EchoReply {
+ 				icmpHdr.SetIdent(^icmpHdr.Ident())
+ 			}
+ 			icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
