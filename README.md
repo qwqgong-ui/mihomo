@@ -312,7 +312,7 @@ PR 里冲突的分歧，合并时保留下游的 go 指令。
 
 抬升的动机是依赖：`golang.org/x/net`、`golang.org/x/text`、`golang.org/x/crypto`
 和 `miekg/dns` 的当前版本都声明 `go 1.25.0`，主模块停在 1.20 就无法 require
-它们，也就拿不到 x/net 的 HTTP/2 与 idna 安全修复。依赖升级本身在后续改动里做。
+它们，也就拿不到 x/net 的 HTTP/2 与 idna 安全修复。依赖升级见下节。
 
 本改动只动语言版本，不改运行时行为：
 
@@ -370,3 +370,54 @@ MPTCP       conn_mptcp=true   SO_ORIGINAL_DST -> ERROR operation not supported
 标准库 `crypto/x509`，所以 `rsa1024min`、`x509negativeserial`、`tlssha1` 会
 影响到用弱参数或畸形证书的对端。真遇到问题，单独把对应项加回 `godebug` 块
 即可，不必回退整个改动。
+
+## Dependency Security Upgrades
+
+go 指令抬到 1.26 之后可以取到的更新。govulncheck 符号级扫描（`-mode=binary`）
+从 **4 个可达漏洞降到 0**，模块层面的不可达项从 29 降到 1。
+
+修掉的可达项：
+
+| | 模块 | 修复版本 | 可达符号 |
+|---|---|---|---|
+| GO-2026-4918 | x/net | v0.53.0 | `http2.Transport.RoundTrip` —— 对端发畸形 `SETTINGS_MAX_FRAME_SIZE` 让 HTTP/2 客户端死循环 |
+| GO-2026-5026 | x/net | v0.55.0 | `idna.ToASCII` —— Punycode 标签校验绕过 |
+| GO-2025-3503 | x/net | v0.36.0 | `httpproxy.config.useProxy` —— IPv6 Zone ID 代理绕过 |
+| GO-2026-5970 | x/text | v0.39.0 | `norm.Form.*` —— 畸形输入死循环 |
+
+另外顺带修掉两个不可达项：`klauspost/compress` 的 s2 OOB read（GO-2026-5841）
+和 `insomniacslk/dhcp` 的畸形 IPv4 包 DoS（GO-2026-6237）。
+
+版本变动：
+
+```
+github.com/insomniacslk/dhcp  20250109 -> 20260728
+github.com/klauspost/compress v1.17.9  -> v1.19.2
+github.com/miekg/dns          v1.1.63  -> v1.1.73
+golang.org/x/crypto           v0.33.0  -> v0.55.0
+golang.org/x/net              v0.35.0  -> v0.58.0
+golang.org/x/sync             v0.11.0  -> v0.22.0
+golang.org/x/sys              v0.30.0  -> v0.47.0
+golang.org/x/mod/term/text/tools                    (indirect，随之拉起)
+```
+
+剩下唯一一项是 GO-2026-5932（`x/crypto/openpgp` 已废弃，无修复版本），不可达。
+
+## sing-mux h2mux
+
+只改依赖 `github.com/metacubex/sing-mux`，补丁在 `patches/sing-mux/`。
+
+x/net **v0.54.0** 起 `x/net/http2` 在 **Go 1.27 工具链**下会走 net/http 的请求
+校验（`//go:build go1.27 && !http2legacy`），而 sing-mux 的 h2mux 客户端为每条
+流构造的 `http.Request` 字面量没有 `Header` 字段，于是 `RoundTrip` 直接返回
+`http: nil Request.Header`，每条流都开不起来 —— 调用方看到请求体上的 closed
+pipe 和等响应头的超时。表现是
+`TestInboundVless_Encryption/**/singmux/h2mux/Sequential` 96 条全部挂 60s。
+
+`http.Request` 的 `Header` 本来就不允许为 nil，只是旧版 `x/net/http2` 没去看它。
+补上一个空 map 即可，对新旧两种实现都成立。
+
+排查过程中试过另外两条路，都比这个差：把 x/net 钉在 v0.53.0（最后一个可用版本）
+需要 `replace` 压过 x/crypto、miekg/dns 和 x/text 声明的 v0.57.0，且拿不到
+v0.55.0 的 idna 修复；用上游的 `http2legacy` 构建标签则要求每条构建命令都别忘了
+带，漏了就静默坏掉。补 sing-mux 一行两者都不需要。
