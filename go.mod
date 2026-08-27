@@ -1,6 +1,37 @@
 module github.com/metacubex/mihomo
 
-go 1.20
+go 1.26
+
+// Bumping the language version releases every GODEBUG that was pinned to the
+// go1.20 defaults. Pin them back so this change is language version only: the
+// binary's DefaultGODEBUG is byte for byte what it was. Relax them one at a
+// time, with the reason and the testing, in their own changes.
+godebug (
+	containermaxprocs=0
+	cryptocustomrand=1
+	decoratemappings=0
+	gotestjsonbuildtext=1
+	httpcookiemaxnum=0
+	httplaxcontentlength=1
+	httpmuxgo121=1
+	httpservecontentkeepheaders=1
+	multipathtcp=0
+	panicnil=1
+	randseednop=0
+	rsa1024min=0
+	tlsmlkem=0
+	tlssecpmlkem=0
+	tlssha1=1
+	updatemaxprocs=0
+	urlmaxqueryparams=0
+	urlstrictcolons=0
+	winreadlinkvolume=0
+	winsymlink=0
+	x509negativeserial=1
+	x509rsacrt=0
+	x509sha256skid=0
+	x509usepolicies=0
+)
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0
