@@ -299,3 +299,27 @@ Patches:
 write(2) 次数比 1.000（不同 flow，1/8/64 writer）到 0.967（同 flow 64 writer），
 而每包多出的一对 mutex 让 flows=1 慢 5%。真要拿到 UDP GSO，得让 mihomo 的
 UDP 回写 API 一次交多个包，而不是在 tun 这层等。
+
+## Go 1.26 Language Version
+
+`go.mod` 的 go 指令从上游的 `go 1.20` 抬到 `go 1.26`。上游整套 fork
+（sing、sing-tun、quic-go）都停在 1.20，所以这是一处会在每次 upstream sync
+PR 里冲突的分歧，合并时保留下游的 go 指令和 `godebug` 块。
+
+抬升的动机是依赖：`golang.org/x/net`、`golang.org/x/text`、`golang.org/x/crypto`
+和 `miekg/dns` 的当前版本都声明 `go 1.25.0`，主模块停在 1.20 就无法 require
+它们，也就拿不到 x/net 的 HTTP/2 与 idna 安全修复。依赖升级本身在后续改动里做。
+
+本改动只动语言版本，不改运行时行为：
+
+- go 指令一抬，26 个原本被钉在 go1.20 默认值上的 GODEBUG 会全部释放。`go.mod`
+  的 `godebug` 块把其中会变的 24 个钉回原值，编译产物的 `DefaultGODEBUG`
+  与改动前逐项一致。其中 `multipathtcp` 最需要钉住 —— Go 1.24 起它默认
+  在所有 listener 上开启 MPTCP。要放开某一项，连同理由和验证单独提。
+- 唯一无法用 `godebug` 钉住的是 Go 1.22 的循环变量按迭代语义。用
+  `-gcflags=github.com/metacubex/mihomo/...=-d=loopvar=2` 量化过：本仓库自身代码
+  只有 4 个循环受影响，全部 stack-allocated（循环变量没有被闭包或 goroutine
+  捕获），可观察差异为 0。依赖仍声明 go 1.20，不受影响。
+- Go 1.24 起 `printf` 分析器会检查非常量格式串，`go test` 默认跑 vet，
+  因此 25 处「把运行时字符串当格式串传」的调用必须先修，否则 CI 直接红。
+  这些是真问题：消息里含 `%` 时会输出成 `%!x(MISSING)`。
