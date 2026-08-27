@@ -1,10 +1,12 @@
 package redir
 
 import (
+	"context"
 	"net"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/component/keepalive"
+	"github.com/metacubex/mihomo/component/mptcp"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -38,7 +40,12 @@ func New(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener
 		}
 	}
 
-	l, err := net.Listen("tcp", addr)
+	// Golang will then enable mptcp support for listeners by default when the major version of go.mod is 1.24 or higher.
+	// getsockopt(SO_ORIGINAL_DST) answers EOPNOTSUPP on an mptcp socket, which would fail every redirected
+	// connection, so we force to disable mptcp for redir as tproxy already does.
+	lc := net.ListenConfig{}
+	mptcp.SetNetListenConfig(&lc, false)
+	l, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
