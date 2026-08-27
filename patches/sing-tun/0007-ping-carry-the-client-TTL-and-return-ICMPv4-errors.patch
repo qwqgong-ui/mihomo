@@ -1,0 +1,581 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 27 Aug 2026 12:06:20 +0800
+Subject: [PATCH] ping: carry the client TTL and return ICMPv4 errors
+
+Backport of the ICMP rework in sing-tun v0.9.0-beta.2, which this fork's
+v0.4.x base predates. Three defects it fixes, all of which make ICMP
+diagnostics through the tunnel lie:
+
+- WriteIP dropped the client's IP header and wrote only the ICMP message
+  to a socket left at the kernel's default TTL, so `ping -t 1` and every
+  traceroute hop reached the real destination. The TTL/hop limit now
+  follows the packet, cached in lastTTL/lastHopLimit so a steady ping
+  does not setsockopt per packet.
+- The sockets were connected, and a connected ICMP socket only receives
+  messages whose source is the peer, so the Time Exceeded replies transit
+  routers send never arrived at all. Linux privileged and Windows now use
+  unconnected sockets. Since Go's IPConn.ReadFrom strips the IPv4 header
+  and only ReadMsgIP keeps it, the raw v4 read path switches to readMsg.
+- loopRead dropped everything that was not an echo reply. Time Exceeded
+  and Destination Unreachable are now matched against the outstanding
+  requests through the datagram embedded in the error, with the wire
+  identifier and the local source address restored in place, and relayed
+  with the reporting router left as the source address.
+
+An unconnected raw ICMP socket receives a clone of every ICMP packet the
+host sees, so each flow would receive and discard every other flow's
+traffic. filter_linux.go attaches a BPF program that keeps only echo
+replies carrying this flow's wire identifier plus the two error types;
+the identifier XOR also means the replies we inject into the tunnel never
+match our own filter. If a Conn is reused for a second identifier the
+filter is detached and left off rather than narrowing the socket wrongly.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ ping/destination.go    |  81 ++++++++++++++++++++++-----
+ ping/filter_linux.go   |  99 +++++++++++++++++++++++++++++++++
+ ping/filter_other.go   |   8 +++
+ ping/ping.go           | 122 ++++++++++++++++++++++++++++++-----------
+ ping/socket_unix.go    |  35 +++++++-----
+ ping/socket_windows.go |  23 +++++---
+ 6 files changed, 299 insertions(+), 69 deletions(-)
+ create mode 100644 ping/filter_linux.go
+ create mode 100644 ping/filter_other.go
+
+diff --git a/ping/destination.go b/ping/destination.go
+index 7f62906..cb3cd20 100644
+--- a/ping/destination.go
++++ b/ping/destination.go
+@@ -105,23 +105,31 @@ func (d *Destination) loopRead() {
+ 			}
+ 			icmpHdr := header.ICMPv4(ipHdr.Payload())
+ 			if d.needFilter() {
+-				if icmpHdr.Type() != header.ICMPv4EchoReply {
+-					continue
+-				}
+-				var requestExists bool
+-				request := pingRequest{Source: ipHdr.DestinationAddr(), Destination: ipHdr.SourceAddr(), Identifier: icmpHdr.Ident(), Sequence: icmpHdr.Sequence()}
+-				d.requestAccess.Lock()
+-				_, loaded := d.requests[request]
+-				if loaded {
+-					requestExists = true
+-					delete(d.requests, request)
+-				}
+-				d.requestAccess.Unlock()
+-				if !requestExists {
++				switch icmpHdr.Type() {
++				case header.ICMPv4EchoReply:
++					var requestExists bool
++					request := pingRequest{Source: ipHdr.DestinationAddr(), Destination: ipHdr.SourceAddr(), Identifier: icmpHdr.Ident(), Sequence: icmpHdr.Sequence()}
++					d.requestAccess.Lock()
++					_, loaded := d.requests[request]
++					if loaded {
++						requestExists = true
++						delete(d.requests, request)
++					}
++					d.requestAccess.Unlock()
++					if !requestExists {
++						continue
++					}
++					d.logger.TraceContext(d.ctx, "read ICMPv4 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
++				case header.ICMPv4TimeExceeded, header.ICMPv4DstUnreachable:
++					if !d.rewriteICMPv4Error(ipHdr, icmpHdr) {
++						continue
++					}
++				default:
+ 					continue
+ 				}
++			} else {
++				d.logger.TraceContext(d.ctx, "read ICMPv4 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
+ 			}
+-			d.logger.TraceContext(d.ctx, "read ICMPv4 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
+ 		} else {
+ 			ipHdr := header.IPv6(buffer.Bytes())
+ 			if !ipHdr.IsValid(buffer.Len()) {
+@@ -191,6 +199,51 @@ func (d *Destination) WritePacket(packet *buf.Buffer) error {
+ 	return d.conn.WriteIP(packet)
+ }
+ 
++// rewriteICMPv4Error turns an ICMPv4 error message returned by a transit router
++// into one the client can match against its own outstanding echo request: the
++// embedded datagram still carries the wire identifier and the local source
++// address this destination sent with, so both are restored before the packet
++// goes back into the tunnel. The outer source stays the router that reported
++// the error, which is exactly what traceroute wants to display.
++func (d *Destination) rewriteICMPv4Error(ipHdr header.IPv4, icmpHdr header.ICMPv4) bool {
++	inner := icmpHdr.Payload()
++	if len(inner) < header.IPv4MinimumSize {
++		return false
++	}
++	innerIPHdr := header.IPv4(inner)
++	headerLen := int(innerIPHdr.HeaderLength())
++	if headerLen < header.IPv4MinimumSize || len(inner) < headerLen+header.ICMPv4MinimumSize {
++		return false
++	}
++	if innerIPHdr.TransportProtocol() != header.ICMPv4ProtocolNumber {
++		return false
++	}
++	innerICMP := header.ICMPv4(inner[headerLen:])
++	if innerICMP.Type() != header.ICMPv4Echo {
++		return false
++	}
++	originalIdent := ^innerICMP.Ident()
++	request := pingRequest{
++		Source:      ipHdr.DestinationAddr(),
++		Destination: innerIPHdr.DestinationAddr(),
++		Identifier:  originalIdent,
++		Sequence:    innerICMP.Sequence(),
++	}
++	d.requestAccess.Lock()
++	_, loaded := d.requests[request]
++	d.requestAccess.Unlock()
++	if !loaded {
++		return false
++	}
++	innerICMP.SetIdent(originalIdent)
++	innerICMP.SetChecksum(header.ICMPv4Checksum(innerICMP, 0))
++	innerIPHdr.SetSourceAddr(ipHdr.DestinationAddr())
++	innerIPHdr.SetChecksum(^innerIPHdr.CalculateChecksum())
++	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
++	d.logger.TraceContext(d.ctx, "read ICMPv4 error type ", int(icmpHdr.Type()), " from ", ipHdr.SourceAddr(), " seq ", innerICMP.Sequence())
++	return true
++}
++
+ func (d *Destination) needFilter() bool {
+ 	return !d.conn.isLinuxUnprivileged()
+ }
+diff --git a/ping/filter_linux.go b/ping/filter_linux.go
+new file mode 100644
+index 0000000..d7be7e9
+--- /dev/null
++++ b/ping/filter_linux.go
+@@ -0,0 +1,99 @@
++package ping
++
++import (
++	"sync"
++	"syscall"
++
++	"github.com/metacubex/sing-tun/internal/gtcpip/header"
++	"github.com/metacubex/sing/common"
++	"github.com/metacubex/sing/common/control"
++
++	"golang.org/x/net/bpf"
++	"golang.org/x/sys/unix"
++)
++
++type identFilterState struct {
++	access     sync.Mutex
++	attached   bool
++	disabled   bool
++	identifier uint16
++}
++
++// The kernel clones every matching-protocol packet into every unconnected raw
++// ICMP socket, so without a socket filter each flow receives and discards all
++// other flows' traffic.
++func (c *Conn) updateIdentFilter(wireIdentifier uint16) {
++	if !c.privileged {
++		return
++	}
++	syscallConn, isSyscallConn := common.Cast[syscall.Conn](c.conn)
++	if !isSyscallConn {
++		return
++	}
++	state := &c.identFilter
++	state.access.Lock()
++	defer state.access.Unlock()
++	if state.disabled {
++		return
++	}
++	if state.attached {
++		if state.identifier == wireIdentifier {
++			return
++		}
++		state.attached = false
++		state.disabled = true
++		_ = control.Conn(syscallConn, func(fd uintptr) error {
++			return unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_DETACH_FILTER, 0)
++		})
++		return
++	}
++	rawInstructions, err := identFilterProgram(c.destination.Is6(), wireIdentifier)
++	if err != nil {
++		state.disabled = true
++		return
++	}
++	filter := make([]unix.SockFilter, len(rawInstructions))
++	for i, instruction := range rawInstructions {
++		filter[i] = unix.SockFilter{Code: instruction.Op, Jt: instruction.Jt, Jf: instruction.Jf, K: instruction.K}
++	}
++	program := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
++	err = control.Conn(syscallConn, func(fd uintptr) error {
++		return unix.SetsockoptSockFprog(int(fd), unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &program)
++	})
++	if err != nil {
++		state.disabled = true
++		return
++	}
++	state.attached = true
++	state.identifier = wireIdentifier
++}
++
++func identFilterProgram(is6 bool, wireIdentifier uint16) ([]bpf.RawInstruction, error) {
++	if !is6 {
++		// Raw ICMPv4 sockets deliver the full packet including the IP header.
++		return bpf.Assemble([]bpf.Instruction{
++			bpf.LoadMemShift{Off: 0},
++			bpf.LoadIndirect{Off: 0, Size: 1},
++			bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(header.ICMPv4EchoReply), SkipTrue: 3},
++			bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(header.ICMPv4DstUnreachable), SkipTrue: 4},
++			bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(header.ICMPv4TimeExceeded), SkipTrue: 3},
++			bpf.RetConstant{Val: 0},
++			bpf.LoadIndirect{Off: 4, Size: 2},
++			bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(wireIdentifier), SkipFalse: 1},
++			bpf.RetConstant{Val: 0xffffffff},
++			bpf.RetConstant{Val: 0},
++		})
++	}
++	// Raw ICMPv6 sockets deliver the ICMPv6 message without the IP header.
++	return bpf.Assemble([]bpf.Instruction{
++		bpf.LoadAbsolute{Off: 0, Size: 1},
++		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(header.ICMPv6EchoReply), SkipTrue: 3},
++		bpf.JumpIf{Cond: bpf.JumpGreaterThan, Val: uint32(header.ICMPv6ParamProblem), SkipTrue: 1},
++		bpf.RetConstant{Val: 0xffffffff},
++		bpf.RetConstant{Val: 0},
++		bpf.LoadAbsolute{Off: 4, Size: 2},
++		bpf.JumpIf{Cond: bpf.JumpEqual, Val: uint32(wireIdentifier), SkipFalse: 1},
++		bpf.RetConstant{Val: 0xffffffff},
++		bpf.RetConstant{Val: 0},
++	})
++}
+diff --git a/ping/filter_other.go b/ping/filter_other.go
+new file mode 100644
+index 0000000..34c2137
+--- /dev/null
++++ b/ping/filter_other.go
+@@ -0,0 +1,8 @@
++//go:build !linux
++
++package ping
++
++type identFilterState struct{}
++
++func (c *Conn) updateIdentFilter(wireIdentifier uint16) {
++}
+diff --git a/ping/ping.go b/ping/ping.go
+index 6dbfe37..63d0981 100644
+--- a/ping/ping.go
++++ b/ping/ping.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/netip"
+ 	"reflect"
+ 	"runtime"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -21,20 +22,27 @@ import (
+ )
+ 
+ type Conn struct {
+-	ctx         context.Context
+-	privileged  bool
+-	conn        net.Conn
+-	destination netip.Addr
+-	source      common.TypedValue[netip.Addr]
+-	closed      atomic.Bool
+-	readMsg     func(b, oob []byte) (n, oobn int, addr netip.Addr, err error)
++	ctx          context.Context
++	privileged   bool
++	conn         net.Conn
++	controlConn  net.Conn
++	destination  netip.Addr
++	source       common.TypedValue[netip.Addr]
++	closed       atomic.Bool
++	identFilter  identFilterState
++	readMsg      func(b, oob []byte) (n, oobn int, addr netip.Addr, err error)
++	writeAccess  sync.Mutex
++	lastTTL      int
++	lastHopLimit int
+ }
+ 
+ func Connect(ctx context.Context, privileged bool, controlFunc control.Func, destination netip.Addr, idleTimeout time.Duration) (*Conn, error) {
+ 	c := &Conn{
+-		ctx:         ctx,
+-		privileged:  privileged,
+-		destination: destination,
++		ctx:          ctx,
++		privileged:   privileged,
++		destination:  destination,
++		lastTTL:      -1,
++		lastHopLimit: -1,
+ 	}
+ 	err := c.connect(controlFunc, idleTimeout)
+ 	if err != nil {
+@@ -53,6 +61,7 @@ func (c *Conn) connect(controlFunc control.Func, idleTimeout time.Duration) (err
+ 		return err
+ 	}
+ 	if ipConn, isIPConn := common.Cast[*net.IPConn](c.conn); isIPConn {
++		c.controlConn = ipConn
+ 		c.readMsg = func(b, oob []byte) (n, oobn int, addr netip.Addr, err error) {
+ 			var ipAddr *net.IPAddr
+ 			n, oobn, _, ipAddr, err = ipConn.ReadMsgIP(b, oob)
+@@ -62,6 +71,7 @@ func (c *Conn) connect(controlFunc control.Func, idleTimeout time.Duration) (err
+ 			return
+ 		}
+ 	} else if udpConn, isUDPConn := common.Cast[*net.UDPConn](c.conn); isUDPConn {
++		c.controlConn = udpConn
+ 		c.readMsg = func(b, oob []byte) (n, oobn int, addr netip.Addr, err error) {
+ 			var addrPort netip.AddrPort
+ 			n, oobn, _, addrPort, err = udpConn.ReadMsgUDPAddrPort(b, oob)
+@@ -158,9 +168,19 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
+ 			})
+ 		}
+ 	} else {
+-		_, err := buffer.ReadOnceFrom(c.conn)
+-		if err != nil {
+-			return err
++		if runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "windows" {
++			// An unconnected SOCK_RAW IPv4 socket delivers the full packet including the IP
++			// header via ReadMsgIP, whereas ReadFrom strips it.
++			n, _, _, err := c.readMsg(buffer.FreeBytes(), nil)
++			if err != nil {
++				return err
++			}
++			buffer.Truncate(n)
++		} else {
++			_, err := buffer.ReadOnceFrom(c.conn)
++			if err != nil {
++				return err
++			}
+ 		}
+ 		if !c.destination.Is6() {
+ 			ipHdr := header.IPv4(buffer.Bytes())
+@@ -177,10 +197,12 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
+ 			ipHdr.SetDestinationAddr(c.source.Load())
+ 			ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+ 			icmpHdr := header.ICMPv4(ipHdr.Payload())
+-			if !c.isLinuxUnprivileged() {
+-				icmpHdr.SetIdent(^icmpHdr.Ident())
++			if icmpHdr.Type() == header.ICMPv4EchoReply {
++				if !c.isLinuxUnprivileged() {
++					icmpHdr.SetIdent(^icmpHdr.Ident())
++				}
++				icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+ 			}
+-			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+ 		} else {
+ 			ipHdr := header.IPv6(buffer.Bytes())
+ 			if !ipHdr.IsValid(buffer.Len()) {
+@@ -202,45 +224,78 @@ func (c *Conn) ReadIP(buffer *buf.Buffer) error {
+ }
+ 
+ func (c *Conn) ReadICMP(buffer *buf.Buffer) error {
++	if !c.isLinuxUnprivileged() && !c.destination.Is6() {
++		if runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "windows" {
++			// An unconnected SOCK_RAW IPv4 socket delivers the full packet including the IP
++			// header via ReadMsgIP, whereas ReadFrom strips it.
++			n, _, _, err := c.readMsg(buffer.FreeBytes(), nil)
++			if err != nil {
++				return err
++			}
++			buffer.Truncate(n)
++		} else {
++			_, err := buffer.ReadOnceFrom(c.conn)
++			if err != nil {
++				return err
++			}
++		}
++		ipHdr := header.IPv4(buffer.Bytes())
++		buffer.Advance(int(ipHdr.HeaderLength()))
++
++		icmpHdr := header.ICMPv4(buffer.Bytes())
++		icmpHdr.SetIdent(^icmpHdr.Ident())
++		icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
++		return nil
++	}
+ 	_, err := buffer.ReadOnceFrom(c.conn)
+ 	if err != nil {
+ 		return err
+ 	}
+-	if !c.isLinuxUnprivileged() {
+-		if !c.destination.Is6() {
+-			ipHdr := header.IPv4(buffer.Bytes())
+-			buffer.Advance(int(ipHdr.HeaderLength()))
+-
+-			icmpHdr := header.ICMPv4(buffer.Bytes())
+-			icmpHdr.SetIdent(^icmpHdr.Ident())
+-			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
+-		} else {
+-			icmpHdr := header.ICMPv6(buffer.Bytes())
+-			icmpHdr.SetIdent(^icmpHdr.Ident())
+-			icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+-				Header: icmpHdr,
+-				Src:    c.destination.AsSlice(),
+-				Dst:    c.source.Load().AsSlice(),
+-			}))
+-		}
++	if c.destination.Is6() && !c.isLinuxUnprivileged() {
++		icmpHdr := header.ICMPv6(buffer.Bytes())
++		icmpHdr.SetIdent(^icmpHdr.Ident())
++		icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
++			Header: icmpHdr,
++			Src:    c.destination.AsSlice(),
++			Dst:    c.source.Load().AsSlice(),
++		}))
+ 	}
+ 	return nil
+ }
+ 
+ func (c *Conn) WriteIP(buffer *buf.Buffer) error {
+ 	defer buffer.Release()
++	c.writeAccess.Lock()
++	defer c.writeAccess.Unlock()
+ 	if !c.destination.Is6() {
+ 		ipHdr := header.IPv4(buffer.Bytes())
+ 		if !c.isLinuxUnprivileged() {
++			ttl := int(ipHdr.TTL())
++			if ttl != c.lastTTL {
++				err := ipv4.NewConn(c.controlConn).SetTTL(ttl)
++				if err != nil {
++					return err
++				}
++				c.lastTTL = ttl
++			}
+ 			icmpHdr := header.ICMPv4(ipHdr.Payload())
+ 			icmpHdr.SetIdent(^icmpHdr.Ident())
+ 			icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
++			c.updateIdentFilter(icmpHdr.Ident())
+ 		}
+ 		c.source.Store(M.AddrFromIP(ipHdr.SourceAddressSlice()))
+ 		return common.Error(c.conn.Write(ipHdr.Payload()))
+ 	} else {
+ 		ipHdr := header.IPv6(buffer.Bytes())
+ 		if !c.isLinuxUnprivileged() {
++			hopLimit := int(ipHdr.HopLimit())
++			if hopLimit != c.lastHopLimit {
++				err := ipv6.NewConn(c.controlConn).SetHopLimit(hopLimit)
++				if err != nil {
++					return err
++				}
++				c.lastHopLimit = hopLimit
++			}
+ 			icmpHdr := header.ICMPv6(ipHdr.Payload())
+ 			icmpHdr.SetIdent(^icmpHdr.Ident())
+ 			icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+@@ -248,6 +303,7 @@ func (c *Conn) WriteIP(buffer *buf.Buffer) error {
+ 				Src:    ipHdr.SourceAddressSlice(),
+ 				Dst:    ipHdr.DestinationAddressSlice(),
+ 			}))
++			c.updateIdentFilter(icmpHdr.Ident())
+ 		}
+ 		c.source.Store(M.AddrFromIP(ipHdr.SourceAddressSlice()))
+ 		return common.Error(c.conn.Write(ipHdr.Payload()))
+diff --git a/ping/socket_unix.go b/ping/socket_unix.go
+index 5e334c8..1b91de5 100644
+--- a/ping/socket_unix.go
++++ b/ping/socket_unix.go
+@@ -87,24 +87,33 @@ func connect(privileged bool, controlFunc control.Func, destination netip.Addr)
+ 		return nil, err
+ 	}
+ 
+-	if runtime.GOOS == "darwin" && !privileged {
+-		// When running in NetworkExtension on macOS, write to connected socket results in EPIPE.
++	useUnconnected := (runtime.GOOS == "darwin" && !privileged) ||
++		((runtime.GOOS == "linux" || runtime.GOOS == "android") && privileged)
++	if useUnconnected {
++		// A connected ICMP socket only receives messages whose source is the connected peer,
++		// so the Time Exceeded replies that transit routers send for traceroute never reach it.
++		// Additionally, on macOS NetworkExtension, writing to a connected socket returns EPIPE.
+ 		var packetConn net.PacketConn
+ 		packetConn, err = net.FilePacketConn(file)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		return bufio.NewBindPacketConn(packetConn, M.SocksaddrFrom(destination, 0).UDPAddr()), nil
+-	} else {
+-		err = unix.Connect(fd, M.AddrPortToSockaddr(netip.AddrPortFrom(destination, 0)))
+-		if err != nil {
+-			return nil, err
+-		}
+-		var conn net.Conn
+-		conn, err = net.FileConn(file)
+-		if err != nil {
+-			return nil, err
++		var writeTarget net.Addr
++		if privileged {
++			writeTarget = M.SocksaddrFrom(destination, 0).IPAddr()
++		} else {
++			writeTarget = M.SocksaddrFrom(destination, 0).UDPAddr()
+ 		}
+-		return conn, nil
++		return bufio.NewBindPacketConn(packetConn, writeTarget), nil
++	}
++	err = unix.Connect(fd, M.AddrPortToSockaddr(netip.AddrPortFrom(destination, 0)))
++	if err != nil {
++		return nil, err
++	}
++	var conn net.Conn
++	conn, err = net.FileConn(file)
++	if err != nil {
++		return nil, err
+ 	}
++	return conn, nil
+ }
+diff --git a/ping/socket_windows.go b/ping/socket_windows.go
+index 350b24d..6ed7d47 100644
+--- a/ping/socket_windows.go
++++ b/ping/socket_windows.go
+@@ -1,30 +1,29 @@
+ package ping
+ 
+ import (
++	"context"
+ 	"net"
+ 	"net/netip"
+ 	"syscall"
+ 
++	"github.com/metacubex/sing/common/bufio"
+ 	"github.com/metacubex/sing/common/control"
++	M "github.com/metacubex/sing/common/metadata"
+ 
+ 	"golang.org/x/sys/windows"
+ )
+ 
+ func connect(privileged bool, controlFunc control.Func, destination netip.Addr) (net.Conn, error) {
+-	var dialer net.Dialer
+-	dialer.Control = controlFunc
++	var listenConfig net.ListenConfig
++	listenConfig.Control = controlFunc
+ 	if destination.Is6() {
+-		dialer.Control = control.Append(dialer.Control, func(network, address string, conn syscall.RawConn) error {
++		listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {
+ 			return control.Raw(conn, func(fd uintptr) error {
+ 				err := windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, IPV6_HOPLIMIT, 1)
+ 				if err != nil {
+ 					return err
+ 				}
+-				err = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, IPV6_RECVTCLASS, 1)
+-				if err != nil {
+-					return err
+-				}
+-				return nil
++				return windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IPV6, IPV6_RECVTCLASS, 1)
+ 			})
+ 		})
+ 	}
+@@ -34,5 +33,11 @@ func connect(privileged bool, controlFunc control.Func, destination netip.Addr)
+ 	} else {
+ 		network = "ip6:ipv6-icmp"
+ 	}
+-	return dialer.Dial(network, destination.String())
++	// A connected raw socket only receives messages from the connected peer, so transit routers'
++	// Time Exceeded replies needed by traceroute never arrive.
++	packetConn, err := listenConfig.ListenPacket(context.Background(), network, "")
++	if err != nil {
++		return nil, err
++	}
++	return bufio.NewBindPacketConn(packetConn, M.SocksaddrFrom(destination, 0).IPAddr()), nil
+ }

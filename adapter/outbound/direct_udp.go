@@ -62,8 +62,15 @@ func (d *Direct) listenPacketRaceContext(ctx context.Context, metadata *C.Metada
 	}
 	metadata.DstIP = fallback
 	opts := d.DialOptions()
+	if metadata.DontFragment {
+		opts = append(opts, dialer.WithDontFragment(true))
+	}
 	race := newDirectUDPRacePacketConn(func(ctx context.Context, family int, remote netip.AddrPort) (net.PacketConn, error) {
-		return dialer.NewDialer(opts...).ListenPacket(ctx, fmt.Sprintf("udp%d", family), "", remote)
+		packetConn, err := dialer.NewDialer(opts...).ListenPacket(ctx, fmt.Sprintf("udp%d", family), "", remote)
+		if err != nil {
+			return nil, err
+		}
+		return newPathMTUPacketConn(packetConn, opts), nil
 	})
 	logical := metadata.AddrPort()
 	if err := race.register(ctx, logical, candidates); err != nil {

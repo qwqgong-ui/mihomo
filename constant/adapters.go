@@ -296,6 +296,16 @@ func (s *packetAdapter) Metadata() *Metadata {
 	return s.metadata
 }
 
+// ReportICMPError forwards the report to the inbound packet, when the inbound
+// it came from can carry one back to the sender.
+func (s *packetAdapter) ReportICMPError(icmpError ICMPError, mtu uint32) error {
+	reporter, canReport := s.UDPPacket.(UDPPacketICMPError)
+	if !canReport {
+		return nil
+	}
+	return reporter.ReportICMPError(icmpError, mtu)
+}
+
 // Key is a SNAT key
 func (s *packetAdapter) Key() string {
 	return s.key

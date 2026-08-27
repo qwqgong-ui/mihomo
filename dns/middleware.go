@@ -155,6 +155,10 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			if skipper.ShouldSkipped(host) {
 				return next(ctx, r)
 			}
+			if (q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA) && !isFakeIPHostName(host) {
+				log.Debugln("[DNS] refusing to allocate a fake IP for %q, which cannot be a host name", host)
+				return handleMsgWithNameError(r), nil
+			}
 
 			var rr D.RR
 			switch q.Qtype {

@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 27 Aug 2026 14:40:18 +0800
+Subject: [PATCH] system: tell the handler whether a UDP sender refused
+ fragmentation
+
+The handler re-sends the payload of a UDP datagram from a socket of its
+own, which drops the source's IP header and with it the Don't Fragment
+bit. A sender doing path MTU discovery - QUIC above all - therefore has
+its oversized probes quietly fragmented by the host kernel and answered
+as successes, and settles on a size the path only carries in pieces;
+fragments that any middlebox on the way is free to drop.
+
+Verified with tcpdump on the physical interface: a 1600 byte datagram
+sent through the tunnel to a direct destination leaves as two IPv4
+fragments, with no error of any kind returned to the sender.
+
+Report the bit from the quoted header so the handler can set the same
+policy on its own socket. IPv6 is unconditional: nothing between the
+endpoints may fragment a datagram, so a stack standing in for the path
+must not either.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ udp_icmp_error.go      | 32 ++++++++++++++++++++++++++++++++
+ udp_icmp_error_test.go | 14 ++++++++++++++
+ 2 files changed, 46 insertions(+)
+
+diff --git a/udp_icmp_error.go b/udp_icmp_error.go
+index fec82bb..2df818a 100644
+--- a/udp_icmp_error.go
++++ b/udp_icmp_error.go
+@@ -178,3 +178,35 @@ func icmpErrorSource(gateway netip.Addr, destination netip.Addr) netip.Addr {
+ // defaultICMPErrorTTL is what a first-hop router would put in an error it
+ // originates; the value is not inspected by anything that receives it locally.
+ const defaultICMPErrorTTL = 64
++
++// UDPFragmentPolicy is implemented by the packet writers the system stack hands
++// to the handler, and reports whether the source asked for its datagrams to
++// arrive whole or not at all.
++//
++// The handler re-sends the payload from a socket of its own, which drops the
++// source's IP header and with it the Don't Fragment bit. A sender that set that
++// bit - anything doing path MTU discovery, QUIC above all - then has its probes
++// quietly fragmented and succeed, and settles on a size the path only carries
++// in pieces. Carrying the intent across restores what the sender asked for, and
++// the Packet Too Big it is owed instead.
++type UDPFragmentPolicy interface {
++	DontFragment() bool
++}
++
++var (
++	_ UDPFragmentPolicy = (*systemUDPPacketWriter4)(nil)
++	_ UDPFragmentPolicy = (*systemUDPPacketWriter6)(nil)
++)
++
++func (w *systemUDPPacketWriter4) DontFragment() bool {
++	if len(w.header) < header.IPv4MinimumSize {
++		return false
++	}
++	return header.IPv4(w.header).Flags()&header.IPv4FlagDontFragment != 0
++}
++
++// DontFragment is unconditional for IPv6: nothing between the endpoints may
++// fragment a datagram, so a stack standing in for the path must not either.
++func (w *systemUDPPacketWriter6) DontFragment() bool {
++	return true
++}
+diff --git a/udp_icmp_error_test.go b/udp_icmp_error_test.go
+index 043d2ad..ed6711c 100644
+--- a/udp_icmp_error_test.go
++++ b/udp_icmp_error_test.go
+@@ -147,3 +147,17 @@ func onesComplementSum(data []byte) uint16 {
+ 	}
+ 	return uint16(sum)
+ }
++
++func TestSystemUDPPacketWriterDontFragment(t *testing.T) {
++	source := netip.MustParseAddrPort("192.0.2.100:51000")
++	destination := netip.MustParseAddrPort("198.18.0.31:443")
++	quoted := quotedUDPHeaderV4(t, source, destination, 1400)
++	require.False(t, (&systemUDPPacketWriter4{header: quoted}).DontFragment())
++
++	ipHdr := header.IPv4(quoted)
++	ipHdr.SetFlagsFragmentOffset(header.IPv4FlagDontFragment, 0)
++	require.True(t, (&systemUDPPacketWriter4{header: quoted}).DontFragment())
++
++	require.False(t, (&systemUDPPacketWriter4{header: quoted[:10]}).DontFragment())
++	require.True(t, (&systemUDPPacketWriter6{}).DontFragment())
++}

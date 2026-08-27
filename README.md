@@ -71,6 +71,26 @@ Patches:
 
 让 Fake-IP ICMP 请求经过正常规则判断，仅在最终 DIRECT 路径竞争真实目标，并将回复地址重写回原 Fake-IP。
 
+途中路由器回的 ICMP 差错（超时、不可达、包太大）也一并转交，因此 Fake-IP 上的
+traceroute/`ping -t` 是真的：外层源地址保留报告差错的那台路由器，只把差错内嵌的
+原始数据报里的目的地址改回 Fake-IP，内层与外层校验和按 RFC 1624 eqn.3 增量更新
+（路由器只保证回传被丢数据报的前若干字节，内层传输层校验和无法重算）。竞速期间
+同一个探测发往全部候选，低 TTL 会每个候选各回一份，按 (id, seq) 只放行最先报告
+的那台，应用看到的一跳就是一行。差错不设 winner，也不消费请求表条目。
+
+Fake-IP 的域名解不出真实地址时（打错的名字、已死的域名、被直接喂给 ping 的
+URL）回 ICMP 目标不可达，而不是本地合成 echo reply：真实流量在 DIRECT 出站解析
+该名字时同样会失败，合成回复等于报告一个谁也连不上的主机是通的。所有候选都连不
+上时同理。失败不入 direct route 表，下一个 echo request 会重新解析，瞬时故障自
+愈。代理路由的 Fake-IP 和丢失 host 映射的 Fake-IP 仍走合成 echo reply。
+
+traceroute 要用 ICMP 模式（`traceroute -I`，或默认走 ICMP 的 mtr）。默认的 UDP
+模式全是星号：UDP 进的是 mihomo 的 NAT，客户端 TTL 没被带到出站 socket，回程的
+ICMP 差错也没有注入回 TUN 的路径。`-T` 的 TCP 模式则会把目标显示在第一跳 —— TCP
+在 TUN 里本地终结，TTL 在那里没有意义，这条不是能修的。
+
+依赖侧的 ICMP 能力见下面的 `sing-tun ICMP Ping`。
+
 Patches:
 
 - `adapter/outbound.patch`
@@ -78,6 +98,43 @@ Patches:
 - `component/directrace.patch`
 - `listener/sing_tun.patch`
 - `tunnel.patch`
+
+## Direct UDP ICMP Errors
+
+直连 UDP 的数据报送不出去时，发送方原本什么都得不到：它面对的是一个收下了包的
+tun 设备，于是继续按同样大小发，或者等满一个本可以由差错立即结束的超时。
+
+两件事一起做才有意义。其一，**把发送方的 Don't Fragment 意图带到出站 socket**：
+mihomo 用自己的 socket 重发载荷，发送方的 IP 头连同 DF 位一起被丢掉，于是做 PMTU
+探测的应用（首当其冲是 QUIC）超长的探测包被本机内核静默分片、当成成功，最后收敛
+到一个只有分片才能通过的尺寸 —— 而分片在路上被任何中间设备丢掉都是合法的。实测
+一个 1600 字节数据报穿隧道发往直连目标，在物理网卡上是两个 IPv4 分片出去的，发送
+方收不到任何提示。现在按发送方的原意设置：v4 跟随 DF 位，v6 无条件（IPv6 中间节点
+本就不允许分片，代行路径职责的栈也不该分片）。没设 DF 的发送方行为不变。
+
+其二，**写失败时合成 ICMP 差错回给发送方**：EMSGSIZE 回 Packet Too Big 并带上内核
+知道的 MTU（连一个用同样选项、因而同样路由的临时 socket 读 `IP_MTU`/`IPV6_MTU`
+拿到，不打扰承载流量的那个 socket，按目的地址缓存 5 秒），ECONNREFUSED、
+EHOSTUNREACH、ENETUNREACH 分别回端口/主机/网络不可达。差错由 tun 栈合成，源地址是
+发送方自己路由指向的下一跳（也就是这个栈），内嵌 RFC 792 要求的原始 IP 头加 UDP 头。
+两侧地址族不同时（Fake-IP 落到另一族的真实地址）MTU 按头部大小差换算，低于 576/1280
+则不报。
+
+实测 v4：1600 字节 DF 数据报，第一次发出后发送方即学到 PMTU，第二次起本地
+`Message too long`，`IP_MTU` 依次收敛到 1500、1480（1480 是这条线路的真实值）。v6：
+差错同样送达并让发送方的下一次 `send()` 拿到 EMSGSIZE，但 Linux 不为其建立持久的
+路由例外，因此发送方每次超长都要重新被告知一次 —— 对按失败探测调整尺寸的 QUIC 来说
+够用，对依赖路由缓存的应用则是一次性信号。
+
+Patches:
+
+- `adapter/outbound.patch`
+- `common/sockopt.patch`
+- `component/dialer.patch`
+- `constant.patch`
+- `listener/sing.patch`
+- `tunnel.patch`
+- `../../sing-tun/0010-*.patch`、`0011-*.patch`（依赖补丁）
 
 ## Runtime IPv6 Availability Handling
 
@@ -92,6 +149,22 @@ Patches:
 - `config.patch`
 - `hub/executor.patch`
 - `hub/route.patch`
+
+## Fake-IP Host-Name Validation
+
+Fake-IP 的 A/AAAA 不问上游，客户端查什么都给地址，包括没有任何域名服务器会解析的
+字符串 —— 直接喂给 ping 或 curl 的 URL 就是这样。拿到的地址对所有协议都是死的：
+DIRECT 在出站解析该名字时同样失败，用户看到的却像是路由问题，其实是个笔误。合成
+之前先检查名字能不能是个主机名，不能就回 NXDOMAIN，把失败摆回它真正发生的地方，
+也和不挂隧道时看到的结果一致（`名称或服务未知`）。
+
+判据是字符而不是注册名：下划线（`_dmarc`、`_http._tcp`）、单标签（局域网主机名）
+和 punycode 都是正当查询；而 miekg/dns 的呈现形式里出现转义序列，就意味着线格式
+里带了主机名不可能有的字节。只作用于 Fake-IP 合成的 A/AAAA，其他类型不变。
+
+Patches:
+
+- `dns.patch`
 
 ## Fake-IP HTTPS/SVCB Hint Synthesis
 
@@ -292,6 +365,17 @@ Patches:
   再关。补上该调用。mihomo 侧 `PrepareConnection` 对 TCP 仍返回 nil，行为
   不变，但拒绝能力就位了。UDP 未接：上游挂在自己的 udpnat2 上，本 fork 栈内
   没有 UDP 会话表，mihomo 的 NAT 在 tunnel 里，为找首包再建一张表得不偿失。
+- `0010` UDP 流的数据报送不出去时没有任何东西能告诉发送方，因为它面对的是一个
+  收下了包的 tun 设备。栈正站在那台无法转发的路由器的位置上，也是唯一还留着差错
+  必须引用的 IP 与 UDP 头的地方，所以给 handler 一个 `ReportICMPError`：Packet Too
+  Big、端口/主机/网络不可达。源地址取发送方路由指向的下一跳（栈自己的 next address），
+  该族没有地址时退回发送方本来要去的地址。只做 system 栈，gvisor 的写回走的是栈内
+  路由而不是手搓包。
+- `0011` handler 用自己的 socket 重发载荷，丢掉了发送方 IP 头里的 DF 位，于是做
+  PMTU 探测的发送方（QUIC）超长探测被本机内核静默分片当成成功。把该位从引用头里
+  报给 handler，让它在自己的 socket 上照办；IPv6 无条件，因为端点之间没有任何节点
+  被允许分片。
+
 - `0006` Go 1.24 起 listener 默认开 MPTCP，而 redirect server 从不显式设置，
   于是跟随默认值。MPTCP socket 上 `getsockopt(SOL_IP, SO_ORIGINAL_DST)` 返回
   `EOPNOTSUPP`，`loopIn()` 取不到目的地会把 MPTCP 客户端的每条重定向连接直接丢弃。
@@ -303,6 +387,40 @@ Patches:
 write(2) 次数比 1.000（不同 flow，1/8/64 writer）到 0.967（同 flow 64 writer），
 而每包多出的一对 mutex 让 flows=1 慢 5%。真要拿到 UDP GSO，得让 mihomo 的
 UDP 回写 API 一次交多个包，而不是在 tun 这层等。
+
+## sing-tun ICMP Ping
+
+同样只改依赖，补丁在 `patches/sing-tun/`。上游 sing-tun 的 ping 包在本 fork 的
+v0.4.x 血统里与 sagernet v0.8.13 逐字节相同；v0.9.0-beta.2 重写了 ICMP 这块，
+`0007`/`0009` 是那次重写的移植，`0008` 是上游至今没做的 IPv6 部分。
+
+- `0007` 三处让隧道内的 ICMP 诊断结果失真的缺陷。`WriteIP` 丢掉客户端的 IP 头
+  只写 ICMP 报文，socket 用内核默认 TTL，于是 `ping -t 1` 和 traceroute 的每一跳
+  都直达真实目标；现在 TTL/hop limit 跟着包走，用 `lastTTL`/`lastHopLimit` 缓存，
+  稳定 ping 不会每包一次 setsockopt。socket 原本是 connected 的，而 connected 的
+  ICMP socket 只收得到 peer 发来的报文，途中路由器的 Time Exceeded 根本到不了；
+  Linux privileged 与 Windows 改用非连接 socket，随之而来的是 Go 的
+  `IPConn.ReadFrom` 会剥掉 IPv4 头、只有 `ReadMsgIP` 保留，raw v4 读路径改用后者。
+  `loopRead` 原本丢掉一切非 echo reply，现在 Time Exceeded 与 Destination
+  Unreachable 按差错内嵌的数据报匹配未完成请求，就地还原 wire identifier 与本地
+  源地址后转交，外层源地址保持为报告差错的路由器。
+  非连接的 raw ICMP socket 会收到本机每个 ICMP 包的副本，因此附带一个 BPF 程序，
+  只留本 flow wire identifier 的 echo reply 加上那两类差错；identifier 的异或映射
+  同时意味着我们注入回隧道的包永远匹配不上自己的过滤器。一个 Conn 被第二个
+  identifier 复用时过滤器直接摘掉而不是错误地收窄。
+- `0008` 上游那次重写只做了 ICMPv4：BPF 已经放行 ICMPv6 的差错类型，但
+  `loopRead` 的 v6 分支仍然只放 echo reply，IPv6 traceroute 依旧全是星号。按 v4
+  的做法处理 Time Exceeded、Destination Unreachable 和 Packet Too Big；内嵌的是
+  完整 IPv6 头加原 echo request，两层校验和都带伪头，因而按地址重算而非增量更新。
+  `ReadIP` 原本对收到的每个 ICMPv6 报文都做 identifier 反映射，而差错报文的那两个
+  字节根本不是 identifier —— 是未用字段，或者 Packet Too Big 的 MTU —— 现在只对
+  echo reply 做。
+- `0009` `loopRead` 的读截止时间原本从每次读开始算，于是客户端还在发包时
+  destination 也会在最后一次**回包**之后一个 timeout 被拆掉，且截止时间到达是走
+  错误路径报出来的：每个结束的 ping 会话都在日志里留一条 `receive ICMP echo
+  reply: i/o timeout`。改为跟踪最后活动时间（写也算），截止时间到了就继续循环，
+  空闲满一个 timeout 才退出。这条在本 fork 比上游更要紧：Fake-IP 竞速自己持有多个
+  destination 且跨它们存活，某个候选在稳定 ping 下自行关闭就等于永久退出竞速。
 
 ## Go 1.26 Language Version
 
