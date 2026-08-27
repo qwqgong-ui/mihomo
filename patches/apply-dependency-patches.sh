@@ -35,8 +35,8 @@ apply_module_patches() {
 		fi
 		git -C "$patched_dir" apply --whitespace=error-all "$patch"
 	done
-	if [ -d "$patch_dir/files" ]; then
-		cp -R "$patch_dir/files/." "$patched_dir/"
+	if [ -d "$patch_dir/_files" ]; then
+		cp -R "$patch_dir/_files/." "$patched_dir/"
 	fi
 
 	go mod edit -modfile="$modfile" -replace="$module=$patched_dir"
