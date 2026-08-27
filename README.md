@@ -84,6 +84,11 @@ URL）回 ICMP 目标不可达，而不是本地合成 echo reply：真实流量
 上时同理。失败不入 direct route 表，下一个 echo request 会重新解析，瞬时故障自
 愈。代理路由的 Fake-IP 和丢失 host 映射的 Fake-IP 仍走合成 echo reply。
 
+traceroute 要用 ICMP 模式（`traceroute -I`，或默认走 ICMP 的 mtr）。默认的 UDP
+模式全是星号：UDP 进的是 mihomo 的 NAT，客户端 TTL 没被带到出站 socket，回程的
+ICMP 差错也没有注入回 TUN 的路径。`-T` 的 TCP 模式则会把目标显示在第一跳 —— TCP
+在 TUN 里本地终结，TTL 在那里没有意义，这条不是能修的。
+
 依赖侧的 ICMP 能力见下面的 `sing-tun ICMP Ping`。
 
 Patches:
