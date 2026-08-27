@@ -308,18 +308,17 @@ UDP 回写 API 一次交多个包，而不是在 tun 这层等。
 
 `go.mod` 的 go 指令从上游的 `go 1.20` 抬到 `go 1.26`。上游整套 fork
 （sing、sing-tun、quic-go）都停在 1.20，所以这是一处会在每次 upstream sync
-PR 里冲突的分歧，合并时保留下游的 go 指令和 `godebug` 块。
+PR 里冲突的分歧，合并时保留下游的 go 指令。
 
 抬升的动机是依赖：`golang.org/x/net`、`golang.org/x/text`、`golang.org/x/crypto`
 和 `miekg/dns` 的当前版本都声明 `go 1.25.0`，主模块停在 1.20 就无法 require
-它们，也就拿不到 x/net 的 HTTP/2 与 idna 安全修复。依赖升级本身在后续改动里做。
+它们，也就拿不到 x/net 的 HTTP/2 与 idna 安全修复。依赖升级见下节。
 
 本改动只动语言版本，不改运行时行为：
 
-- go 指令一抬，26 个原本被钉在 go1.20 默认值上的 GODEBUG 会全部释放。`go.mod`
-  的 `godebug` 块把其中会变的 24 个钉回原值，编译产物的 `DefaultGODEBUG`
-  与改动前逐项一致。其中 `multipathtcp` 最需要钉住 —— Go 1.24 起它默认
-  在所有 listener 上开启 MPTCP。要放开某一项，连同理由和验证单独提。
+- go 指令一抬，26 个原本被钉在 go1.20 默认值上的 GODEBUG 会全部释放。抬升时
+  先用 `godebug` 块把它们钉回原值以隔离风险，之后整块移除，现在全部采用
+  go1.26 默认值（见下节）。
 - 唯一无法用 `godebug` 钉住的是 Go 1.22 的循环变量按迭代语义。用
   `-gcflags=github.com/metacubex/mihomo/...=-d=loopvar=2` 量化过：本仓库自身代码
   只有 4 个循环受影响，全部 stack-allocated（循环变量没有被闭包或 goroutine
@@ -346,3 +345,79 @@ MPTCP       conn_mptcp=true   SO_ORIGINAL_DST -> ERROR operation not supported
 `multipathtcp=0` 钉着也照样能建立真 MPTCP 连接（实测 `conn_mptcp=true`）。
 换句话说放开 `multipathtcp` 这个 GODEBUG 并不会让正常 inbound 多拿到什么，
 只会波及这些不显式设置的监听器。
+
+## GODEBUG Defaults Released
+
+`go 1.26` 引入时加的 `godebug` 块（把 24 项钉回 go1.20 默认值）已整块移除，
+现在全部采用 go1.26 默认值。与之前相比实际发生变化的项：
+
+| setting | 之前（go1.20 默认） | 现在（go1.26 默认） | 影响面 |
+|---|---|---|---|
+| `multipathtcp` | 0（关） | 2（listener 默认开 MPTCP） | 只波及不显式设置的监听器；两个 redirect 监听器已在上一节的防护里显式关闭，正常 inbound 由 `inbound-mptcp` 显式控制 |
+| `tlssha1` | 1（允许） | 0（拒绝 TLS 1.2 的 SHA-1 签名） | 标准库 TLS 与证书校验 |
+| `rsa1024min` | 0（允许） | 1（拒绝 <1024 位 RSA） | 同上 |
+| `x509negativeserial` | 1（容忍） | 0（拒绝负序列号证书） | 同上 |
+| `x509rsacrt` / `x509sha256skid` / `x509usepolicies` | 旧值 | 新值 | 证书解析与策略校验 |
+| `tlsmlkem` / `tlssecpmlkem` | 0 | 1（默认启用后量子密钥交换） | 标准库 TLS 的 ClientHello |
+| `httplaxcontentlength` | 1（容忍畸形 Content-Length） | 0（拒绝） | HTTP 客户端与服务端 |
+| `httpservecontentkeepheaders` / `httpmuxgo121` | 旧语义 | 新语义 | `net/http` |
+| `httpcookiemaxnum` / `urlmaxqueryparams` / `urlstrictcolons` | 0（无限制/宽松） | 新限制生效 | Go 1.26 新增的解析上限 |
+| `panicnil` | 1（`panic(nil)` 不转换） | 0（转成 `*runtime.PanicNilError`） | 运行时 |
+| `containermaxprocs` / `updatemaxprocs` | 0 | 1（cgroup 感知 GOMAXPROCS） | 容器内自动调整 P 数 |
+| `cryptocustomrand` / `decoratemappings` / `randseednop` / `winsymlink` / `winreadlinkvolume` / `gotestjsonbuildtext` | 旧值 | 新值 | 低风险 |
+
+代理出站 TLS 大多走 `metacubex/utls`，不受 `tls*` 这几项影响；但证书校验仍是
+标准库 `crypto/x509`，所以 `rsa1024min`、`x509negativeserial`、`tlssha1` 会
+影响到用弱参数或畸形证书的对端。真遇到问题，单独把对应项加回 `godebug` 块
+即可，不必回退整个改动。
+
+## Dependency Security Upgrades
+
+go 指令抬到 1.26 之后可以取到的更新。govulncheck 符号级扫描（`-mode=binary`）
+从 **4 个可达漏洞降到 0**，模块层面的不可达项从 29 降到 1。
+
+修掉的可达项：
+
+| | 模块 | 修复版本 | 可达符号 |
+|---|---|---|---|
+| GO-2026-4918 | x/net | v0.53.0 | `http2.Transport.RoundTrip` —— 对端发畸形 `SETTINGS_MAX_FRAME_SIZE` 让 HTTP/2 客户端死循环 |
+| GO-2026-5026 | x/net | v0.55.0 | `idna.ToASCII` —— Punycode 标签校验绕过 |
+| GO-2025-3503 | x/net | v0.36.0 | `httpproxy.config.useProxy` —— IPv6 Zone ID 代理绕过 |
+| GO-2026-5970 | x/text | v0.39.0 | `norm.Form.*` —— 畸形输入死循环 |
+
+另外顺带修掉两个不可达项：`klauspost/compress` 的 s2 OOB read（GO-2026-5841）
+和 `insomniacslk/dhcp` 的畸形 IPv4 包 DoS（GO-2026-6237）。
+
+版本变动：
+
+```
+github.com/insomniacslk/dhcp  20250109 -> 20260728
+github.com/klauspost/compress v1.17.9  -> v1.19.2
+github.com/miekg/dns          v1.1.63  -> v1.1.73
+golang.org/x/crypto           v0.33.0  -> v0.55.0
+golang.org/x/net              v0.35.0  -> v0.58.0
+golang.org/x/sync             v0.11.0  -> v0.22.0
+golang.org/x/sys              v0.30.0  -> v0.47.0
+golang.org/x/mod/term/text/tools                    (indirect，随之拉起)
+```
+
+剩下唯一一项是 GO-2026-5932（`x/crypto/openpgp` 已废弃，无修复版本），不可达。
+
+## sing-mux h2mux
+
+只改依赖 `github.com/metacubex/sing-mux`，补丁在 `patches/sing-mux/`。
+
+x/net **v0.54.0** 起 `x/net/http2` 在 **Go 1.27 工具链**下会走 net/http 的请求
+校验（`//go:build go1.27 && !http2legacy`），而 sing-mux 的 h2mux 客户端为每条
+流构造的 `http.Request` 字面量没有 `Header` 字段，于是 `RoundTrip` 直接返回
+`http: nil Request.Header`，每条流都开不起来 —— 调用方看到请求体上的 closed
+pipe 和等响应头的超时。表现是
+`TestInboundVless_Encryption/**/singmux/h2mux/Sequential` 96 条全部挂 60s。
+
+`http.Request` 的 `Header` 本来就不允许为 nil，只是旧版 `x/net/http2` 没去看它。
+补上一个空 map 即可，对新旧两种实现都成立。
+
+排查过程中试过另外两条路，都比这个差：把 x/net 钉在 v0.53.0（最后一个可用版本）
+需要 `replace` 压过 x/crypto、miekg/dns 和 x/text 声明的 v0.57.0，且拿不到
+v0.55.0 的 idna 修复；用上游的 `http2legacy` 构建标签则要求每条构建命令都别忘了
+带，漏了就静默坏掉。补 sing-mux 一行两者都不需要。
