@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 27 Aug 2026 09:53:57 +0800
+Subject: [PATCH] redirect: keep the redirect server off MPTCP
+
+Go 1.24 turned MPTCP on by default for listeners, and the redirect server
+takes the default because it never says otherwise. On an MPTCP socket
+getsockopt(SOL_IP, SO_ORIGINAL_DST) answers EOPNOTSUPP, so loopIn() would
+fail to resolve the destination and drop every connection an MPTCP client
+opens through the redirect. Verified on Linux 7.2 with net.mptcp.enabled=1:
+a plain accept returns the address, an MPTCP accept returns "operation not
+supported".
+
+Nothing about a redirect server benefits from multipath, so ask for it
+explicitly rather than depending on the main module's go directive keeping
+the GODEBUG at the old default.
+---
+ redirect_server.go | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/redirect_server.go b/redirect_server.go
+index 754d757..dc81b7b 100644
+--- a/redirect_server.go
++++ b/redirect_server.go
+@@ -40,6 +40,10 @@ func (s *redirectServer) Start() error {
+ 	var listenConfig net.ListenConfig
+ 	// listenConfig.KeepAlive = C.TCPKeepAliveInitial
+ 	listenConfig.KeepAlive = 10 * time.Minute
++	// Since Go 1.24 listeners get MPTCP by default, and getsockopt(SO_ORIGINAL_DST)
++	// answers EOPNOTSUPP on an MPTCP socket, which would fail every redirected
++	// connection below. The redirect server has no use for multipath anyway.
++	listenConfig.SetMultipathTCP(false)
+ 	listener, err := listenConfig.Listen(s.ctx, M.NetworkFromNetAddr("tcp", s.listenAddr), M.SocksaddrFrom(s.listenAddr, 0).String())
+ 	if err != nil {
+ 		return err

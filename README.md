@@ -292,6 +292,10 @@ Patches:
   再关。补上该调用。mihomo 侧 `PrepareConnection` 对 TCP 仍返回 nil，行为
   不变，但拒绝能力就位了。UDP 未接：上游挂在自己的 udpnat2 上，本 fork 栈内
   没有 UDP 会话表，mihomo 的 NAT 在 tunnel 里，为找首包再建一张表得不偿失。
+- `0006` Go 1.24 起 listener 默认开 MPTCP，而 redirect server 从不显式设置，
+  于是跟随默认值。MPTCP socket 上 `getsockopt(SOL_IP, SO_ORIGINAL_DST)` 返回
+  `EOPNOTSUPP`，`loopIn()` 取不到目的地会把 MPTCP 客户端的每条重定向连接直接丢弃。
+  显式关掉，不再依赖主模块 go 指令把 GODEBUG 压在旧值上。
 
 `Write()` 的写合并（把单包写入队、由持锁方统一 flush 以喂饱 GRO）试过并
 **撤掉了**：实测同一 flow 的包由同一个 goroutine 顺序写出，永远不会同时待在
@@ -323,3 +327,22 @@ PR 里冲突的分歧，合并时保留下游的 go 指令和 `godebug` 块。
 - Go 1.24 起 `printf` 分析器会检查非常量格式串，`go test` 默认跑 vet，
   因此 25 处「把运行时字符串当格式串传」的调用必须先修，否则 CI 直接红。
   这些是真问题：消息里含 `%` 时会输出成 `%!x(MISSING)`。
+## MPTCP Listener Guards
+
+`listener/tproxy` 早就显式 `SetMultipathTCP(false)`，理由写在注释里：Go 1.24 起
+listener 默认开 MPTCP，会让 tproxy 在某些内核上失效。同类的两处漏了，本分支补上：
+`listener/redir`（裸 `net.Listen`）和 sing-tun 的 redirect server（补丁 `0006`）。
+
+实测（Linux 7.2，`net.mptcp.enabled=1`）：
+
+```
+plain TCP   conn_mptcp=false  SO_ORIGINAL_DST -> 127.0.0.1:21077
+MPTCP       conn_mptcp=true   SO_ORIGINAL_DST -> ERROR operation not supported
+```
+
+要开 inbound MPTCP 用配置项 `inbound-mptcp: true` —— 走
+`adapter/inbound.ListenConfig` 的显式设置，对每个正常 inbound 生效，而
+`net.ListenConfig` 的 MPTCP 是三态，显式值优先于 GODEBUG，所以
+`multipathtcp=0` 钉着也照样能建立真 MPTCP 连接（实测 `conn_mptcp=true`）。
+换句话说放开 `multipathtcp` 这个 GODEBUG 并不会让正常 inbound 多拿到什么，
+只会波及这些不显式设置的监听器。
