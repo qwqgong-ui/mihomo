@@ -502,6 +502,9 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 	if opt.addrReuse {
 		addrReuseToListenConfig(lc)
 	}
+	if opt.dontFragment {
+		dontFragmentToListenConfig(lc)
+	}
 	if DefaultSocketHook != nil { // ignore interfaceName, routingMark when DefaultSocketHook not null (in CMFA)
 		socketHookToListenConfig(lc)
 	} else {

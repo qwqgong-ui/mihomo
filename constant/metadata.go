@@ -215,6 +215,10 @@ type Metadata struct {
 
 	RawSrcAddr net.Addr `json:"-"`
 	RawDstAddr net.Addr `json:"-"`
+	// DontFragment carries a UDP sender's refusal to have its datagrams
+	// fragmented through to the socket that re-sends them, so that a sender
+	// doing path MTU discovery is answered instead of quietly fragmented.
+	DontFragment bool `json:"-"`
 	// Only domain rule
 	SniffHost string `json:"sniffHost"`
 }

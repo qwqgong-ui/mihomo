@@ -17,6 +17,7 @@ import (
 
 	"github.com/gofrs/uuid/v5"
 	mux "github.com/metacubex/sing-mux"
+	tun "github.com/metacubex/sing-tun"
 	vmess "github.com/metacubex/sing-vmess"
 	"github.com/metacubex/sing-vmess/packetaddr"
 	"github.com/metacubex/sing/common"
@@ -242,6 +243,7 @@ func (h *ListenerHandler) handlePacket(ctx context.Context, cPacket *packet, sou
 	if destination.IsIP() && destination.Fqdn == "" {
 		cMetadata.RawDstAddr = destination.Unwrap().UDPAddr()
 	}
+	cMetadata.DontFragment = cPacket.dontFragment()
 	inbound.ApplyAdditions(cMetadata, inbound.WithDstAddr(destination), inbound.WithSrcAddr(source), inbound.WithInAddr(cPacket.InAddr()))
 	inbound.ApplyAdditions(cMetadata, h.Additions...)
 	inbound.ApplyAdditions(cMetadata, getAdditions(ctx)...)
@@ -308,4 +310,50 @@ func (c *packet) Drop() {
 
 func (c *packet) InAddr() net.Addr {
 	return c.lAddr
+}
+
+// dontFragment reports whether the sender asked for its datagrams to arrive
+// whole or not at all. Only a tun inbound knows: everywhere else the sender
+// handed us a payload over a socket, having already made that choice on its own
+// side of it.
+func (c *packet) dontFragment() bool {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	conn := *c.writer
+	if conn == nil {
+		return false
+	}
+	policy, hasPolicy := common.Cast[tun.UDPFragmentPolicy](conn)
+	return hasPolicy && policy.DontFragment()
+}
+
+// ReportICMPError asks the inbound to tell the sender why its datagram went no
+// further. Only a tun inbound can: it speaks IP, and its writer still holds the
+// headers the ICMP error has to quote. Everywhere else the sender reached us
+// over a socket that has its own way of failing, so there is nothing to send.
+func (c *packet) ReportICMPError(icmpError C.ICMPError, mtu uint32) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	conn := *c.writer
+	if conn == nil {
+		return errors.New("report to closed connection")
+	}
+	reporter, canReport := common.Cast[tun.UDPErrorReporter](conn)
+	if !canReport {
+		return nil
+	}
+	var tunError tun.ICMPError
+	switch icmpError {
+	case C.ICMPErrorPacketTooBig:
+		tunError = tun.ICMPErrorPacketTooBig
+	case C.ICMPErrorPortUnreachable:
+		tunError = tun.ICMPErrorPortUnreachable
+	case C.ICMPErrorHostUnreachable:
+		tunError = tun.ICMPErrorHostUnreachable
+	case C.ICMPErrorNetworkUnreachable:
+		tunError = tun.ICMPErrorNetworkUnreachable
+	default:
+		return nil
+	}
+	return reporter.ReportICMPError(tunError, mtu)
 }

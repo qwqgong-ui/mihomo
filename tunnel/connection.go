@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -294,7 +295,98 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 		}
 		s.AddMapping(originMetadata, metadata)
 	}
-	_ = handleUDPToRemote(packet, pc, addr)
+	if err := handleUDPToRemote(packet, pc, addr); err != nil {
+		reportUDPICMPError(packet, addr, err)
+	}
+}
+
+// reportUDPICMPError tells the sender why its datagram went no further, for the
+// failures an ICMP error exists for. Without this the write error dies here:
+// the sender is talking to a tun device that took the packet, so it keeps
+// sending the same size, or waits out a timeout.
+func reportUDPICMPError(packet C.UDPPacket, addr net.Addr, err error) {
+	reporter, canReport := packet.(C.UDPPacketICMPError)
+	if !canReport {
+		return
+	}
+	var (
+		icmpError C.ICMPError
+		mtu       uint32
+	)
+	var packetTooBig *C.PacketTooBigError
+	switch {
+	case errors.As(err, &packetTooBig):
+		icmpError = C.ICMPErrorPacketTooBig
+		mtu = senderMTU(packetTooBig.MTU, packet.LocalAddr(), addr)
+		if mtu == 0 {
+			return
+		}
+	case errors.Is(err, syscall.ECONNREFUSED):
+		icmpError = C.ICMPErrorPortUnreachable
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		icmpError = C.ICMPErrorHostUnreachable
+	case errors.Is(err, syscall.ENETUNREACH):
+		icmpError = C.ICMPErrorNetworkUnreachable
+	default:
+		return
+	}
+	if reportErr := reporter.ReportICMPError(icmpError, mtu); reportErr != nil {
+		log.Debugln("[UDP] report %s to %s failed: %v", icmpError, packet.LocalAddr(), reportErr)
+	}
+}
+
+// senderMTU restates a path MTU the way the sender measures it. The sender's
+// datagram is re-headered on the way out, so when the two sides are not the
+// same address family the headers differ in size and the number has to move
+// with them.
+func senderMTU(pathMTU uint32, source net.Addr, destination net.Addr) uint32 {
+	const (
+		ipv4HeaderSize = 20
+		ipv6HeaderSize = 40
+		minimumMTUv4   = 576
+		minimumMTUv6   = 1280
+	)
+	sourceIs6, ok := addrIs6(source)
+	if !ok {
+		return 0
+	}
+	destinationIs6, ok := addrIs6(destination)
+	if !ok {
+		return 0
+	}
+	mtu := int(pathMTU)
+	if sourceIs6 != destinationIs6 {
+		if sourceIs6 {
+			mtu += ipv6HeaderSize - ipv4HeaderSize
+		} else {
+			mtu -= ipv6HeaderSize - ipv4HeaderSize
+		}
+	}
+	minimum := minimumMTUv4
+	if sourceIs6 {
+		minimum = minimumMTUv6
+	}
+	if mtu < minimum {
+		return 0
+	}
+	return uint32(mtu)
+}
+
+func addrIs6(addr net.Addr) (bool, bool) {
+	if addr == nil {
+		return false, false
+	}
+	if udpAddr, isUDPAddr := addr.(*net.UDPAddr); isUDPAddr {
+		if ip, ok := netip.AddrFromSlice(udpAddr.IP); ok {
+			return ip.Unmap().Is6(), true
+		}
+		return false, false
+	}
+	addrPort, err := netip.ParseAddrPort(addr.String())
+	if err != nil {
+		return false, false
+	}
+	return addrPort.Addr().Unmap().Is6(), true
 }
 
 func (s *packetSender) Process(pc C.PacketConn, proxy C.WriteBackProxy) {

@@ -40,6 +40,7 @@ type option struct {
 	interfaceName string
 	fallbackBind  bool
 	addrReuse     bool
+	dontFragment  bool
 	routingMark   int
 	network       int
 	prefer        int
@@ -68,6 +69,16 @@ func WithFallbackBind(fallback bool) Option {
 func WithAddrReuse(reuse bool) Option {
 	return func(opt *option) {
 		opt.addrReuse = reuse
+	}
+}
+
+// WithDontFragment carries a sender's refusal to have its datagrams fragmented
+// through to the socket that re-sends them. Without it the tunnel quietly
+// fragments what the sender asked to keep whole, and the sender's path MTU
+// discovery settles on a size the path only carries in pieces.
+func WithDontFragment(dontFragment bool) Option {
+	return func(opt *option) {
+		opt.dontFragment = dontFragment
 	}
 }
 
