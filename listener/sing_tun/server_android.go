@@ -47,6 +47,9 @@ func getPackageManager() (tun.PackageManager, error) {
 }
 
 func (l *Listener) buildAndroidRules(tunOptions *tun.Options) error {
+	if len(tunOptions.IncludePackage) == 0 && len(tunOptions.ExcludePackage) == 0 {
+		return nil
+	}
 	packageManager, err := getPackageManager()
 	if err != nil {
 		return err

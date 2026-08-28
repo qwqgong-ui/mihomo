@@ -33,6 +33,16 @@ type RuleProcessMatcher interface {
 	HasProcessRule() bool
 }
 
+// EndpointResolver lets an embedding platform resolve a socket owner using
+// both endpoints when the native process lookup is unavailable.
+type EndpointResolver func(network string, src, dst netip.AddrPort) (uint32, string, error)
+
+var externalEndpointResolver EndpointResolver
+
+func SetEndpointResolver(resolver EndpointResolver) {
+	externalEndpointResolver = resolver
+}
+
 func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
 	return findProcessName(network, srcIP, srcPort)
 }
@@ -47,6 +57,11 @@ func FindProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, str
 // FindProcessNameByAddrWithMatcher limits expensive process descriptor scans
 // to executable paths that can match the active process rules.
 func FindProcessNameByAddrWithMatcher(network string, src, dst netip.AddrPort, matcher ProcessMatcher) (uint32, string, error) {
+	if resolver := externalEndpointResolver; resolver != nil {
+		if uid, path, err := resolver(network, src, dst); err == nil {
+			return uid, path, nil
+		}
+	}
 	return findProcessNameByAddr(network, src, dst, matcher)
 }
 

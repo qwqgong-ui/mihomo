@@ -668,7 +668,32 @@ func NewVless(option VlessOption) (*Vless, error) {
 			ReuseConfig:          reuseCfg,
 		}
 
+		useExternalTransport := xhttp.ExternalTransportEnabled()
+		if useExternalTransport {
+			if !option.TLS {
+				return nil, errors.New("xhttp external transport requires TLS")
+			}
+			if securityMode != "" {
+				return nil, fmt.Errorf("xhttp external transport does not support %s", securityMode)
+			}
+			if len(option.ALPN) == 1 && option.ALPN[0] == "h3" {
+				return nil, errors.New("xhttp external transport cannot force HTTP/3")
+			}
+			if option.XHTTPOpts.DownloadSettings != nil {
+				return nil, errors.New("xhttp external transport does not support download-settings")
+			}
+			if err := xhttp.PrepareExternalTransportConfig(cfg); err != nil {
+				return nil, err
+			}
+		}
+
 		makeTransport := func() http.RoundTripper {
+			if useExternalTransport {
+				return xhttp.ExternalTransportMaker(xhttp.ExternalTransportOptions{
+					ServerAddress: v.addr,
+					Host:          requestHost,
+				})()
+			}
 			return xhttp.NewTransport(
 				func(ctx context.Context) (net.Conn, error) {
 					return v.dialer.DialContext(ctx, "tcp", v.addr)
