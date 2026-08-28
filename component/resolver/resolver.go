@@ -66,6 +66,24 @@ type Resolver interface {
 	ResetConnection()
 }
 
+// IPCandidateBatch is one independently resolved set of addresses. DIRECT
+// uses the optional ProgressiveResolver interface to start TCP connects as
+// soon as one direct-nameserver answers, while later servers may still add
+// candidates to the same race.
+type IPCandidateBatch struct {
+	IPs    []netip.Addr
+	Source int
+	Err    error
+}
+
+// ProgressiveResolver is deliberately optional: only the resolver built from
+// direct-nameserver implements it. Other resolver users retain the ordinary
+// one-shot Resolver contract.
+type ProgressiveResolver interface {
+	LookupIPCandidates(ctx context.Context, host string, ipv6 bool, networkScope string) <-chan IPCandidateBatch
+	PromoteIP(host string, ipv6 bool, networkScope string, ip netip.Addr)
+}
+
 const defaultIPv6Timeout = 100 * time.Millisecond
 
 // IPv6Timeout returns the resolver's AAAA wait budget. Resolver
@@ -289,6 +307,22 @@ func ClearCache() {
 		go DefaultResolver.ClearCache()
 	}
 	go SystemResolver.ClearCache() // SystemResolver unneeded check nil
+}
+
+// ClearVolatileCache drops ordinary resolver answers after a network handover
+// without deleting long-lived, network-scoped source candidates.
+func ClearVolatileCache() {
+	clear := func(r Resolver) {
+		if volatile, ok := r.(interface{ ClearVolatileCache() }); ok {
+			volatile.ClearVolatileCache()
+		} else {
+			r.ClearCache()
+		}
+	}
+	if DefaultResolver != nil {
+		go clear(DefaultResolver)
+	}
+	go clear(SystemResolver)
 }
 
 func ResetConnection() {

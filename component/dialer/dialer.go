@@ -51,8 +51,21 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 		network = fmt.Sprintf("%s%d", network, opt.network)
 	}
 
-	if network == "tcp" && opt.directRace && !GetTcpConcurrent() {
-		return directDualStackDialContext(ctx, network, address, opt)
+	if isTCPNetwork(network) && opt.directRace {
+		host, _, splitErr := net.SplitHostPort(address)
+		if splitErr == nil && canUseProgressiveDirect(host) {
+			preferResolver := opt.resolver
+			if preferResolver == nil {
+				preferResolver = resolver.ProxyServerHostResolver
+			}
+			if progressive, ok := preferResolver.(resolver.ProgressiveResolver); ok {
+				opt.resolver = preferResolver
+				return directProgressiveDialContext(ctx, network, address, opt, progressive)
+			}
+		}
+		if network == "tcp" && !GetTcpConcurrent() {
+			return directDualStackDialContext(ctx, network, address, opt)
+		}
 	}
 
 	ips, port, err := parseAddr(ctx, network, address, opt.resolver)

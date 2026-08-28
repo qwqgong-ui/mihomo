@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"time"
 
@@ -48,6 +49,7 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
+	sourceCaches          []dnsCache
 }
 
 func (r *Resolver) IPv6Timeout() time.Duration {
@@ -398,6 +400,15 @@ func (r *Resolver) Invalid() bool {
 }
 
 func (r *Resolver) ClearCache() {
+	r.ClearVolatileCache()
+	if r != nil {
+		for _, cache := range r.sourceCaches {
+			cache.Clear()
+		}
+	}
+}
+
+func (r *Resolver) ClearVolatileCache() {
 	if r != nil && r.cache != nil {
 		r.cache.Clear()
 	}
@@ -507,7 +518,7 @@ func (config Config) newCache() dnsCache {
 type Resolvers struct {
 	*Resolver
 	ProxyResolver  *Resolver
-	DirectResolver *Resolver
+	DirectResolver *directResolver
 	// BootstrapResolver is the `default-nameserver` resolver, which only
 	// talks to plain IP servers and is therefore the one path that resolves
 	// a hostname regardless of how the other lists are configured.
@@ -518,6 +529,12 @@ func (rs Resolvers) ClearCache() {
 	rs.Resolver.ClearCache()
 	rs.ProxyResolver.ClearCache()
 	rs.DirectResolver.ClearCache()
+}
+
+func (rs Resolvers) ClearVolatileCache() {
+	rs.Resolver.ClearVolatileCache()
+	rs.ProxyResolver.ClearVolatileCache()
+	rs.DirectResolver.ClearVolatileCache()
 }
 
 func (rs Resolvers) ResetConnection() {
@@ -633,6 +650,7 @@ func NewResolver(config Config) (rs Resolvers) {
 	}
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
+	rs.DirectResolver = &directResolver{Resolver: &Resolver{}}
 	registerPersistentCache("main", r.cache)
 	rs.BootstrapResolver = defaultResolver
 
@@ -648,13 +666,18 @@ func NewResolver(config Config) (rs Resolvers) {
 	}
 
 	if len(config.DirectServer) != 0 {
-		rs.DirectResolver = &Resolver{
+		rs.DirectResolver = &directResolver{Resolver: &Resolver{
 			ipv6:        config.IPv6,
 			main:        cacheTransform(config.DirectServer),
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
-		}
+		}}
 		registerPersistentCache("direct", rs.DirectResolver.cache)
+		for index := range rs.DirectResolver.main {
+			sourceCache := config.newCache()
+			rs.DirectResolver.sourceCaches = append(rs.DirectResolver.sourceCaches, sourceCache)
+			registerPersistentCache(fmt.Sprintf("direct-source-%d", index+1), sourceCache)
+		}
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy
 		}

@@ -135,6 +135,24 @@ func (c *TCPConcurrentCache) SetWithRTT(key string, winner netip.Addr, rtt time.
 	})
 }
 
+// SetIfFaster records winner only when it is the first measured candidate or
+// beats the still-live sample already stored for the scoped destination.
+func (c *TCPConcurrentCache) SetIfFaster(key string, winner netip.Addr, rtt time.Duration) bool {
+	if c == nil || key == "" || !winner.IsValid() || rtt <= 0 {
+		return false
+	}
+	now := c.now()
+	updated := false
+	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
+		if loaded && now.Before(current.expireAt) && current.rtt > 0 && current.rtt <= rtt {
+			return current, false
+		}
+		updated = true
+		return tcpConcurrentCacheEntry{winner: winner.Unmap(), rtt: rtt, expireAt: now.Add(c.ttl)}, false
+	})
+	return updated
+}
+
 // Delete removes a destination from the cache.
 func (c *TCPConcurrentCache) Delete(key string) {
 	if c == nil || key == "" {
@@ -160,6 +178,10 @@ func ClearTCPConcurrentCache() {
 }
 
 func tcpConcurrentCacheKey(host, port, network string) (string, bool) {
+	return tcpConcurrentCacheScopedKey(host, port, network, "")
+}
+
+func tcpConcurrentCacheScopedKey(host, port, network, scope string) (string, bool) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 	default:
@@ -172,7 +194,11 @@ func tcpConcurrentCacheKey(host, port, network string) (string, bool) {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return "", false
 	}
-	return net.JoinHostPort(host, port) + "/" + network, true
+	key := net.JoinHostPort(host, port) + "/" + network
+	if scope != "" {
+		key += "\x00" + scope
+	}
+	return key, true
 }
 
 func containsTCPConcurrentCandidate(candidates []netip.Addr, winner netip.Addr) bool {
