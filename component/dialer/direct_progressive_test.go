@@ -2,6 +2,7 @@ package dialer
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"testing"
@@ -94,6 +95,185 @@ func TestProgressiveDirectReturnsFirstDNSRaceAndAcceptsLaterFasterSource(t *test
 	winner, loaded := tcpConcurrentCache.Get(key)
 	if !loaded || winner != laterIP {
 		t.Fatalf("TCP winner = %s, loaded=%v", winner, loaded)
+	}
+}
+
+func TestProgressiveDirectUsesTCPConcurrentWinnerBeforeStaleCandidates(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previousConcurrent := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
+	SetDirectNetworkEnvironment("tcp-cache-test")
+	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
+
+	cachedIP := netip.MustParseAddr("192.0.2.2")
+	otherIP := netip.MustParseAddr("192.0.2.1")
+	key, ok := tcpConcurrentCacheScopedKey("stale.example", "443", "tcp", "environment|tcp-cache-test")
+	if !ok {
+		t.Fatal("missing scoped TCP winner cache key")
+	}
+	cache.SetWithRTT(key, cachedIP, 5*time.Millisecond)
+
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{otherIP, cachedIP}, Source: -1}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	progressive := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 4)}
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	dial := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
+		otherIP:  {{release: blocked}},
+		cachedIP: {{release: closedTestGate()}},
+	})
+
+	conn, err := directProgressiveDialContext(context.Background(), "tcp", "stale.example:443", option{netDialer: dial}, progressive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	time.Sleep(10 * time.Millisecond)
+	if dial.count(cachedIP) != 1 || dial.count(otherIP) != 0 {
+		t.Fatalf("attempt counts = cached:%d other:%d; want cached:1 other:0", dial.count(cachedIP), dial.count(otherIP))
+	}
+	if winner, loaded := cache.Get(key); !loaded || winner != cachedIP {
+		t.Fatalf("TCP winner = %s, loaded=%v; want %s, true", winner, loaded, cachedIP)
+	}
+}
+
+func TestProgressiveDirectTCPConcurrentFailureFallsBackToAllCandidates(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previousConcurrent := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
+	SetDirectNetworkEnvironment("tcp-cache-fallback-test")
+	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
+
+	cachedIP := netip.MustParseAddr("192.0.2.2")
+	otherIP := netip.MustParseAddr("192.0.2.1")
+	key, ok := tcpConcurrentCacheScopedKey("fallback.example", "443", "tcp", "environment|tcp-cache-fallback-test")
+	if !ok {
+		t.Fatal("missing scoped TCP winner cache key")
+	}
+	cache.SetWithRTT(key, cachedIP, 5*time.Millisecond)
+
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{otherIP, cachedIP}, Source: -1}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	progressive := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 4)}
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	dial := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
+		otherIP: {{release: closedTestGate()}},
+		cachedIP: {
+			{release: closedTestGate(), err: errors.New("cached address failed")},
+			{release: blocked},
+		},
+	})
+
+	conn, err := directProgressiveDialContext(context.Background(), "tcp", "fallback.example:443", option{netDialer: dial}, progressive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	waitForAttemptCount(t, dial, cachedIP, 2)
+	if dial.count(otherIP) != 1 {
+		t.Fatalf("fallback attempts for other candidate = %d, want 1", dial.count(otherIP))
+	}
+	if winner, loaded := cache.Get(key); !loaded || winner != otherIP {
+		t.Fatalf("replacement TCP winner = %s, loaded=%v; want %s, true", winner, loaded, otherIP)
+	}
+}
+
+func TestProgressiveDirectTCPConcurrentTimeoutFallsBackToAllCandidates(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previousConcurrent := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
+	SetDirectNetworkEnvironment("tcp-cache-timeout-test")
+	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
+
+	cachedIP := netip.MustParseAddr("192.0.2.2")
+	otherIP := netip.MustParseAddr("192.0.2.1")
+	key, ok := tcpConcurrentCacheScopedKey("timeout.example", "443", "tcp", "environment|tcp-cache-timeout-test")
+	if !ok {
+		t.Fatal("missing scoped TCP winner cache key")
+	}
+	cache.SetWithRTT(key, cachedIP, time.Millisecond)
+
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{otherIP, cachedIP}, Source: -1}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	progressive := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 4)}
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	dial := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
+		otherIP: {{release: closedTestGate()}},
+		cachedIP: {
+			{release: nil},
+			{release: blocked},
+		},
+	})
+
+	started := time.Now()
+	conn, err := directProgressiveDialContext(context.Background(), "tcp", "timeout.example:443", option{netDialer: dial}, progressive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if elapsed := time.Since(started); elapsed < minFastPathTimeout {
+		t.Fatalf("fallback started before cached fast-path timeout: %s", elapsed)
+	}
+	waitForAttemptCount(t, dial, cachedIP, 2)
+	if dial.count(otherIP) != 1 {
+		t.Fatalf("fallback attempts for other candidate = %d, want 1", dial.count(otherIP))
+	}
+	if winner, loaded := cache.Get(key); !loaded || winner != otherIP {
+		t.Fatalf("replacement TCP winner = %s, loaded=%v; want %s, true", winner, loaded, otherIP)
+	}
+}
+
+func TestProgressiveDirectIgnoresCachedWinnerFromUnavailableFamily(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previousConcurrent := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
+	SetDirectNetworkEnvironment("tcp-cache-family-test")
+	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
+
+	cachedIPv6 := netip.MustParseAddr("2001:db8::2")
+	currentIPv4 := netip.MustParseAddr("192.0.2.1")
+	key, ok := tcpConcurrentCacheScopedKey("family.example", "443", "tcp4", "environment|tcp-cache-family-test")
+	if !ok {
+		t.Fatal("missing scoped TCP winner cache key")
+	}
+	cache.SetWithRTT(key, cachedIPv6, 5*time.Millisecond)
+
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{currentIPv4}, Source: -1}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	progressive := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 4)}
+	dial := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
+		currentIPv4: {{release: closedTestGate()}},
+		cachedIPv6:  {{release: closedTestGate()}},
+	})
+
+	conn, err := directProgressiveDialContext(context.Background(), "tcp4", "family.example:443", option{netDialer: dial}, progressive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if dial.count(currentIPv4) != 1 || dial.count(cachedIPv6) != 0 {
+		t.Fatalf("attempt counts = current:%d unavailable:%d; want current:1 unavailable:0", dial.count(currentIPv4), dial.count(cachedIPv6))
+	}
+	if winner, loaded := cache.Get(key); !loaded || winner != currentIPv4 {
+		t.Fatalf("replacement TCP winner = %s, loaded=%v; want %s, true", winner, loaded, currentIPv4)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	R "github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/log"
 )
 
 type progressiveCandidateEvent struct {
@@ -23,6 +24,7 @@ type progressiveConnectResult struct {
 	dialResult
 	ipv6 bool
 	rtt  time.Duration
+	fast bool
 }
 
 func canUseProgressiveDirect(host string) bool {
@@ -134,6 +136,31 @@ func runProgressiveDirectRace(
 	preferenceEnabled := opt.prefer == 4 || opt.prefer == 6
 	var preferenceTimer *time.Timer
 	var preferenceTimeout <-chan time.Time
+	type queuedCandidate struct {
+		ip   netip.Addr
+		ipv6 bool
+	}
+	var queued []queuedCandidate
+	var cachedIP netip.Addr
+	var cachedRTT time.Duration
+	cachePending := false
+	if cacheKey != "" && GetTcpConcurrent() {
+		cachedIP, cachePending = tcpConcurrentCache.Get(cacheKey)
+		if cachePending {
+			cachedRTT, _ = tcpConcurrentCache.RTT(cacheKey)
+			cachedFamilyUnavailable := cachedIP.Is4() && network == "tcp6" ||
+				cachedIP.Is6() && (network == "tcp4" || R.DisableIPv6.Load())
+			if cachedFamilyUnavailable {
+				tcpConcurrentCache.Delete(cacheKey)
+				cachePending = false
+			}
+		}
+	}
+	fastActive := false
+	fastSucceeded := false
+	var cancelFast context.CancelFunc
+	var fastTimer *time.Timer
+	var fastTimeout <-chan time.Time
 
 	deliver := func(conn net.Conn, ip netip.Addr) {
 		if delivered {
@@ -195,6 +222,70 @@ func runProgressiveDirectRace(
 			}
 		}()
 	}
+	startQueued := func() {
+		for _, candidate := range queued {
+			start(candidate.ip, candidate.ipv6)
+		}
+		queued = nil
+	}
+	stopFastTimer := func() {
+		fastTimeout = nil
+		if fastTimer == nil {
+			return
+		}
+		if !fastTimer.Stop() {
+			select {
+			case <-fastTimer.C:
+			default:
+			}
+		}
+		fastTimer = nil
+	}
+	startFast := func(ip netip.Addr, ipv6 bool) {
+		fastActive = true
+		fastCtx, cancel := context.WithCancel(ctx)
+		cancelFast = cancel
+		fastTimer = time.NewTimer(fastPathTimeoutFor(cachedRTT))
+		fastTimeout = fastTimer.C
+		pending++
+		family := 0
+		if ipv6 {
+			family = 1
+		}
+		pendingFamily[family]++
+		go func() {
+			connectOpt := opt
+			connectOpt.tfo = false
+			started := time.Now()
+			conn, err := dialContext(fastCtx, network, ip, port, connectOpt)
+			result := progressiveConnectResult{
+				dialResult: dialResult{ip: ip, Conn: conn, error: err},
+				ipv6:       ipv6,
+				rtt:        time.Since(started),
+				fast:       true,
+			}
+			select {
+			case connects <- result:
+			case <-ctx.Done():
+				if conn != nil {
+					_ = conn.Close()
+				}
+			}
+		}()
+	}
+	fallbackCached := func() {
+		cachePending = false
+		fastActive = false
+		stopFastTimer()
+		if cancelFast != nil {
+			cancelFast()
+			cancelFast = nil
+		}
+		if cacheKey != "" {
+			tcpConcurrentCache.Delete(cacheKey)
+		}
+		startQueued()
+	}
 	preferredDone := func() bool {
 		if !preferenceEnabled {
 			return true
@@ -233,6 +324,9 @@ func runProgressiveDirectRace(
 			return
 		case event := <-events:
 			if event.done {
+				if cachePending && event.ipv6 == cachedIP.Is6() {
+					fallbackCached()
+				}
 				doneFamilies++
 				if event.ipv6 {
 					doneFamily[1] = true
@@ -249,6 +343,25 @@ func runProgressiveDirectRace(
 				errs = append(errs, event.Err)
 				continue
 			}
+			if fastSucceeded {
+				continue
+			}
+			if cachePending || fastActive {
+				for _, ip := range event.IPs {
+					queued = append(queued, queuedCandidate{ip: ip, ipv6: event.ipv6})
+				}
+				if cachePending && event.ipv6 == cachedIP.Is6() {
+					cachePending = false
+					if containsTCPConcurrentCandidate(event.IPs, cachedIP) {
+						log.Debugln("[TCP] progressive direct cache hit %s:%s --> %s", host, port, cachedIP)
+						startFast(cachedIP, event.ipv6)
+					} else {
+						log.Debugln("[TCP] progressive direct cache expired %s:%s --> %s; racing current candidates", host, port, cachedIP)
+						fallbackCached()
+					}
+				}
+				continue
+			}
 			for _, ip := range event.IPs {
 				start(ip, event.ipv6)
 			}
@@ -258,6 +371,35 @@ func runProgressiveDirectRace(
 				pendingFamily[1]--
 			} else {
 				pendingFamily[0]--
+			}
+			if result.fast {
+				if !fastActive {
+					if result.Conn != nil {
+						_ = result.Conn.Close()
+					}
+					continue
+				}
+				fastActive = false
+				stopFastTimer()
+				if cancelFast != nil {
+					cancelFast()
+					cancelFast = nil
+				}
+				if result.error != nil {
+					log.Debugln("[TCP] progressive direct cached connect failed %s:%s --> %s: %v", host, port, result.ip, result.error)
+					errs = append(errs, fmt.Errorf("cached connect %s failed: %w", result.ip, result.error))
+					if cacheKey != "" {
+						tcpConcurrentCache.Delete(cacheKey)
+					}
+					startQueued()
+					continue
+				}
+				fastSucceeded = true
+				queued = nil
+				log.Debugln("[TCP] progressive direct cached connect ready %s:%s --> %s in %s", host, port, result.ip, result.rtt)
+				promote(result)
+				deliver(result.Conn, result.ip)
+				continue
 			}
 			if result.error != nil {
 				errs = append(errs, fmt.Errorf("connect %s failed: %w", result.ip, result.error))
@@ -298,6 +440,9 @@ func runProgressiveDirectRace(
 				deliver(heldFallback, netip.Addr{})
 				heldFallback = nil
 			}
+		case <-fastTimeout:
+			log.Debugln("[TCP] progressive direct cached connect timeout %s:%s --> %s; racing current candidates", host, port, cachedIP)
+			fallbackCached()
 		}
 	}
 }
