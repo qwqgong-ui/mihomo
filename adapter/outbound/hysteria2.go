@@ -62,6 +62,7 @@ type Hysteria2Option struct {
 	BBRProfile        string     `proxy:"bbr-profile,omitempty"`
 	UdpMTU            int        `proxy:"udp-mtu,omitempty"`
 	HandshakeTimeout  int        `proxy:"handshake-timeout,omitempty"`
+	HybridQUIC        *bool      `proxy:"hybrid-quic,omitempty"`
 
 	RealmOpts Hysteria2RealmOption `proxy:"realm-opts,omitempty"`
 
@@ -97,6 +98,32 @@ func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 	return NewConn(c, h), nil
 }
 
+func (h *Hysteria2) hybridQUICEnabled() bool {
+	return h.option.HybridQUIC == nil || *h.option.HybridQUIC
+}
+
+// ResolveUDP keeps ordinary HY2 remote DNS behavior except for eligible
+// hybrid QUIC traffic. A hybrid registration must carry one concrete public
+// target IP; the server never infers it from a domain or SNI.
+func (h *Hysteria2) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	if err := h.Base.ResolveUDP(ctx, metadata); err != nil {
+		return err
+	}
+	if !h.hybridQUICEnabled() || metadata.DstPort != 443 || metadata.Host == "" {
+		return nil
+	}
+	// Resolve through the authenticated HY2 path. The ordinary/default resolver
+	// may intentionally return a synthetic fake-IP, while a direct resolver can
+	// be poisoned on networks that block Google and other QUIC destinations.
+	target, err := h.resolveHybridTargetViaHY2(ctx, metadata.Host)
+	if err != nil || !isHybridPublicTarget(target) {
+		return nil
+	}
+	metadata.DstIP = target
+	metadata.Host = ""
+	return nil
+}
+
 func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
@@ -107,6 +134,23 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	}
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
+	}
+	defaultRoute := h.option.Interface == "" && h.option.RoutingMark == 0 && h.option.DialerProxy == "" && h.option.DialerForAPI == nil
+	if h.hybridQUICEnabled() && defaultRoute && metadata.DstPort == 443 && metadata.DstIP.IsValid() && isHybridPublicTarget(metadata.DstIP) {
+		relay, resolveErr := resolveHybridRelay(ctx, h.option.Server, h.option.Port)
+		if resolveErr == nil {
+			pc = newHybridQUICPacketConn(N.NewThreadSafePacketConn(pc), relay, func() (net.PacketConn, error) {
+				return h.dialer.ListenPacket(context.Background(), "udp6", "", relay)
+			}, func() (net.PacketConn, error) {
+				fallback, fallbackErr := h.client.ListenPacket(context.Background())
+				if fallbackErr != nil {
+					return nil, fallbackErr
+				}
+				return N.NewThreadSafePacketConn(fallback), nil
+			})
+			return NewPacketConn(pc, h), nil
+		}
+		log.Debugln("hysteria2 hybrid QUIC unavailable, using HY2: %v", resolveErr)
 	}
 	return NewPacketConn(N.NewThreadSafePacketConn(pc), h), nil
 }
