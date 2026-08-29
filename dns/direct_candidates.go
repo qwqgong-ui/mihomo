@@ -102,7 +102,8 @@ func (r *Resolver) directCachedCandidates(key string, sourceCount int) []netip.A
 
 // LookupIPCandidates implements resolver.ProgressiveResolver for the
 // direct-nameserver resolver only. A valid ordinary cache is returned without
-// network I/O. A cold miss walks servers in order. A stale entry refreshes #1
+// network I/O. A cold miss walks servers in order. A stale entry first
+// publishes still-live, network-scoped source candidates, then refreshes #1
 // and #2 independently and publishes either response as soon as it arrives.
 func (direct *directResolver) LookupIPCandidates(ctx context.Context, host string, ipv6 bool, networkScope string) <-chan R.IPCandidateBatch {
 	r := direct.Resolver
@@ -150,6 +151,11 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 		}
 
 		parallel := min(2, len(r.main))
+		if candidates := r.directCachedCandidates(key, len(r.main)); len(candidates) != 0 {
+			_, qType := msgToQtype(query)
+			log.Debugln("[DNS] direct source cache hit %s %s with %d candidates; refreshing in background", host, qType, len(candidates))
+			output <- R.IPCandidateBatch{IPs: candidates, Source: -1}
+		}
 		type answer struct {
 			source int
 			msg    *D.Msg

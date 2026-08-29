@@ -138,3 +138,101 @@ func TestDirectCandidatesStaleCachePublishesTwoSourcesIndependently(t *testing.T
 		t.Fatalf("ordinary winner cache = %v, hit=%v", msgToIP(winner), hit)
 	}
 }
+
+func TestDirectCandidatesStaleCachePublishesSourceCacheBeforeRefresh(t *testing.T) {
+	release1 := make(chan struct{})
+	release2 := make(chan struct{})
+	r := newDirectCandidateResolver(
+		&directCandidateClient{address: "#1", exchange: func(_ context.Context, query *D.Msg) (*D.Msg, error) {
+			<-release1
+			return directAnswer(query, "192.0.2.11", 60), nil
+		}},
+		&directCandidateClient{address: "#2", exchange: func(_ context.Context, query *D.Msg) (*D.Msg, error) {
+			<-release2
+			return directAnswer(query, "192.0.2.12", 60), nil
+		}},
+	)
+	scope := "wlan0|192.168.0.0/16"
+	q := directQuestion("cached.example", false)
+	key := directCacheKey(scope, q)
+	query := new(D.Msg).SetQuestion(q.Name, q.Qtype)
+	r.cache.SetWithExpire(key, directAnswer(query, "192.0.2.9", 60), time.Now().Add(-time.Second))
+	for source, ip := range []string{"192.0.2.1", "192.0.2.2"} {
+		r.sourceCaches[source].SetWithExpire(
+			r.directSourceCacheKey(key, source),
+			directAnswer(query, ip, 60),
+			time.Now().Add(time.Hour),
+		)
+	}
+
+	batches := r.LookupIPCandidates(context.Background(), "cached.example", false, scope)
+	select {
+	case first := <-batches:
+		want := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}
+		if first.Source != -1 || len(first.IPs) != len(want) {
+			t.Fatalf("source-cache batch: %+v", first)
+		}
+		for index := range want {
+			if first.IPs[index] != want[index] {
+				t.Fatalf("source-cache batch IPs = %v, want %v", first.IPs, want)
+			}
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("stale lookup waited for DNS refresh before publishing source cache")
+	}
+
+	close(release1)
+	close(release2)
+	var refreshed []netip.Addr
+	for batch := range batches {
+		if batch.Err != nil {
+			t.Fatal(batch.Err)
+		}
+		refreshed = batch.IPs
+	}
+	if !containsAddr(refreshed, netip.MustParseAddr("192.0.2.11")) ||
+		!containsAddr(refreshed, netip.MustParseAddr("192.0.2.12")) {
+		t.Fatalf("refreshed candidates = %v", refreshed)
+	}
+}
+
+func TestDirectCandidatesSourceCacheIsNetworkScoped(t *testing.T) {
+	release := make(chan struct{})
+	r := newDirectCandidateResolver(
+		&directCandidateClient{address: "#1", exchange: func(_ context.Context, query *D.Msg) (*D.Msg, error) {
+			<-release
+			return directAnswer(query, "192.0.2.11", 60), nil
+		}},
+	)
+	q := directQuestion("scoped.example", false)
+	query := new(D.Msg).SetQuestion(q.Name, q.Qtype)
+	oldScope := "wlan0|192.168.0.0/16"
+	newScope := "wlan0|10.0.0.0/24"
+	oldKey := directCacheKey(oldScope, q)
+	newKey := directCacheKey(newScope, q)
+	r.sourceCaches[0].SetWithExpire(
+		r.directSourceCacheKey(oldKey, 0),
+		directAnswer(query, "192.0.2.1", 60),
+		time.Now().Add(time.Hour),
+	)
+	r.cache.SetWithExpire(newKey, directAnswer(query, "192.0.2.9", 60), time.Now().Add(-time.Second))
+
+	batches := r.LookupIPCandidates(context.Background(), "scoped.example", false, newScope)
+	select {
+	case batch := <-batches:
+		t.Fatalf("different-network source cache was published: %+v", batch)
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	for range batches {
+	}
+}
+
+func containsAddr(addrs []netip.Addr, want netip.Addr) bool {
+	for _, addr := range addrs {
+		if addr == want {
+			return true
+		}
+	}
+	return false
+}
