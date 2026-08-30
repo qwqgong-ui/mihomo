@@ -1239,7 +1239,7 @@ proxies: # socks5
   #hysteria2
   - name: "hysteria2"
     type: hysteria2
-    # hybrid-quic: false # 默认开启；设为 false 可关闭。仅公网 IPv6：QUIC Initial 走 HY2，其余 UDP 走认证 raw relay。
+    # hybrid-quic: false # 默认开启；设为 false 可关闭。仅公网 IPv6：QUIC Initial 走 HY2，其余 UDP 走认证 raw relay。dual 目标优先 IPv6。
     server: server.com
     port: 443
     # ports: 1000,2000-3000,5000 # port 不可省略

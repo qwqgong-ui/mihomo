@@ -32,8 +32,9 @@ const defaultHopInterval = 30
 type Hysteria2 struct {
 	*Base
 
-	option *Hysteria2Option
-	client *hysteria2.Client
+	option            *Hysteria2Option
+	client            *hysteria2.Client
+	hybridTargetCache *hybridTargetCache
 }
 
 type Hysteria2Option struct {
@@ -184,7 +185,8 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			Prefer:       option.IPVersion,
 			RemoteDNS:    true,
 		}),
-		option: &option,
+		option:            &option,
+		hybridTargetCache: newHybridTargetCache(),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 

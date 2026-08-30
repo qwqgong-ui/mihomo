@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,75 +26,163 @@ const (
 
 var hybridQUICDNSAddress = netip.MustParseAddrPort("1.1.1.1:53")
 
-func (h *Hysteria2) resolveHybridTargetViaHY2(ctx context.Context, host string) (netip.Addr, error) {
-	queryTypes := []uint16{dns.TypeA, dns.TypeAAAA}
-	switch h.prefer {
+const hybridTargetCacheMaxEntries = 256
+
+type hybridTargetCacheEntry struct {
+	addr      netip.Addr
+	expiresAt time.Time
+}
+
+type hybridTargetCache struct {
+	mu      sync.Mutex
+	entries map[string]hybridTargetCacheEntry
+	now     func() time.Time
+}
+
+func newHybridTargetCache() *hybridTargetCache {
+	return &hybridTargetCache{
+		entries: make(map[string]hybridTargetCacheEntry),
+		now:     time.Now,
+	}
+}
+
+func hybridTargetCacheKey(host string) string {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+func (c *hybridTargetCache) get(host string) (netip.Addr, bool) {
+	if c == nil {
+		return netip.Addr{}, false
+	}
+	key := hybridTargetCacheKey(host)
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, loaded := c.entries[key]
+	if !loaded {
+		return netip.Addr{}, false
+	}
+	if !now.Before(entry.expiresAt) {
+		delete(c.entries, key)
+		return netip.Addr{}, false
+	}
+	return entry.addr, true
+}
+
+func (c *hybridTargetCache) set(host string, addr netip.Addr, ttl time.Duration) {
+	if c == nil || ttl <= 0 || !isHybridPublicTarget(addr) {
+		return
+	}
+	key := hybridTargetCacheKey(host)
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.entries) >= hybridTargetCacheMaxEntries {
+		for existingKey, entry := range c.entries {
+			if !now.Before(entry.expiresAt) {
+				delete(c.entries, existingKey)
+			}
+		}
+	}
+	if len(c.entries) >= hybridTargetCacheMaxEntries {
+		// The cache is deliberately small. Evict one arbitrary entry instead of
+		// allowing untrusted destination names to grow it without bound.
+		for existingKey := range c.entries {
+			delete(c.entries, existingKey)
+			break
+		}
+	}
+	c.entries[key] = hybridTargetCacheEntry{addr: addr.Unmap(), expiresAt: now.Add(ttl)}
+}
+
+type hybridTargetQuery func(context.Context, string, uint16) (netip.Addr, time.Duration, error)
+
+func resolveHybridTarget(ctx context.Context, host string, prefer C.DNSPrefer, cache *hybridTargetCache, query hybridTargetQuery) (netip.Addr, error) {
+	if target, loaded := cache.get(host); loaded {
+		return target, nil
+	}
+
+	// Dual stack favors IPv6 for hybrid QUIC. IPv4 remains the fallback when
+	// the destination has no usable AAAA response.
+	queryTypes := []uint16{dns.TypeAAAA, dns.TypeA}
+	switch prefer {
 	case C.IPv4Only:
-		queryTypes = queryTypes[:1]
-	case C.IPv6Only:
 		queryTypes = queryTypes[1:]
-	case C.IPv6Prefer:
+	case C.IPv6Only:
+		queryTypes = queryTypes[:1]
+	case C.IPv4Prefer:
 		queryTypes[0], queryTypes[1] = queryTypes[1], queryTypes[0]
 	}
 
 	var queryErrors []error
 	for _, queryType := range queryTypes {
-		pc, err := h.client.ListenPacket(ctx)
-		if err != nil {
-			queryErrors = append(queryErrors, err)
-			continue
+		target, ttl, err := query(ctx, host, queryType)
+		if err == nil && isHybridPublicTarget(target) {
+			cache.set(host, target, ttl)
+			return target, nil
 		}
-		deadline := time.Now().Add(3 * time.Second)
-		if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-			deadline = ctxDeadline
-		}
-		_ = pc.SetDeadline(deadline)
-
-		request := new(dns.Msg)
-		request.SetQuestion(dns.Fqdn(host), queryType)
-		wire, packErr := request.Pack()
-		if packErr != nil {
-			_ = pc.Close()
-			return netip.Addr{}, packErr
-		}
-		_, writeErr := pc.WriteTo(wire, net.UDPAddrFromAddrPort(hybridQUICDNSAddress))
-		if writeErr != nil {
-			_ = pc.Close()
-			queryErrors = append(queryErrors, writeErr)
-			continue
-		}
-		responseWire := make([]byte, 4096)
-		n, _, readErr := pc.ReadFrom(responseWire)
-		_ = pc.Close()
-		if readErr != nil {
-			queryErrors = append(queryErrors, readErr)
-			continue
-		}
-		response := new(dns.Msg)
-		if unpackErr := response.Unpack(responseWire[:n]); unpackErr != nil {
-			queryErrors = append(queryErrors, unpackErr)
-			continue
-		}
-		if response.Id != request.Id || !response.Response || response.Rcode != dns.RcodeSuccess {
-			queryErrors = append(queryErrors, errors.New("invalid hybrid QUIC DNS response"))
-			continue
-		}
-		for _, answer := range response.Answer {
-			var target netip.Addr
-			switch record := answer.(type) {
-			case *dns.A:
-				target, _ = netip.AddrFromSlice(record.A)
-			case *dns.AAAA:
-				target, _ = netip.AddrFromSlice(record.AAAA)
-			}
-			target = target.Unmap()
-			if isHybridPublicTarget(target) {
-				return target, nil
-			}
-		}
-		queryErrors = append(queryErrors, errors.New("hybrid QUIC DNS response has no public address"))
+		queryErrors = append(queryErrors, err)
 	}
 	return netip.Addr{}, errors.Join(queryErrors...)
+}
+
+func (h *Hysteria2) resolveHybridTargetViaHY2(ctx context.Context, host string) (netip.Addr, error) {
+	return resolveHybridTarget(ctx, host, h.prefer, h.hybridTargetCache, h.queryHybridTargetViaHY2)
+}
+
+func (h *Hysteria2) queryHybridTargetViaHY2(ctx context.Context, host string, queryType uint16) (netip.Addr, time.Duration, error) {
+	pc, err := h.client.ListenPacket(ctx)
+	if err != nil {
+		return netip.Addr{}, 0, err
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = pc.SetDeadline(deadline)
+
+	request := new(dns.Msg)
+	request.SetQuestion(dns.Fqdn(host), queryType)
+	wire, err := request.Pack()
+	if err != nil {
+		_ = pc.Close()
+		return netip.Addr{}, 0, err
+	}
+	if _, err = pc.WriteTo(wire, net.UDPAddrFromAddrPort(hybridQUICDNSAddress)); err != nil {
+		_ = pc.Close()
+		return netip.Addr{}, 0, err
+	}
+	responseWire := make([]byte, 4096)
+	n, _, err := pc.ReadFrom(responseWire)
+	_ = pc.Close()
+	if err != nil {
+		return netip.Addr{}, 0, err
+	}
+	response := new(dns.Msg)
+	if err = response.Unpack(responseWire[:n]); err != nil {
+		return netip.Addr{}, 0, err
+	}
+	if response.Id != request.Id || !response.Response || response.Rcode != dns.RcodeSuccess {
+		return netip.Addr{}, 0, errors.New("invalid hybrid QUIC DNS response")
+	}
+	for _, answer := range response.Answer {
+		var target netip.Addr
+		switch record := answer.(type) {
+		case *dns.A:
+			if queryType == dns.TypeA {
+				target, _ = netip.AddrFromSlice(record.A)
+			}
+		case *dns.AAAA:
+			if queryType == dns.TypeAAAA {
+				target, _ = netip.AddrFromSlice(record.AAAA)
+			}
+		}
+		target = target.Unmap()
+		if isHybridPublicTarget(target) {
+			return target, time.Duration(answer.Header().Ttl) * time.Second, nil
+		}
+	}
+	return netip.Addr{}, 0, errors.New("hybrid QUIC DNS response has no public address")
 }
 
 type hybridQUICPacketConn struct {
