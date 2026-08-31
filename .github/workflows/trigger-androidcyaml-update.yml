@@ -81,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           git -C mihomo diff --check
-          test -f mihomo/androidcyaml/facade.go
+          test -f mihomo/androidcyaml/doc.go
           if [[ -d AndroidCyaml/patches/mihomo ]] && \
             find AndroidCyaml/patches/mihomo -maxdepth 1 -type f -name '*.patch' -print -quit | grep -q .; then
             echo "::error::AndroidCyaml must consume the mihomo facade without source patches"
