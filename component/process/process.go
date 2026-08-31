@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/netip"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	C "github.com/metacubex/mihomo/constant"
 )
 
@@ -39,10 +40,21 @@ type RuleProcessMatcher interface {
 // unavailable or permission-denied native mechanism.
 type EndpointResolver func(network string, src, dst netip.AddrPort) (uint32, string, error)
 
-var externalEndpointResolver EndpointResolver
+// An embedding platform can register and clear this while connections are being
+// matched: a core restarted in-process writes it from the start and stop paths
+// while rule evaluation reads it on the hot path. A plain variable is a data
+// race there, so the value is published atomically.
+var externalEndpointResolver atomic.TypedValue[EndpointResolver]
 
 func SetEndpointResolver(resolver EndpointResolver) {
-	externalEndpointResolver = resolver
+	externalEndpointResolver.Store(resolver)
+}
+
+// EndpointResolverInstalled reports whether a platform lookup is registered.
+// Such a resolver already returns the package name alongside the UID, so a
+// caller must not spend a second lookup mapping that UID back to a name.
+func EndpointResolverInstalled() bool {
+	return externalEndpointResolver.Load() != nil
 }
 
 func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
@@ -59,7 +71,7 @@ func FindProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, str
 // FindProcessNameByAddrWithMatcher limits expensive process descriptor scans
 // to executable paths that can match the active process rules.
 func FindProcessNameByAddrWithMatcher(network string, src, dst netip.AddrPort, matcher ProcessMatcher) (uint32, string, error) {
-	if resolver := externalEndpointResolver; resolver != nil {
+	if resolver := externalEndpointResolver.Load(); resolver != nil {
 		return resolver(network, src, dst)
 	}
 	return findProcessNameByAddr(network, src, dst, matcher)

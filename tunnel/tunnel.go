@@ -487,8 +487,15 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 						metadata.ProcessPath = path
 						metadata.Uid = uid
 
-						if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
-							metadata.Process = pkg
+						// A registered endpoint resolver already returned the
+						// package name as the path above, and mapping the UID
+						// again would be a second platform lookup per matched
+						// connection for a result that is either identical or,
+						// where no name resolver exists, always an error.
+						if !process.EndpointResolverInstalled() {
+							if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
+								metadata.Process = pkg
+							}
 						}
 					}
 				} else {

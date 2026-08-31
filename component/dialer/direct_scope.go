@@ -18,9 +18,25 @@ func SetDirectNetworkEnvironment(environment string) {
 	directNetworkEnvironment.Store(strings.TrimSpace(environment))
 }
 
+// environmentScopePrefix marks a scope the platform named rather than one
+// derived from local interfaces.
+const environmentScopePrefix = "environment|"
+
+// EnvironmentScope reports the scope string a given platform environment
+// produces. An embedder needs it to address a branch it created earlier -- to
+// evict the answers of a network it has stopped tracking, for example -- and
+// deriving that string a second time by hand is how the two drift apart.
+func EnvironmentScope(environment string) string {
+	environment = strings.TrimSpace(environment)
+	if environment == "" {
+		return ""
+	}
+	return environmentScopePrefix + environment
+}
+
 func directNetworkScope(opt option) string {
 	if environment := directNetworkEnvironment.Load(); environment != "" {
-		return "environment|" + environment
+		return environmentScopePrefix + environment
 	}
 	interfaceName := opt.interfaceName
 	if interfaceName == "" {

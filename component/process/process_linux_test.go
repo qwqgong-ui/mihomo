@@ -70,8 +70,8 @@ func TestFindProcessNameByAddrWithMatcher(t *testing.T) {
 }
 
 func TestEndpointResolverFailureIsAuthoritative(t *testing.T) {
-	oldResolver := externalEndpointResolver
-	t.Cleanup(func() { externalEndpointResolver = oldResolver })
+	oldResolver := externalEndpointResolver.Load()
+	t.Cleanup(func() { SetEndpointResolver(oldResolver) })
 	wantErr := errors.New("platform lookup failed")
 	SetEndpointResolver(func(string, netip.AddrPort, netip.AddrPort) (uint32, string, error) {
 		return 0, "", wantErr

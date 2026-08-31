@@ -174,3 +174,59 @@ func startStoreLoop() {
 		}
 	}()
 }
+
+// cacheDeleter is implemented by the cache algorithms that can remove a single
+// key. A cache without it is expired in place instead, which every read path
+// already honours.
+type cacheDeleter interface {
+	Delete(key string)
+}
+
+// EvictNetworkScope drops every cached answer belonging to one network scope and
+// reports how many were removed.
+//
+// The direct-nameserver candidate caches are keyed by network scope precisely so
+// that one physical network's answers are never served on another, and that is
+// why nothing clears them on a handover. The gap is retirement: when the
+// platform stops tracking a network entirely, its branch has no owner left, yet
+// the answers survive until each entry's own expiry -- with a 24-hour floor,
+// long after the profile that explained them is gone. The platform knows when it
+// retired a network; this lets it say so.
+func EvictNetworkScope(scope string) int {
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return 0
+	}
+	prefix := scope + keySep
+
+	persistMu.Lock()
+	caches := make([]dnsCache, 0, len(persistCaches))
+	for _, c := range persistCaches {
+		caches = append(caches, c)
+	}
+	persistMu.Unlock()
+
+	evicted := 0
+	for _, c := range caches {
+		items, ok := snapshotOf(c)
+		if !ok {
+			continue
+		}
+		deleter, deletable := c.(cacheDeleter)
+		for _, item := range items {
+			if !strings.HasPrefix(item.Key, prefix) {
+				continue
+			}
+			evicted++
+			if deletable {
+				deleter.Delete(item.Key)
+				continue
+			}
+			c.SetWithExpire(item.Key, item.Value, time.Unix(0, 0))
+		}
+	}
+	if evicted > 0 {
+		log.Infoln("[DNS] evicted %d cached answers for a retired network scope", evicted)
+	}
+	return evicted
+}
