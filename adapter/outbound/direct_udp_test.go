@@ -91,7 +91,7 @@ func TestDirectUDPRaceFirstResponsePinsAndDropsLoser(t *testing.T) {
 	logical := directUDPTestAddr("192.0.2.10", 443)
 	v4 := logical
 	v6 := directUDPTestAddr("2001:db8::10", 443)
-	if err := race.register(context.Background(), logical, []netip.AddrPort{v4, v6}); err != nil {
+	if err := race.register(context.Background(), logical, []netip.AddrPort{v4, v6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,7 +145,7 @@ func TestDirectUDPRaceDatagramBudgetPinsFallback(t *testing.T) {
 	race, conns := newDirectUDPTestRace(t)
 	logical := directUDPTestAddr("192.0.2.20", 8443)
 	v6 := directUDPTestAddr("2001:db8::20", 8443)
-	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
+	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -167,7 +167,7 @@ func TestDirectUDPRaceByteAndTimeBudgetsPinFallback(t *testing.T) {
 		race, conns := newDirectUDPTestRace(t)
 		logical := directUDPTestAddr("192.0.2.30", 53)
 		v6 := directUDPTestAddr("2001:db8::30", 53)
-		if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
+		if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}, "", ""); err != nil {
 			t.Fatal(err)
 		}
 		payload := make([]byte, directUDPRaceBytes/2+1)
@@ -189,7 +189,7 @@ func TestDirectUDPRaceByteAndTimeBudgetsPinFallback(t *testing.T) {
 		race, conns := newDirectUDPTestRace(t)
 		logical := directUDPTestAddr("192.0.2.31", 53)
 		v6 := directUDPTestAddr("2001:db8::31", 53)
-		if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
+		if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}, "", ""); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := race.WriteTo([]byte("first"), net.UDPAddrFromAddrPort(logical)); err != nil {
@@ -213,10 +213,10 @@ func TestDirectUDPRaceKeepsEIMTargetsSeparate(t *testing.T) {
 	firstV6 := directUDPTestAddr("2001:db8::40", 1000)
 	second := directUDPTestAddr("192.0.2.41", 2000)
 	secondV6 := directUDPTestAddr("2001:db8::41", 2000)
-	if err := race.register(context.Background(), first, []netip.AddrPort{first, firstV6}); err != nil {
+	if err := race.register(context.Background(), first, []netip.AddrPort{first, firstV6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := race.register(context.Background(), second, []netip.AddrPort{second, secondV6}); err != nil {
+	if err := race.register(context.Background(), second, []netip.AddrPort{second, secondV6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	_, _ = race.WriteTo([]byte("one"), net.UDPAddrFromAddrPort(first))
@@ -285,7 +285,7 @@ func TestDirectUDPRaceRealDualStackSockets(t *testing.T) {
 	defer race.Close()
 	logical := directUDPTestAddr("127.0.0.1", uint16(port))
 	v6 := directUDPTestAddr("::1", uint16(port))
-	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
+	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	_ = race.SetReadDeadline(time.Now().Add(2 * time.Second))
@@ -321,7 +321,7 @@ func TestDirectUDPRaceReturnsLastReaderError(t *testing.T) {
 	race, conns := newDirectUDPTestRace(t)
 	logical := directUDPTestAddr("192.0.2.50", 443)
 	v6 := directUDPTestAddr("2001:db8::50", 443)
-	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
+	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	_ = conns[4].Close()
@@ -346,7 +346,7 @@ func TestDirectUDPRaceIgnoresCandidateICMPReadError(t *testing.T) {
 	race, conns := newDirectUDPTestRace(t)
 	logical := directUDPTestAddr("192.0.2.60", 443)
 	v6 := directUDPTestAddr("2001:db8::60", 443)
-	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}); err != nil {
+	if err := race.register(context.Background(), logical, []netip.AddrPort{logical, v6}, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := race.WriteTo([]byte("probe"), net.UDPAddrFromAddrPort(logical)); err != nil {

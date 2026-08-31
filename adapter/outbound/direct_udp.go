@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	directUDPRaceDatagrams = 4
-	directUDPRaceBytes     = 16 * 1024
-	directUDPRaceWindow    = 300 * time.Millisecond
+	directUDPRaceDatagrams      = 4
+	directUDPRaceBytes          = 16 * 1024
+	directUDPRaceWindow         = 300 * time.Millisecond
+	directUDPQUICServerCIDLimit = 32
 )
 
 type directUDPReadResult struct {
@@ -32,13 +33,18 @@ type directUDPReadResult struct {
 }
 
 type directUDPTarget struct {
-	logical    netip.AddrPort
-	candidates []netip.AddrPort
-	live       map[netip.AddrPort]bool
-	winner     netip.AddrPort
-	started    time.Time
-	datagrams  int
-	bytes      int
+	logical                  netip.AddrPort
+	candidates               []netip.AddrPort
+	live                     map[netip.AddrPort]bool
+	winner                   netip.AddrPort
+	started                  time.Time
+	datagrams                int
+	bytes                    int
+	host                     string
+	adapter                  string
+	quic                     bool
+	quicConfirmed            bool
+	quicCandidateByServerCID map[string]netip.AddrPort
 }
 
 type directUDPRacePacketConn struct {
@@ -73,7 +79,7 @@ func (d *Direct) listenPacketRaceContext(ctx context.Context, metadata *C.Metada
 		return newPathMTUPacketConn(packetConn, opts), nil
 	})
 	logical := metadata.AddrPort()
-	if err := race.register(ctx, logical, candidates); err != nil {
+	if err := race.register(ctx, logical, candidates, metadata.Host, d.Name()); err != nil {
 		return nil, err
 	}
 	resolveUDP := func(ctx context.Context, metadata *C.Metadata) error {
@@ -82,7 +88,7 @@ func (d *Direct) listenPacketRaceContext(ctx context.Context, metadata *C.Metada
 			return err
 		}
 		metadata.DstIP = fallback
-		return race.register(ctx, metadata.AddrPort(), candidates)
+		return race.register(ctx, metadata.AddrPort(), candidates, metadata.Host, d.Name())
 	}
 	return d.loopBack.NewPacketConn(newPacketConn(race, d, resolveUDP)), nil
 }
@@ -196,7 +202,7 @@ func newDirectUDPRacePacketConn(factory func(context.Context, int, netip.AddrPor
 	}
 }
 
-func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.AddrPort, candidates []netip.AddrPort) error {
+func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.AddrPort, candidates []netip.AddrPort, host, adapter string) error {
 	for _, candidate := range candidates {
 		family := 6
 		if candidate.Addr().Is4() {
@@ -215,7 +221,7 @@ func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.Ad
 	if _, loaded := c.targets[logical]; loaded {
 		return nil
 	}
-	target := &directUDPTarget{logical: logical, live: make(map[netip.AddrPort]bool)}
+	target := &directUDPTarget{logical: logical, live: make(map[netip.AddrPort]bool), host: host, adapter: adapter}
 	for _, candidate := range candidates {
 		family := 6
 		if candidate.Addr().Is4() {
@@ -334,12 +340,40 @@ func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, e
 		}
 		return pc.WriteTo(payload, addr)
 	}
-	if !target.winner.IsValid() && !target.started.IsZero() && (now.Sub(target.started) >= directUDPRaceWindow || target.datagrams >= directUDPRaceDatagrams || target.bytes+len(payload)*len(target.candidates) > directUDPRaceBytes) {
+	var confirmedQUICWinner netip.Addr
+	if destinationConnectionID, _, ok := quicLongHeaderConnectionIDs(payload); ok {
+		// Keep racing Initial packets until the application continues with a
+		// server-issued CID. A fast CONNECTION_CLOSE is only another response,
+		// not proof that its candidate established the QUIC connection.
+		target.quic = true
+		if candidate := target.quicCandidateByServerCID[destinationConnectionID]; candidate.IsValid() {
+			target.winner = candidate
+		}
+	} else if target.quic && target.winner.IsValid() && !target.quicConfirmed {
+		// A short-header packet carrying the selected server CID proves the
+		// application reached 1-RTT on this path. Only then may the candidate
+		// become a warm preference for a later connection.
+		for serverConnectionID, candidate := range target.quicCandidateByServerCID {
+			if candidate != target.winner || len(payload) < 1+len(serverConnectionID) {
+				continue
+			}
+			if string(payload[1:1+len(serverConnectionID)]) == serverConnectionID {
+				target.quicConfirmed = true
+				confirmedQUICWinner = candidate.Addr()
+				break
+			}
+		}
+	}
+	if !target.quic && !target.winner.IsValid() && !target.started.IsZero() && (now.Sub(target.started) >= directUDPRaceWindow || target.datagrams >= directUDPRaceDatagrams || target.bytes+len(payload)*len(target.candidates) > directUDPRaceBytes) {
 		target.winner = firstLiveDirectUDPCandidate(target)
 	}
 	if target.winner.IsValid() {
 		candidates := []netip.AddrPort{target.winner}
+		host, adapter := target.host, target.adapter
 		c.mu.Unlock()
+		if confirmedQUICWinner.IsValid() {
+			directrace.Store(host, adapter, confirmedQUICWinner)
+		}
 		return c.writeCandidates(payload, candidates)
 	}
 	if target.started.IsZero() {
@@ -361,12 +395,33 @@ func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, e
 		for _, candidate := range failed {
 			delete(target.live, candidate)
 		}
-		if !target.winner.IsValid() && countLiveDirectUDPCandidates(target) == 1 {
+		if !target.quic && !target.winner.IsValid() && countLiveDirectUDPCandidates(target) == 1 {
 			target.winner = firstLiveDirectUDPCandidate(target)
 		}
 		c.mu.Unlock()
 	}
 	return n, err
+}
+
+func quicLongHeaderConnectionIDs(payload []byte) (destination, source string, ok bool) {
+	// The version and both connection IDs are not header-protected in QUIC long
+	// headers, so routing can follow the application's choice without decrypting
+	// or otherwise interpreting its handshake.
+	if len(payload) < 7 || payload[0]&0xc0 != 0xc0 || payload[1]|payload[2]|payload[3]|payload[4] == 0 {
+		return "", "", false
+	}
+	destinationLength := int(payload[5])
+	if destinationLength > 20 || 6+destinationLength >= len(payload) {
+		return "", "", false
+	}
+	destinationEnd := 6 + destinationLength
+	sourceLength := int(payload[destinationEnd])
+	sourceStart := destinationEnd + 1
+	sourceEnd := sourceStart + sourceLength
+	if sourceLength > 20 || sourceEnd > len(payload) {
+		return "", "", false
+	}
+	return string(payload[6:destinationEnd]), string(payload[sourceStart:sourceEnd]), true
 }
 
 func (c *directUDPRacePacketConn) writeCandidates(payload []byte, candidates []netip.AddrPort) (int, error) {
@@ -451,7 +506,25 @@ func (c *directUDPRacePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, erro
 			if target.started.IsZero() {
 				continue
 			}
-			if !target.winner.IsValid() && now.Sub(target.started) >= directUDPRaceWindow {
+			if target.quic {
+				_, serverConnectionID, ok := quicLongHeaderConnectionIDs(result.data)
+				if ok && serverConnectionID != "" {
+					if target.quicCandidateByServerCID == nil {
+						target.quicCandidateByServerCID = make(map[string]netip.AddrPort)
+					}
+					if candidate, loaded := target.quicCandidateByServerCID[serverConnectionID]; loaded {
+						// The same CID can be returned by multiple anycast
+						// candidates. Mark it ambiguous instead of letting the
+						// last response masquerade as the application's choice.
+						if !candidate.IsValid() || candidate != source {
+							target.quicCandidateByServerCID[serverConnectionID] = netip.AddrPort{}
+						}
+					} else if len(target.quicCandidateByServerCID) < directUDPQUICServerCIDLimit {
+						target.quicCandidateByServerCID[serverConnectionID] = source
+					}
+				}
+			}
+			if !target.quic && !target.winner.IsValid() && now.Sub(target.started) >= directUDPRaceWindow {
 				target.winner = firstLiveDirectUDPCandidate(target)
 			}
 			if target.winner.IsValid() {
@@ -460,6 +533,10 @@ func (c *directUDPRacePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, erro
 					break
 				}
 				continue
+			}
+			if target.quic {
+				logical = target.logical
+				break
 			}
 			if target.live[source] {
 				target.winner = source

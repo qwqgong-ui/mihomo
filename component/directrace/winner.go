@@ -38,9 +38,9 @@ func Store(host, adapter string, ip netip.Addr) {
 	winners.Unlock()
 }
 
-// Prefer returns a recent ICMP winner only while it remains in the current
-// DNS RRset. Callers use it as a warm preference, never as proof that an
-// application protocol is reachable.
+// Prefer returns a recent path winner only while it remains in the current DNS
+// RRset. Callers use it as a warm preference, never as proof that an application
+// protocol is still reachable.
 func Prefer(host, adapter string, candidates []netip.Addr) (netip.Addr, bool) {
 	if host == "" || adapter == "" || len(candidates) == 0 {
 		return netip.Addr{}, false
