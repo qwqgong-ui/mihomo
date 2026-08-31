@@ -54,10 +54,7 @@ const (
 // max number of additional goroutines that participate in cooperative resize;
 // "resize owner" goroutine isn't counted
 var maxResizeHelpers = func() int32 {
-	v := int32(parallelism() - 1)
-	if v < 1 {
-		v = 1
-	}
+	v := max(int32(parallelism()-1), 1)
 	if v > maxResizeHelpersLimit {
 		v = maxResizeHelpersLimit
 	}
@@ -901,28 +898,16 @@ func (m *Map[K, V]) transfer(table, newTable *mapTable[K, V]) {
 	// By iterating 0..baseLen and processing all possible source buckets
 	// (srcIdx += baseLen) in the inner loop, a single goroutine exclusively
 	// owns the write operations for its assigned destination buckets.
-	baseLen := tableLen
-	if baseLen > newTableLen {
-		baseLen = newTableLen
-	}
-	stride := (tableLen >> 3) / int(maxResizeHelpers)
-	if stride < minResizeTransferStride {
-		stride = minResizeTransferStride
-	}
+	baseLen := min(tableLen, newTableLen)
+	stride := max((tableLen>>3)/int(maxResizeHelpers), minResizeTransferStride)
 	for {
 		// Claim work by incrementing resizeIdx.
 		nextIdx := m.resizeIdx.Add(int64(stride))
-		start := int(nextIdx) - stride
-		if start < 0 {
-			start = 0
-		}
+		start := max(int(nextIdx)-stride, 0)
 		if start >= baseLen {
 			break
 		}
-		end := int(nextIdx)
-		if end > baseLen {
-			end = baseLen
-		}
+		end := min(int(nextIdx), baseLen)
 		// Transfer buckets in this range.
 		total := 0
 		for i := start; i < end; i++ {
@@ -946,7 +931,7 @@ func transferBucketUnsafe[K comparable, V any](
 	rootb := b
 	rootb.mu.Lock()
 	for {
-		for i := 0; i < entriesPerMapBucket; i++ {
+		for i := range entriesPerMapBucket {
 			if eptr := b.entries[i]; eptr != nil {
 				e := (*entry[K, V])(eptr)
 				var hash uint64
@@ -997,7 +982,7 @@ func (m *Map[K, V]) Range(f func(key K, value V) bool) {
 		// the intermediate slice.
 		rootb.mu.Lock()
 		for {
-			for i := 0; i < entriesPerMapBucket; i++ {
+			for i := range entriesPerMapBucket {
 				if b.entries[i] != nil {
 					bentries = append(bentries, (*entry[K, V])(b.entries[i]))
 				}
@@ -1136,7 +1121,7 @@ delete_loop_attempt:
 		var bucketDeleted int
 		b := rootb
 		for {
-			for i := 0; i < entriesPerMapBucket; i++ {
+			for i := range entriesPerMapBucket {
 				eptr := b.entries[i]
 				if eptr != nil {
 					e := (*entry[K, V])(eptr)
@@ -1198,7 +1183,7 @@ func (m *Map[K, V]) Size() int {
 // either locked or exclusively written to by the helper during resize.
 func appendToBucket[K comparable, V any](h2 uint8, e *entry[K, V], b *bucketPadded) {
 	for {
-		for i := 0; i < entriesPerMapBucket; i++ {
+		for i := range entriesPerMapBucket {
 			if b.entries[i] == nil {
 				b.meta = setByte(b.meta, h2, i)
 				b.entries[i] = unsafe.Pointer(e)
@@ -1318,7 +1303,7 @@ func (m *Map[K, V]) Stats() MapStats {
 		for {
 			nentriesLocal := 0
 			stats.Capacity += entriesPerMapBucket
-			for i := 0; i < entriesPerMapBucket; i++ {
+			for i := range entriesPerMapBucket {
 				if atomic.LoadPointer(&b.entries[i]) != nil {
 					stats.Size++
 					nentriesLocal++

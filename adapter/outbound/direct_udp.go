@@ -110,7 +110,7 @@ func (d *Direct) resolveUDPRaceCandidates(ctx context.Context, metadata *C.Metad
 
 	var ips []netip.Addr
 	var lookupErrs []error
-	for completed := 0; completed < 2; completed++ {
+	for range 2 {
 		select {
 		case <-ctx.Done():
 			return nil, netip.Addr{}, ctx.Err()

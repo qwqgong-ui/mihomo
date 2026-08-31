@@ -89,8 +89,7 @@ func New(config LC.Hysteria2RealmServer, lc C.InboundListenConfig, tunnel C.Tunn
 
 	sl := &Listener{config: config, server: s}
 
-	for _, addr := range strings.Split(config.Listen, ",") {
-		addr := addr
+	for addr := range strings.SplitSeq(config.Listen, ",") {
 
 		//TCP
 		l, err := lc.Listen(context.Background(), "tcp", addr)

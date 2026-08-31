@@ -399,10 +399,7 @@ func ReadPacket(r io.Reader, payload []byte) (net.Addr, int, error) {
 		return nil, 0, errors.New("parse addr error")
 	}
 
-	length := len(payload)
-	if n-headLen < length {
-		length = n - headLen
-	}
+	length := min(n-headLen, len(payload))
 	copy(payload[:], buf[headLen:headLen+length])
 
 	return uAddr, length, nil

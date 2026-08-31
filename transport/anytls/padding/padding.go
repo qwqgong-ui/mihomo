@@ -59,8 +59,8 @@ func NewPaddingFactory(rawScheme []byte) *PaddingFactory {
 
 func (p *PaddingFactory) GenerateRecordPayloadSizes(pkt uint32) (pktSizes []int) {
 	if s, ok := p.scheme[strconv.Itoa(int(pkt))]; ok {
-		sRanges := strings.Split(s, ",")
-		for _, sRange := range sRanges {
+		sRanges := strings.SplitSeq(s, ",")
+		for sRange := range sRanges {
 			sRangeMinMax := strings.Split(sRange, "-")
 			if len(sRangeMinMax) == 2 {
 				_min, err := strconv.ParseInt(sRangeMinMax[0], 10, 64)

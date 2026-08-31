@@ -181,10 +181,7 @@ func NewEnhancer(cfg EnhancerConfig) *ResolverEnhancer {
 			e.fakeIPPool6 = cfg.FakeIPPool6
 		}
 		e.fakeIPSkipper = cfg.FakeIPSkipper
-		e.fakeIPTTL = cfg.FakeIPTTL
-		if e.fakeIPTTL < 1 {
-			e.fakeIPTTL = 1
-		}
+		e.fakeIPTTL = max(cfg.FakeIPTTL, 1)
 		e.mapping = lru.New(lru.WithSize[netip.Addr, string](4096))
 	}
 

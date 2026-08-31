@@ -334,7 +334,7 @@ func (c *ClientConfig) ValidateInstallScriptSubset() error {
 
 func DecodeStaticKey(block []byte) ([]byte, error) {
 	var hexLines []string
-	for _, raw := range strings.Split(string(block), "\n") {
+	for raw := range strings.SplitSeq(string(block), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

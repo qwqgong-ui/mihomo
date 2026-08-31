@@ -690,7 +690,7 @@ func TestControlConnWriteFragmentsTLSCiphertext(t *testing.T) {
 		t.Fatalf("Write = %d, want %d", n, len(payload))
 	}
 	var got []byte
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		raw, err := serverIO.ReadPacket(context.Background())
 		if err != nil {
 			t.Fatal(err)

@@ -229,10 +229,7 @@ func NewServer(option *ServerOption, pc net.PacketConn) (*Server, error) {
 		}
 	}
 	if len(option.Users) > 0 {
-		maxUdpRelayPacketSize := option.MaxUdpRelayPacketSize
-		if maxUdpRelayPacketSize > MaxFragSizeV5 {
-			maxUdpRelayPacketSize = MaxFragSizeV5
-		}
+		maxUdpRelayPacketSize := min(option.MaxUdpRelayPacketSize, MaxFragSizeV5)
 		server.optionV5 = &v5.ServerOption{
 			HandleTcpFn:           option.HandleTcpFn,
 			HandleUdpFn:           option.HandleUdpFn,

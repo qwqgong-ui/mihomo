@@ -254,8 +254,7 @@ func New(config LC.VlessServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 			tlsConfig.NextProtos = append([]string{"h2"}, tlsConfig.NextProtos...)
 		}
 	}
-	for _, addr := range strings.Split(config.Listen, ",") {
-		addr := addr
+	for addr := range strings.SplitSeq(config.Listen, ",") {
 
 		//TCP
 		l, err := lc.Listen(context.Background(), "tcp", addr)

@@ -15,7 +15,6 @@ func TestAge(t *testing.T) {
 		{"MLKEM768X25519", age.GenHybridKeyPair},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			secretKey, publicKey, err := tc.gen()
 			if err != nil {

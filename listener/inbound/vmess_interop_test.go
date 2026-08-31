@@ -82,7 +82,7 @@ func vmessInteropGoVersion(t *testing.T, goBin string) string {
 }
 
 func vmessInteropParseGoVersion(output string) string {
-	for _, field := range strings.Fields(output) {
+	for field := range strings.FieldsSeq(output) {
 		if strings.HasPrefix(field, "go1.") {
 			return field
 		}
@@ -295,7 +295,7 @@ func vmessInteropMetadata(t *testing.T, addr string) *C.Metadata {
 func vmessInteropRoundTripWithRetry(t *testing.T, dial func() (net.Conn, error), payloadSize int) {
 	t.Helper()
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for range 3 {
 		conn, err := dial()
 		if err == nil {
 			err = vmessInteropRoundTripConn(conn, payloadSize)

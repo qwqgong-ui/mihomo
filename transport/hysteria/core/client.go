@@ -393,8 +393,7 @@ func (c *quicPktConn) WriteTo(p []byte, addr string) error {
 	// try no frag first
 	err = c.Session.SendDatagram(msg.Pack())
 	if err != nil {
-		var errSize *quic.DatagramTooLargeError
-		if errors.As(err, &errSize) {
+		if errSize, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			// need to frag
 			msg.MsgID = uint16(randv2.IntN(0xFFFF)) + 1 // msgID must be > 0 when fragCount > 1
 			fragMsgs := fragUDPMessage(msg, int(errSize.MaxDatagramPayloadSize))

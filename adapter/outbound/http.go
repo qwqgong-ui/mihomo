@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"strconv"
 
@@ -99,9 +100,7 @@ func (h *Http) shakeHandContext(ctx context.Context, c net.Conn, metadata *C.Met
 		"Proxy-Connection": "Keep-Alive",
 	}
 
-	for key, value := range h.option.Headers {
-		tempHeaders[key] = value
-	}
+	maps.Copy(tempHeaders, h.option.Headers)
 
 	if h.user != "" && h.pass != "" {
 		auth := h.user + ":" + h.pass

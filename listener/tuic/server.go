@@ -119,10 +119,7 @@ func New(config LC.TuicServer, lc C.InboundListenConfig, tunnel C.Tunnel, additi
 	if config.MaxUdpRelayPacketSize == 0 {
 		config.MaxUdpRelayPacketSize = 1500
 	}
-	maxDatagramFrameSize := config.MaxUdpRelayPacketSize + packetOverHead
-	if maxDatagramFrameSize > 1400 {
-		maxDatagramFrameSize = 1400
-	}
+	maxDatagramFrameSize := min(config.MaxUdpRelayPacketSize+packetOverHead, 1400)
 	config.MaxUdpRelayPacketSize = maxDatagramFrameSize - packetOverHead
 	quicConfig.MaxDatagramFrameSize = int64(maxDatagramFrameSize)
 
@@ -175,8 +172,7 @@ func New(config LC.TuicServer, lc C.InboundListenConfig, tunnel C.Tunnel, additi
 
 	sl := &Listener{false, config, nil, nil}
 
-	for _, addr := range strings.Split(config.Listen, ",") {
-		addr := addr
+	for addr := range strings.SplitSeq(config.Listen, ",") {
 
 		ul, err := lc.ListenPacket(context.Background(), "udp", addr)
 		if err != nil {

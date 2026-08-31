@@ -87,7 +87,7 @@ func TestECNSustainedCEShrinksAndEventuallyLowersFloors(t *testing.T) {
 	originalPacing := b.pacingRate
 	originalFloor := b.ecn.btlBwFloor
 
-	for epoch := 0; epoch < ecnFloorReductionEpochs; epoch++ {
+	for range ecnFloorReductionEpochs {
 		b.roundTripCount++
 		b.OnECNFeedback(true, false, 15, 0, 1)
 		b.applyECNPolicy(true, false)

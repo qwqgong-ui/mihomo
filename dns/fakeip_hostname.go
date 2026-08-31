@@ -27,7 +27,7 @@ func isFakeIPHostName(name string) bool {
 	if name == "" || len(name) > maxHostNameLength {
 		return false
 	}
-	for _, label := range strings.Split(name, ".") {
+	for label := range strings.SplitSeq(name, ".") {
 		if label == "" || len(label) > 63 {
 			return false
 		}

@@ -226,20 +226,6 @@ func (a *ARC[K, V]) replace(ent *entry[K, V]) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a int, b int) int {
-	if a < b {
-		return b
-	}
-	return a
-}
-
 // Snapshot returns every live (non-ghost) entry together with its expiry.
 // Ghost entries are ARC's eviction bookkeeping: they keep a key to detect a
 // recent eviction but carry no value, so they are skipped.

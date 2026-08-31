@@ -121,10 +121,7 @@ func (c *Config) GetRequestHeaderWithPayload(payload []byte, uplinkChunkSize Ran
 	encodedData := base64.RawURLEncoding.EncodeToString(payload)
 
 	for i := 0; len(encodedData) > 0; i++ {
-		chunkSize := uplinkChunkSize.Rand()
-		if len(encodedData) < chunkSize {
-			chunkSize = len(encodedData)
-		}
+		chunkSize := min(len(encodedData), uplinkChunkSize.Rand())
 		chunk := encodedData[:chunkSize]
 		encodedData = encodedData[chunkSize:]
 		headerKey := fmt.Sprintf("%s-%d", key, i)
@@ -141,10 +138,7 @@ func (c *Config) GetRequestCookiesWithPayload(payload []byte, uplinkChunkSize Ra
 	encodedData := base64.RawURLEncoding.EncodeToString(payload)
 
 	for i := 0; len(encodedData) > 0; i++ {
-		chunkSize := uplinkChunkSize.Rand()
-		if len(encodedData) < chunkSize {
-			chunkSize = len(encodedData)
-		}
+		chunkSize := min(len(encodedData), uplinkChunkSize.Rand())
 		chunk := encodedData[:chunkSize]
 		encodedData = encodedData[chunkSize:]
 		cookieName := fmt.Sprintf("%s_%d", key, i)

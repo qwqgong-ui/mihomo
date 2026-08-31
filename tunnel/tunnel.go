@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"path/filepath"
 	"runtime"
+	slices0 "slices"
 	"strings"
 	"sync"
 	"time"
@@ -753,11 +754,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 			defer func() {
 				if err != nil {
 					_ = remoteConn.Close()
-					for _, chain := range remoteConn.Chains() {
-						if chain == "REJECT" {
-							err = nil
-							return
-						}
+					if slices0.Contains(remoteConn.Chains(), "REJECT") {
+						err = nil
+						return
 					}
 					remoteConn = nil
 				}
@@ -908,7 +907,7 @@ func shouldStopRetry(err error) bool {
 
 func retry[T any](ctx context.Context, ft func(context.Context) (T, error), fe func(err error)) (t T, err error) {
 	s := slowdown.New()
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		t, err = ft(ctx)
 		if err != nil {
 			if fe != nil {

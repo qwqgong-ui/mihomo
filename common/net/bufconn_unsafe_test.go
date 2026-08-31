@@ -13,8 +13,8 @@ import (
 )
 
 func TestBufioReaderLayout(t *testing.T) {
-	standard := reflect.TypeOf(bufio.Reader{})
-	mirror := reflect.TypeOf(bufioReader{})
+	standard := reflect.TypeFor[bufio.Reader]()
+	mirror := reflect.TypeFor[bufioReader]()
 
 	require.Equal(t, standard.Size(), mirror.Size())
 	require.Equal(t, standard.Align(), mirror.Align())

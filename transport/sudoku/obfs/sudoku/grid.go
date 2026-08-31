@@ -18,15 +18,15 @@ func GenerateAllGrids() []Grid {
 		br, bc := (row/2)*2, (col/2)*2
 		for num := uint8(1); num <= 4; num++ {
 			valid := true
-			for i := 0; i < 4; i++ {
+			for i := range 4 {
 				if g[row*4+i] == num || g[i*4+col] == num {
 					valid = false
 					break
 				}
 			}
 			if valid {
-				for r := 0; r < 2; r++ {
-					for c := 0; c < 2; c++ {
+				for r := range 2 {
+					for c := range 2 {
 						if g[(br+r)*4+(bc+c)] == num {
 							valid = false
 							break

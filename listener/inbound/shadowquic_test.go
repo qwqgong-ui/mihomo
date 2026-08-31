@@ -19,7 +19,6 @@ func TestInboundShadowQuic(t *testing.T) {
 		{name: "v1", version: "v1"},
 		{name: "v2", version: "v2"},
 	} {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			testInboundShadowQuic(t, test.version)

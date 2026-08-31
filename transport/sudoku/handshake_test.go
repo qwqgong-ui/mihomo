@@ -87,7 +87,7 @@ func TestPackedDownlinkSoak(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, sessions*2)
 
-	for i := 0; i < sessions; i++ {
+	for i := range sessions {
 		wg.Add(2)
 		go func(id int) {
 			defer wg.Done()

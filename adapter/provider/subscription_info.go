@@ -19,7 +19,7 @@ func NewSubscriptionInfo(userinfo string) (si *SubscriptionInfo) {
 	userinfo = strings.ReplaceAll(strings.ToLower(userinfo), " ", "")
 	si = new(SubscriptionInfo)
 
-	for _, field := range strings.Split(userinfo, ";") {
+	for field := range strings.SplitSeq(userinfo, ";") {
 		name, value, ok := strings.Cut(field, "=")
 		if !ok {
 			continue

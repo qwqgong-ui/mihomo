@@ -456,10 +456,7 @@ func (c *hybridQUICPacketConn) SetReadDeadline(deadline time.Time) error {
 		c.readTimer = nil
 	}
 	if !deadline.IsZero() {
-		duration := time.Until(deadline)
-		if duration < 0 {
-			duration = 0
-		}
+		duration := max(time.Until(deadline), 0)
 		c.readTimer = time.NewTimer(duration)
 	}
 	return nil

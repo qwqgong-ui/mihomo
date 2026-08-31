@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"strings"
@@ -312,9 +313,7 @@ func cloneHandshakeMap(source map[string]HandshakeConfig) map[string]HandshakeCo
 		return nil
 	}
 	cloned := make(map[string]HandshakeConfig, len(source))
-	for key, value := range source {
-		cloned[key] = value
-	}
+	maps.Copy(cloned, source)
 	return cloned
 }
 

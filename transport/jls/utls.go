@@ -11,6 +11,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"strings"
 
 	"github.com/metacubex/mihomo/component/ca"
@@ -150,12 +151,7 @@ func jlsClientHTTPFallback(ctx context.Context, uConn net.Conn, serverName strin
 }
 
 func utlsClientHelloSupportsTLS13(hello *utls.PubClientHelloMsg) bool {
-	for _, version := range hello.SupportedVersions {
-		if version == utls.VersionTLS13 {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(hello.SupportedVersions, utls.VersionTLS13)
 }
 
 type utlsJLSVerifier struct {
@@ -207,13 +203,7 @@ func verifyUTLSCertificate(state utls.ConnectionState, serverName string) error 
 
 // overrideUTLSALPN keeps ALPS only when h2 remains advertised.
 func overrideUTLSALPN(conn *utls.UConn, protocols []string) {
-	hasH2 := false
-	for _, protocol := range protocols {
-		if protocol == "h2" {
-			hasH2 = true
-			break
-		}
-	}
+	hasH2 := slices.Contains(protocols, "h2")
 
 	hasALPN := false
 	extensions := conn.Extensions[:0]

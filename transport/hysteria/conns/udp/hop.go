@@ -359,8 +359,8 @@ var _ oobCapablePacketConn = (*ObfsUDPHopClientPacketConnWithOOB)(nil)
 // Supports both comma-separated single ports and dash-separated port ranges.
 // Format: "host:port1,port2-port3,port4"
 func parsePorts(serverPorts string) (ports []uint16, err error) {
-	portStrs := strings.Split(serverPorts, ",")
-	for _, portStr := range portStrs {
+	portStrs := strings.SplitSeq(serverPorts, ",")
+	for portStr := range portStrs {
 		if strings.Contains(portStr, "-") {
 			// Port range
 			portRange := strings.Split(portStr, "-")

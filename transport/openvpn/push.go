@@ -133,7 +133,7 @@ func parsePushReplyInner(message string) (*PushReply, error) {
 			reply.BlockIPv6 = true
 		case "data-ciphers", "ncp-ciphers":
 			if len(fields) >= 2 {
-				for _, c := range strings.Split(fields[1], ":") {
+				for c := range strings.SplitSeq(fields[1], ":") {
 					c = strings.TrimSpace(c)
 					if c != "" {
 						reply.DataCiphers = append(reply.DataCiphers, c)

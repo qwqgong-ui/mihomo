@@ -103,10 +103,7 @@ func (g *Conn) Read(b []byte) (n int, err error) {
 
 func (g *Conn) read(b []byte) (n int, err error) {
 	if g.remain > 0 {
-		size := g.remain
-		if len(b) < size {
-			size = len(b)
-		}
+		size := min(len(b), g.remain)
 
 		n, err = g.reader.Read(b[:size])
 		g.remain -= n

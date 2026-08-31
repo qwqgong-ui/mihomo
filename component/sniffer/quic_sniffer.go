@@ -462,7 +462,7 @@ func decryptQUICInitialPacket(b []byte, hdrLen, packetEnd int, labels quicLabels
 	// We only decrypt once, so we do not need to XOR it back.
 	// https://github.com/quic-go/qtls-go1-20/blob/e132a0e6cb45e20ac0b705454849a11d09ba5a54/cipher_suites.go#L496
 	iv := bytes.Clone(labels.iv)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		iv[len(iv)-1-i] ^= byte(uint64(decodedPacketNumber) >> (8 * i))
 	}
 	dst := cache.Extend(len(data))
@@ -525,7 +525,7 @@ func (q *quicPacketSender) readQUICFrames(data []byte) error {
 			if _, err := quicvarint.Read(buffer); err != nil { // Field: First ACK Range
 				return io.ErrUnexpectedEOF
 			}
-			for i := uint64(0); i < ackRangeCount; i++ { // Field: ACK Range
+			for range ackRangeCount { // Field: ACK Range
 				if _, err := quicvarint.Read(buffer); err != nil { // Field: ACK Range -> Gap
 					return io.ErrUnexpectedEOF
 				}
@@ -647,8 +647,7 @@ func (q *quicPacketSender) tryAssemble() (string, error) {
 
 	domain, err := ReadClientHello(q.buffer[:q.contiguousCryptoEnd])
 	if err != nil {
-		var need *errNeedAtLeastData
-		if errors.As(err, &need) {
+		if need, ok := errors.AsType[*errNeedAtLeastData](err); ok {
 			if need.length > maxCryptoStreamOffset {
 				return "", io.ErrShortBuffer
 			}

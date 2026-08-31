@@ -213,10 +213,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 		return 0, errors.New("tlsmirror: invalid tls record overhead")
 	}
 	for written := 0; written < len(b); {
-		end := written + maxPlaintext
-		if end > len(b) {
-			end = len(b)
-		}
+		end := min(written+maxPlaintext, len(b))
 		plain := b[written:end]
 		if c.config.TransportLayerPadding.Enabled {
 			plain = packPadding(append([]byte(nil), plain...), 0)

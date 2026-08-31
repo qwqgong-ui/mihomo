@@ -149,7 +149,7 @@ func TestDirectUDPRaceDatagramBudgetPinsFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < directUDPRaceDatagrams+1; i++ {
+	for range directUDPRaceDatagrams + 1 {
 		if _, err := race.WriteTo([]byte("x"), net.UDPAddrFromAddrPort(logical)); err != nil {
 			t.Fatal(err)
 		}

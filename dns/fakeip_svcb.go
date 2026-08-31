@@ -66,10 +66,7 @@ func rewriteFakeIPServiceBindings(msg *D.Msg, fakePool, fakePool6 *fakeip.Pool, 
 			}
 
 			setValue(rewritten)
-			ttl := fakeIPTTL
-			if ttl < 1 {
-				ttl = 1
-			}
+			ttl := max(fakeIPTTL, 1)
 			record.Header().Ttl = uint32(ttl)
 			modifiedRRsets[newServiceRRSet(owner, rrType)] = struct{}{}
 		}

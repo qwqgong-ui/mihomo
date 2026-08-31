@@ -36,7 +36,7 @@ func TestCustomTablesRotation_ProbedByServer(t *testing.T) {
 	*clientCfg = *serverCfg
 	clientCfg.ServerAddress = "example.com:443"
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		serverConn, clientConn := net.Pipe()
 
 		errCh := make(chan error, 1)

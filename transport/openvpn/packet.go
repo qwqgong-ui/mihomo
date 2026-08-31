@@ -155,7 +155,7 @@ func DecodeControlPlain(opcode Opcode, plain []byte) (ackIDs []uint32, ackRemote
 		return nil, SessionID{}, 0, nil, errors.New("control ack array truncated")
 	}
 	ackIDs = make([]uint32, ackLen)
-	for i := 0; i < ackLen; i++ {
+	for i := range ackLen {
 		ackIDs[i] = binary.BigEndian.Uint32(plain[offset : offset+4])
 		offset += 4
 	}

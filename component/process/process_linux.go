@@ -11,6 +11,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -396,12 +397,7 @@ func isTransientProcError(err error) bool {
 }
 
 func containsPID(pids []string, pid string) bool {
-	for _, candidate := range pids {
-		if candidate == pid {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(pids, pid)
 }
 
 func matchProcessCandidate(processPath string, matcher ProcessMatcher) (string, bool, error) {
@@ -716,7 +712,7 @@ func parseHexIPv6(s string) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("invalid ipv6 hex len: %d", len(s))
 	}
 	var ip [16]byte
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		b, err := hex.DecodeString(s[i*8 : (i+1)*8])
 		if err != nil {
 			return netip.Addr{}, err

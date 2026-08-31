@@ -530,7 +530,7 @@ func testTLSMirrorRoundTrip(t *testing.T, cfg Config, firstWriteDelayAtLeast tim
 			serverDone <- err
 			return
 		}
-		for i := 0; i < 8; i++ {
+		for i := range 8 {
 			size := 4 + i*8192
 			buf := make([]byte, size)
 			_, err := io.ReadFull(conn, buf)
@@ -559,7 +559,7 @@ func testTLSMirrorRoundTrip(t *testing.T, cfg Config, firstWriteDelayAtLeast tim
 		SkipCertVerify: true,
 	})
 	require.NoError(t, err)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		size := 4 + i*8192
 		start := time.Now()
 		_, err = client.Write(bytes.Repeat([]byte{byte(i)}, size))

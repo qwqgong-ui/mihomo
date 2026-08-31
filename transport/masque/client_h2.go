@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/url"
 	"strings"
@@ -93,9 +94,7 @@ func dialH2(ctx context.Context, rt http.RoundTripper, template *uritemplate.Tem
 	req.Host = authorityFromURL(u)
 	req.ContentLength = -1
 	req.Header = make(http.Header)
-	for k, v := range additionalHeaders {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, additionalHeaders)
 
 	stop := contextutils.AfterFunc(ctx, cancel) // temporarily connect ctx with reqCtx when client.Do
 	rsp, err := rt.RoundTrip(req)

@@ -43,7 +43,7 @@ func (d *MultiplexDialer) Dial(ctx context.Context, targetAddress string) (net.C
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		client, err := d.getOrCreateClient(ctx)
 		if err != nil {
 			return nil, err

@@ -145,7 +145,7 @@ func readSegment(b []byte) (segment, []byte) {
 			numberList:      make([]uint32, count),
 		}
 		p := b[13:]
-		for i := 0; i < count; i++ {
+		for i := range count {
 			seg.numberList[i] = binary.BigEndian.Uint32(p)
 			p = p[4:]
 		}

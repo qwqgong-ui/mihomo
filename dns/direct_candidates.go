@@ -162,7 +162,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			err    error
 		}
 		answers := make(chan answer, parallel)
-		for source := 0; source < parallel; source++ {
+		for source := range parallel {
 			go func(source int) {
 				msg, err := r.exchangeDirectSource(ctx, source, new(D.Msg).SetQuestion(q.Name, q.Qtype))
 				answers <- answer{source: source, msg: msg, err: err}

@@ -3,9 +3,11 @@ package provider
 import (
 	"encoding"
 	"fmt"
+	"maps"
 	"math"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1145,11 +1147,8 @@ func (t overrideAssignmentTarget) resolve(root any) ([]overrideTargetSelection, 
 			if err != nil {
 				return nil, err
 			}
-			for _, matched := range matches {
-				if overrideTruthy(matched) {
-					next = append(next, selection)
-					break
-				}
+			if slices.ContainsFunc(matches, overrideTruthy) {
+				next = append(next, selection)
 			}
 		}
 		selections = next
@@ -1355,9 +1354,7 @@ func replaceOverrideMapping(mapping, replacement map[string]any) {
 	for key := range mapping {
 		delete(mapping, key)
 	}
-	for key, value := range replacement {
-		mapping[key] = value
-	}
+	maps.Copy(mapping, replacement)
 }
 
 type overrideDeleteStatement struct {
@@ -1959,11 +1956,8 @@ func (e overrideStreamFunctionExpr) evalAll(input any) ([]any, error) {
 			if err != nil {
 				return nil, err
 			}
-			for _, item := range items {
-				if overrideTruthy(item) {
-					result = append(result, cloneOverrideValue(value))
-					break
-				}
+			if slices.ContainsFunc(items, overrideTruthy) {
+				result = append(result, cloneOverrideValue(value))
 			}
 		}
 		return []any{result}, nil
@@ -2199,10 +2193,8 @@ func (e overrideFunctionExpr) eval(input any) (any, error) {
 		args[idx] = value
 	}
 	argCount := func(want ...int) error {
-		for _, count := range want {
-			if len(args) == count {
-				return nil
-			}
+		if slices.Contains(want, len(args)) {
+			return nil
 		}
 		return fmt.Errorf("%s expects %v arguments, got %d", e.name, want, len(args))
 	}

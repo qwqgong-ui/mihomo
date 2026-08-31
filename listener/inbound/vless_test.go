@@ -422,7 +422,6 @@ func TestInboundVless_XHTTP(t *testing.T) {
 		{mode: "packet-up"},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.mode, func(t *testing.T) {
 			getConfig := func() (inbound.VlessOption, outbound.VlessOption) {
 				inboundOptions := inbound.VlessOption{
@@ -495,7 +494,6 @@ func TestInboundVless_XHTTP_Reality(t *testing.T) {
 		{mode: "packet-up"},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.mode, func(t *testing.T) {
 			getConfig := func() (inbound.VlessOption, outbound.VlessOption) {
 				inboundOptions := inbound.VlessOption{
@@ -580,7 +578,6 @@ func TestInboundVless_XHTTP_Encryption(t *testing.T) {
 		{mode: "packet-up"},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.mode, func(t *testing.T) {
 			getConfig := func() (inbound.VlessOption, outbound.VlessOption) {
 				inboundOptions := inbound.VlessOption{
@@ -649,7 +646,6 @@ func TestInboundVless_XHTTP_H1(t *testing.T) {
 		{mode: "packet-up"},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.mode, func(t *testing.T) {
 			getConfig := func() (inbound.VlessOption, outbound.VlessOption) {
 				inboundOptions := inbound.VlessOption{
@@ -694,7 +690,6 @@ func TestInboundVless_XHTTP_H1_Encryption(t *testing.T) {
 		{mode: "packet-up"},
 	}
 	for _, testCase := range testCases {
-		testCase := testCase
 		t.Run(testCase.mode, func(t *testing.T) {
 			getConfig := func() (inbound.VlessOption, outbound.VlessOption) {
 				inboundOptions := inbound.VlessOption{

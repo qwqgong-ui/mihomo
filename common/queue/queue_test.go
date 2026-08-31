@@ -138,10 +138,10 @@ func TestQueueConcurrency(t *testing.T) {
 	wg.Add(goroutines * 2) // For both producers and consumers
 
 	// Start producer goroutines
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < operations; j++ {
+			for j := range operations {
 				q.Put(id*operations + j)
 				// Small sleep to increase chance of race conditions
 				time.Sleep(time.Microsecond)
@@ -151,10 +151,10 @@ func TestQueueConcurrency(t *testing.T) {
 
 	// Start consumer goroutines
 	consumed := make(chan int, goroutines*operations)
-	for i := 0; i < goroutines; i++ {
+	for range goroutines {
 		go func() {
 			defer wg.Done()
-			for j := 0; j < operations; j++ {
+			for range operations {
 				// Try to pop an item, but don't block if queue is empty
 				// Use a mutex to avoid race condition between Len() check and Pop()
 				q.lock.Lock()

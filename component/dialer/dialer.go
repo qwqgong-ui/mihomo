@@ -160,7 +160,7 @@ func directDualStackDialContext(ctx context.Context, network, address string, op
 	}
 
 	var lookupErrs []error
-	for completed := 0; completed < 2; completed++ {
+	for completed := range 2 {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -831,7 +831,7 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, 
 		go racer(ctx, ip)
 	}
 	var errs []error
-	for i := 0; i < len(ips); i++ {
+	for range ips {
 		res := <-results
 		if res.error == nil {
 			return res

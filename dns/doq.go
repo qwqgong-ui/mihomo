@@ -425,8 +425,7 @@ func isQUICRetryError(err error) (ok bool) {
 		return true
 	}
 
-	var qIdleErr *quic.IdleTimeoutError
-	if errors.As(err, &qIdleErr) {
+	if _, ok := errors.AsType[*quic.IdleTimeoutError](err); ok {
 		// This error means that the connection was closed due to being idle.
 		// In this case we should forcibly re-create the QUIC connection.
 		// Reproducing is rather simple, stop the server and wait for 30 seconds
@@ -434,8 +433,7 @@ func isQUICRetryError(err error) (ok bool) {
 		return true
 	}
 
-	var resetErr *quic.StatelessResetError
-	if errors.As(err, &resetErr) {
+	if _, ok := errors.AsType[*quic.StatelessResetError](err); ok {
 		// A stateless reset is sent when a server receives a QUIC packet that
 		// it doesn't know how to decrypt.  For instance, it may happen when
 		// the server was recently rebooted.  We should reconnect and try again

@@ -69,10 +69,7 @@ func (b *BrutalSender) GetCongestionWindow() congestion.ByteCount {
 	if rtt <= 0 {
 		return brutalInitialCongestionWindow
 	}
-	cwnd := congestion.ByteCount(float64(b.bps) * rtt.Seconds() * brutalCongestionWindowFactor / b.ackRate)
-	if cwnd < b.maxDatagramSize {
-		cwnd = b.maxDatagramSize
-	}
+	cwnd := max(congestion.ByteCount(float64(b.bps)*rtt.Seconds()*brutalCongestionWindowFactor/b.ackRate), b.maxDatagramSize)
 	return cwnd
 }
 

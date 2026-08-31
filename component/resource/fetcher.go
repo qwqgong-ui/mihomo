@@ -175,10 +175,7 @@ func (f *Fetcher[V]) Close() error {
 }
 
 func (f *Fetcher[V]) pullLoop(forceUpdate bool) {
-	initialInterval := f.interval - time.Since(f.updatedAt)
-	if initialInterval > f.interval {
-		initialInterval = f.interval
-	}
+	initialInterval := min(f.interval-time.Since(f.updatedAt), f.interval)
 
 	if forceUpdate {
 		log.Warnln("[Provider] %s not updated for a long time, force refresh", f.Name())
@@ -251,10 +248,7 @@ func (f *Fetcher[V]) updateWithLog() {
 
 func NewFetcher[V any](name string, interval time.Duration, vehicle P.Vehicle, bundleFile BundleFile, parser Parser[V], onUpdate func(V)) *Fetcher[V] {
 	ctx, cancel := context.WithCancel(context.Background())
-	minBackoff := 10 * time.Second
-	if interval < minBackoff {
-		minBackoff = interval
-	}
+	minBackoff := min(interval, 10*time.Second)
 	return &Fetcher[V]{
 		ctx:        ctx,
 		ctxCancel:  cancel,

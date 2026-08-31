@@ -187,8 +187,7 @@ func (q *quicStreamPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 			err = q.quicConn.SendDatagram(data)
 		}
 
-		var tooLarge *quic.DatagramTooLargeError
-		if errors.As(err, &tooLarge) {
+		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			err = fragWriteNative(q.quicConn, packet, buf, int(tooLarge.MaxDatagramPayloadSize)-PacketOverHead)
 		}
 		if err != nil {

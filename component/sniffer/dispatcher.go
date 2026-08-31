@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/metacubex/sing/common/metadata"
@@ -350,13 +351,7 @@ func NewDispatcher(snifferConfig *Config) (*Dispatcher, error) {
 	// above. Preserve the previous behavior of rejecting such configurations.
 	if len(dispatcher.sniffers) != len(snifferConfig.Sniffers) {
 		for snifferName := range snifferConfig.Sniffers {
-			found := false
-			for _, supported := range sniffer.List {
-				if snifferName == supported {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(sniffer.List, snifferName)
 			if !found {
 				log.Errorln("Sniffer name[%s] is error", snifferName)
 				return &Dispatcher{enable: false}, ErrorUnsupportedSniffer

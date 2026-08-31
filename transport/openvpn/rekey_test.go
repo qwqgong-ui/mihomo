@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -85,7 +86,7 @@ func clientKeyMethodComplete(packet []byte) bool {
 		return false
 	}
 	offset := fixed
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		if !km2StrComplete(packet, offset) {
 			return false
 		}
@@ -416,7 +417,7 @@ func TestSendSoftResetRotatesKeyID(t *testing.T) {
 	// Drain the 2 old control messages + 1 soft reset from the server-side IO.
 	// The client writes to clientIO.out which arrives at serverIO.in.
 	// The soft reset is the 3rd packet written.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		_, err := serverIO.ReadPacket(ctx)
 		if err != nil {
 			t.Fatalf("failed to drain packet %d: %v", i, err)
@@ -3176,12 +3177,7 @@ func TestMRUCarriesAckOnSubsequentSends(t *testing.T) {
 }
 
 func hasAck(acks []uint32, id uint32) bool {
-	for _, a := range acks {
-		if a == id {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(acks, id)
 }
 
 // TestMRUMoveToFrontMatchesReference verifies the exact copy_acks_to_mru
@@ -3325,7 +3321,7 @@ func TestAckSerializationCaps(t *testing.T) {
 			name:  "dedicated-ack-with-tls",
 			crypt: mustClientCrypt(t),
 			path: func(ctx context.Context, c *ControlChannel) error {
-				for i := 0; i < 5; i++ {
+				for i := range 5 {
 					c.QueueAck(uint32(i))
 				}
 				return c.SendAck(ctx)
@@ -3336,7 +3332,7 @@ func TestAckSerializationCaps(t *testing.T) {
 			name:  "dedicated-ack-plain",
 			crypt: nil,
 			path: func(ctx context.Context, c *ControlChannel) error {
-				for i := 0; i < 5; i++ {
+				for i := range 5 {
 					c.QueueAck(uint32(i))
 				}
 				return c.SendAck(ctx)
@@ -3353,7 +3349,7 @@ func TestAckSerializationCaps(t *testing.T) {
 				if _, err := c.Send(ctx, PControlV1, []byte("data")); err != nil {
 					return err
 				}
-				for i := 0; i < 5; i++ {
+				for i := range 5 {
 					c.QueueAck(uint32(i))
 				}
 				return c.RetransmitPending(ctx)
@@ -3368,7 +3364,7 @@ func TestAckSerializationCaps(t *testing.T) {
 				if _, err := c.Send(ctx, PControlV1, []byte("data")); err != nil {
 					return err
 				}
-				for i := 0; i < 5; i++ {
+				for i := range 5 {
 					c.QueueAck(uint32(i))
 				}
 				return c.RetransmitPending(ctx)

@@ -159,7 +159,7 @@ func WriteRandomRequestHeaderWithPathRoot(w io.Writer, host string, pathRoot str
 	case 0, 1: // ~20% WebSocket-like upgrade
 		hostNoPort := trimPortForHost(host)
 		var keyBytes [16]byte
-		for i := 0; i < len(keyBytes); i++ {
+		for i := range len(keyBytes) {
 			keyBytes[i] = byte(r.Intn(256))
 		}
 		wsKey := base64.StdEncoding.EncodeToString(keyBytes[:])

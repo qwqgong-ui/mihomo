@@ -87,7 +87,7 @@ func New(config LC.SnellServer, lc C.InboundListenConfig, tunnel C.Tunnel, addit
 			return nil, err
 		}
 	}
-	for _, addr := range strings.Split(config.Listen, ",") {
+	for addr := range strings.SplitSeq(config.Listen, ",") {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
 			continue

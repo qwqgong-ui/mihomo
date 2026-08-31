@@ -135,7 +135,7 @@ func parseAuthorizeResponse(body []byte) (*authorizeResponse, error) {
 }
 
 func findAuthorizeField(body []byte, prefix string) string {
-	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(body)), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, prefix) {
 			return strings.TrimSpace(strings.TrimPrefix(line, prefix))

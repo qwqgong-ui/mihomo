@@ -61,18 +61,12 @@ func (c Config) readBuffer() uint32 {
 }
 
 func (c Config) sendingInFlightSize() uint32 {
-	size := c.uplinkCapacity() * 1024 * 1024 / c.mtu() / (1000 / c.tti())
-	if size < 8 {
-		size = 8
-	}
+	size := max(c.uplinkCapacity()*1024*1024/c.mtu()/(1000/c.tti()), 8)
 	return size
 }
 
 func (c Config) receivingInFlightSize() uint32 {
-	size := c.downlinkCapacity() * 1024 * 1024 / c.mtu() / (1000 / c.tti())
-	if size < 8 {
-		size = 8
-	}
+	size := max(c.downlinkCapacity()*1024*1024/c.mtu()/(1000/c.tti()), 8)
 	return size
 }
 

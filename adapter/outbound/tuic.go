@@ -282,10 +282,7 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 
 		t.client = tuic.NewPoolClientV4(clientOption, t.dial)
 	} else {
-		maxUdpRelayPacketSize := option.MaxUdpRelayPacketSize
-		if maxUdpRelayPacketSize > tuic.MaxFragSizeV5 {
-			maxUdpRelayPacketSize = tuic.MaxFragSizeV5
-		}
+		maxUdpRelayPacketSize := min(option.MaxUdpRelayPacketSize, tuic.MaxFragSizeV5)
 		clientOption := &tuic.ClientOptionV5{
 			Uuid:                  uuid.FromStringOrNil(option.UUID),
 			Password:              option.Password,

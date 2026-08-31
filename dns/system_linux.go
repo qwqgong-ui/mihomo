@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -97,12 +98,7 @@ func readLinkDNS(path, interfaceName string) ([]systemNameServer, error) {
 }
 
 func containsSystemNameServer(servers []systemNameServer, target systemNameServer) bool {
-	for _, server := range servers {
-		if server == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(servers, target)
 }
 
 func usableSystemDNS(ip netip.Addr) bool {

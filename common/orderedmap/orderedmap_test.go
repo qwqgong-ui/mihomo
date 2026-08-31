@@ -12,7 +12,7 @@ func TestBasicFeatures(t *testing.T) {
 	om := New[int, int]()
 
 	// set(i, 2 * i)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		assertLenEqual(t, om, i)
 		oldValue, present := om.Set(i, 2*i)
 		assertLenEqual(t, om, i+1)
@@ -22,7 +22,7 @@ func TestBasicFeatures(t *testing.T) {
 	}
 
 	// get what we just set
-	for i := 0; i < n; i++ {
+	for i := range n {
 		value, present := om.Get(i)
 
 		assert.Equal(t, 2*i, value)
@@ -31,7 +31,7 @@ func TestBasicFeatures(t *testing.T) {
 	}
 
 	// get pairs of what we just set
-	for i := 0; i < n; i++ {
+	for i := range n {
 		pair := om.GetPair(i)
 
 		assert.NotNil(t, pair)
@@ -213,7 +213,7 @@ func TestShuffle(t *testing.T) {
 			keys := make([]string, n)
 			values := make([]string, n)
 
-			for i := 0; i < n; i++ {
+			for i := range n {
 				// we prefix with the number to ensure that we don't get any duplicates
 				keys[i] = fmt.Sprintf("%d_%s", i, randomHexString(t, ranLen))
 				values[i] = randomHexString(t, ranLen)

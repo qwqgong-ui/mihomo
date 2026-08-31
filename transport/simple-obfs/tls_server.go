@@ -65,10 +65,7 @@ func (tos *TLSObfsServer) skipOtherExts() error {
 
 func (tos *TLSObfsServer) Read(b []byte) (int, error) {
 	if tos.remain > 0 {
-		length := tos.remain
-		if length > len(b) {
-			length = len(b)
-		}
+		length := min(tos.remain, len(b))
 
 		n, err := io.ReadFull(tos.Conn, b[:length])
 		tos.remain -= n
@@ -94,10 +91,7 @@ func (tos *TLSObfsServer) Read(b []byte) (int, error) {
 func (tos *TLSObfsServer) Write(b []byte) (int, error) {
 	length := len(b)
 	for i := 0; i < length; i += chunkSize {
-		end := i + chunkSize
-		if end > length {
-			end = length
-		}
+		end := min(i+chunkSize, length)
 
 		n, err := tos.write(b[i:end])
 		if err != nil {

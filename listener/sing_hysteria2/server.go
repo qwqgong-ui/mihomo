@@ -246,8 +246,7 @@ func New(config LC.Hysteria2Server, lc C.InboundListenConfig, tunnel C.Tunnel, a
 	}
 	service.UpdateUsers(userNameList, userPasswordList)
 
-	for _, addr := range strings.Split(config.Listen, ",") {
-		addr := addr
+	for addr := range strings.SplitSeq(config.Listen, ",") {
 		_service := *service
 		service := &_service // make a copy
 

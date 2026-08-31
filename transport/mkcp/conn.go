@@ -168,10 +168,7 @@ func (c *Conn) Write(b []byte) (int, error) {
 	}
 	written := 0
 	for written < len(b) {
-		end := written + c.mss
-		if end > len(b) {
-			end = len(b)
-		}
+		end := min(written+c.mss, len(b))
 		payload := append([]byte(nil), b[written:end]...)
 		for {
 			c.mu.Lock()
@@ -588,10 +585,7 @@ func (c *Conn) flushAcksLocked(current uint32) []segment {
 		if item.timestamp-ack.timestamp < 0x7fffffff {
 			ack.timestamp = item.timestamp
 		}
-		timeout := c.rto / 2
-		if timeout < 20 {
-			timeout = 20
-		}
+		timeout := max(c.rto/2, 20)
 		item.nextFlush = current + timeout
 		if len(ack.numberList) == 128 {
 			segments = append(segments, ack)
@@ -671,7 +665,7 @@ func (c *Conn) flushSendLocked(current uint32) []segment {
 func (c *Conn) writeSegments(segments []segment) {
 	for _, seg := range segments {
 		var err error
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			err = c.writer.writeSegment(seg)
 			if err == nil {
 				break
@@ -750,10 +744,7 @@ func (c *Conn) updateRTTLocked(rtt uint32, current uint32) {
 			delta = c.srtt - rtt
 		}
 		c.rttVariation = (3*c.rttVariation + delta) / 4
-		c.srtt = (7*c.srtt + rtt) / 8
-		if c.srtt < c.minRtt {
-			c.srtt = c.minRtt
-		}
+		c.srtt = max((7*c.srtt+rtt)/8, c.minRtt)
 	}
 	var rto uint32
 	if c.minRtt < 4*c.rttVariation {

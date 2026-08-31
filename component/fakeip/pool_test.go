@@ -134,7 +134,7 @@ func TestPool_CycleUsed(t *testing.T) {
 	for _, pool := range pools {
 		foo := pool.Lookup("foo.com")
 		bar := pool.Lookup("bar.com")
-		for i := 0; i < 9; i++ {
+		for i := range 9 {
 			pool.Lookup(fmt.Sprintf("%d.com", i))
 		}
 		baz := pool.Lookup("baz.com")

@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -89,9 +90,7 @@ func registerPersistentCache(name string, c dnsCache) {
 func LoadPersistentCache() {
 	persistMu.Lock()
 	caches := make(map[string]dnsCache, len(persistCaches))
-	for name, c := range persistCaches {
-		caches[name] = c
-	}
+	maps.Copy(caches, persistCaches)
 	persistMu.Unlock()
 
 	if len(caches) == 0 {
@@ -137,9 +136,7 @@ func loadCache(name string, c dnsCache, entries []cachefile.DNSEntry) {
 func StoreCache() {
 	persistMu.Lock()
 	caches := make(map[string]dnsCache, len(persistCaches))
-	for name, c := range persistCaches {
-		caches[name] = c
-	}
+	maps.Copy(caches, persistCaches)
 	persistMu.Unlock()
 
 	var entries []cachefile.DNSEntry

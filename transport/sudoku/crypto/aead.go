@@ -86,10 +86,7 @@ func (cc *AEADConn) Write(p []byte) (int, error) {
 	nonce := make([]byte, cc.nonceSize)
 
 	for len(p) > 0 {
-		chunkSize := len(p)
-		if chunkSize > maxPayload {
-			chunkSize = maxPayload
-		}
+		chunkSize := min(len(p), maxPayload)
 		chunk := p[:chunkSize]
 		p = p[chunkSize:]
 

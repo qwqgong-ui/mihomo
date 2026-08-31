@@ -63,7 +63,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 
 	var excludeFilterRegs []*regexp2.Regexp
 	if opt.ExcludeFilter != "" {
-		for _, excludeFilter := range strings.Split(opt.ExcludeFilter, "`") {
+		for excludeFilter := range strings.SplitSeq(opt.ExcludeFilter, "`") {
 			excludeFilterReg := regexp2.MustCompile(excludeFilter, regexp2.None)
 			excludeFilterRegs = append(excludeFilterRegs, excludeFilterReg)
 		}
@@ -71,7 +71,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 
 	var filterRegs []*regexp2.Regexp
 	if opt.Filter != "" {
-		for _, filter := range strings.Split(opt.Filter, "`") {
+		for filter := range strings.SplitSeq(opt.Filter, "`") {
 			filterReg := regexp2.MustCompile(filter, regexp2.None)
 			filterRegs = append(filterRegs, filterReg)
 		}
@@ -240,9 +240,7 @@ func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus uti
 	mp := map[string]uint16{}
 	proxies := gb.GetProxies(false)
 	for _, proxy := range proxies {
-		proxy := proxy
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			delay, err := proxy.URLTest(ctx, url, expectedStatus)
 			if err == nil {
 				lock.Lock()
@@ -250,8 +248,7 @@ func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus uti
 				lock.Unlock()
 			}
 
-			wg.Done()
-		}()
+		})
 	}
 	wg.Wait()
 

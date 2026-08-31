@@ -293,10 +293,7 @@ func sniffHTTP2(b []byte) (string, error) {
 			}
 		}
 
-		availableEnd := len(b)
-		if availableEnd > fragmentEnd {
-			availableEnd = fragmentEnd
-		}
+		availableEnd := min(len(b), fragmentEnd)
 		if availableEnd > fragmentStart {
 			_, err := decoder.Write(b[fragmentStart:availableEnd])
 			// A complete authority field is enough for routing. Like HTTP/1 Host,

@@ -149,7 +149,7 @@ func (hc *HealthCheck) registerHealthCheckTask(url string, expectedStatus utils.
 func splitAndAddFiltersToExtra(filter string, option *extraOption) {
 	filter = strings.TrimSpace(filter)
 	if len(filter) != 0 {
-		for _, regex := range strings.Split(filter, "`") {
+		for regex := range strings.SplitSeq(filter, "`") {
 			regex = strings.TrimSpace(regex)
 			if len(regex) != 0 {
 				option.filters[regex] = struct{}{}

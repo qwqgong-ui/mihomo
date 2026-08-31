@@ -44,7 +44,6 @@ func TestDiscoverWhoami(t *testing.T) {
 		{name: "address record"},
 		{name: "TXT record", txt: true},
 	} {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			server := serveWhoami(t, "203.0.113.77", test.txt)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

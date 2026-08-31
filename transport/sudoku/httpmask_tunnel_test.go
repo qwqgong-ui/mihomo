@@ -27,9 +27,7 @@ func startTunnelServer(t *testing.T, cfg *ProtocolConfig, handle func(*ServerSes
 	var wg sync.WaitGroup
 	var stopOnce sync.Once
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			c, err := ln.Accept()
 			if err != nil {
@@ -82,7 +80,7 @@ func startTunnelServer(t *testing.T, cfg *ProtocolConfig, handle func(*ServerSes
 				}
 			}(c)
 		}
-	}()
+	})
 
 	stop = func() {
 		stopOnce.Do(func() {
@@ -563,7 +561,7 @@ func TestHTTPMaskTunnel_Soak_Concurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	runErr := make(chan error, sessions)
 
-	for i := 0; i < sessions; i++ {
+	for i := range sessions {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()

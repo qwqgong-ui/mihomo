@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
@@ -146,13 +147,7 @@ func (s *serverHandler) HandleUniStream(reader *bufio.Reader) (err error) {
 		if err != nil {
 			return
 		}
-		authOk := false
-		for _, tkn := range s.Tokens {
-			if authenticate.TKN == tkn {
-				authOk = true
-				break
-			}
-		}
+		authOk := slices.Contains(s.Tokens, authenticate.TKN)
 		s.authOnce.Do(func() {
 			if !authOk {
 				_ = s.quicConn.CloseWithError(AuthenticationFailed, "AuthenticationFailed")

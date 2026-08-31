@@ -14,7 +14,7 @@ import (
 
 func TestHealthCheckProbeStartIntervalRange(t *testing.T) {
 	seen := map[time.Duration]struct{}{}
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		interval := randomHealthCheckProbeStartInterval()
 		if interval < healthCheckProbeStartMin || interval > healthCheckProbeStartMax {
 			t.Fatalf("probe start interval %s is outside [%s, %s]", interval, healthCheckProbeStartMin, healthCheckProbeStartMax)
@@ -29,7 +29,7 @@ func TestHealthCheckProbeStartIntervalRange(t *testing.T) {
 func TestProbeStartPacerSpacesStarts(t *testing.T) {
 	pacer := probeStartPacer{}
 	var previous time.Time
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if err := pacer.wait(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -62,7 +62,7 @@ func TestHealthCheckUsesRealURLTestPath(t *testing.T) {
 	hc.check()
 
 	got := make([]string, 0, proxyCount)
-	for i := 0; i < proxyCount; i++ {
+	for range proxyCount {
 		select {
 		case method := <-arrivals:
 			got = append(got, method)

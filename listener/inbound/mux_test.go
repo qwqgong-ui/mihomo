@@ -26,7 +26,6 @@ func (n *notCloseProxyAdapter) Close() error {
 func testSingMux(t *testing.T, tunnel *TestTunnel, out outbound.ProxyAdapter) {
 	t.Run("singmux", func(t *testing.T) {
 		for _, protocol := range singMuxProtocolList {
-			protocol := protocol
 			t.Run(protocol, func(t *testing.T) {
 				singMuxOption := outbound.SingMuxOption{
 					Enabled:  true,

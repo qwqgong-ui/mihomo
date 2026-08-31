@@ -2,6 +2,7 @@ package shadowquic
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/metacubex/jls-quic-go"
@@ -38,10 +39,5 @@ func ParseQUICVersion(value string) (quic.Version, error) {
 }
 
 func containsQUICVersion(versions []quic.Version, version quic.Version) bool {
-	for _, v := range versions {
-		if v == version {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(versions, version)
 }

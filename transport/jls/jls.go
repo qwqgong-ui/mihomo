@@ -268,10 +268,7 @@ func (c *rateLimitedConn) Read(p []byte) (n int, err error) {
 
 func (c *rateLimitedConn) Write(p []byte) (n int, err error) {
 	for len(p) > 0 {
-		chunkSize := len(p)
-		if chunkSize > c.burst {
-			chunkSize = c.burst
-		}
+		chunkSize := min(len(p), c.burst)
 		if err = c.writeLimiter.WaitN(c.ctx, chunkSize); err != nil {
 			return n, err
 		}

@@ -69,7 +69,7 @@ func TestUserHash_StableAcrossTableRotation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	for i := 0; i < attempts; i++ {
+	for i := range attempts {
 		raw, err := (&net.Dialer{}).DialContext(ctx, "tcp", clientCfg.ServerAddress)
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
@@ -85,7 +85,7 @@ func TestUserHash_StableAcrossTableRotation(t *testing.T) {
 
 	unique := map[string]struct{}{}
 	deadline := time.After(10 * time.Second)
-	for i := 0; i < attempts; i++ {
+	for range attempts {
 		select {
 		case err := <-errCh:
 			t.Fatalf("server handshake error: %v", err)
@@ -202,7 +202,7 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 	}
 	defer mux.Close()
 
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		s, err := mux.Dial(ctx, target)
 		if err != nil {
 			t.Fatalf("dial stream %d: %v", i, err)

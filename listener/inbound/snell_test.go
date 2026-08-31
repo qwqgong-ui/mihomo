@@ -69,7 +69,6 @@ func TestInboundSnell(t *testing.T) {
 		{"v5", 5},
 	}
 	for _, tc := range testCase {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			inboundOptions := inbound.SnellOption{Version: tc.version}
 			outboundOptions := outbound.SnellOption{Version: tc.version}

@@ -165,7 +165,7 @@ func New(config LC.ShadowQuicServer, lc C.InboundListenConfig, tunnel C.Tunnel, 
 	}
 
 	sl := &Listener{config: config}
-	for _, addr := range strings.Split(config.Listen, ",") {
+	for addr := range strings.SplitSeq(config.Listen, ",") {
 		addr = strings.TrimSpace(addr)
 		if addr == "" {
 			continue

@@ -72,7 +72,7 @@ func TestPortHopReusesECNConfiguredSocket(t *testing.T) {
 	require.True(t, ok)
 	localAddr := hopConn.LocalAddr().String()
 
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		hopConn.hop()
 		require.Equal(t, localAddr, hopConn.LocalAddr().String())
 	}

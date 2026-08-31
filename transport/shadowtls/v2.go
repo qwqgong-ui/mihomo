@@ -110,10 +110,7 @@ func (c *shadowConn) Read(p []byte) (int, error) {
 		return 0, fmt.Errorf("shadow-tls: unexpected TLS record type: %d", c.readHeader[0])
 	}
 	length := int(binary.BigEndian.Uint16(c.readHeader[3:]))
-	readLength := len(p)
-	if readLength > length {
-		readLength = length
-	}
+	readLength := min(len(p), length)
 	n, err = c.Conn.Read(p[:readLength])
 	c.readRemaining = length - n
 	return n, err
@@ -130,10 +127,7 @@ func (c *shadowConn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	for len(p) > 0 {
-		length := len(p)
-		if length > maxTLSPlaintext {
-			length = maxTLSPlaintext
-		}
+		length := min(len(p), maxTLSPlaintext)
 		if err := c.writeRecord(p[:length]); err != nil {
 			return total - len(p), err
 		}

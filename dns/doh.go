@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"runtime"
+	slices0 "slices"
 	"strconv"
 	"sync"
 	"time"
@@ -36,9 +37,9 @@ const (
 	// connections in HTTP transport.
 	transportDefaultIdleConnTimeout = 5 * time.Minute
 
-	dialTimeout        = 10 * time.Second
+	dialTimeout = 10 * time.Second
 
-	maxElapsedTime  = time.Second * 30
+	maxElapsedTime = time.Second * 30
 )
 
 var DefaultHTTPVersions = []C.HTTPVersion{C.HTTPVersion11, C.HTTPVersion2}
@@ -671,13 +672,7 @@ func (doh *dnsOverHTTPS) probeTLS(ctx context.Context, tlsConfig *tls.Config, ch
 
 // supportsH3 returns true if HTTP/3 is supported by this upstream.
 func (doh *dnsOverHTTPS) supportsH3() (ok bool) {
-	for _, v := range doh.supportedHTTPVersions() {
-		if v == C.HTTPVersion3 {
-			return true
-		}
-	}
-
-	return false
+	return slices0.Contains(doh.supportedHTTPVersions(), C.HTTPVersion3)
 }
 
 // supportsHTTP returns true if HTTP/1.1 or HTTP2 is supported by this upstream.

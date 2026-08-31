@@ -18,7 +18,6 @@ func testInboundTuic(t *testing.T, inboundOptions inbound.TuicOption, outboundOp
 	inboundOptions.Token = []string{userUUID}
 
 	for _, tuicCC := range tuicCCs {
-		tuicCC := tuicCC
 		t.Run(tuicCC, func(t *testing.T) {
 			t.Parallel()
 			t.Run("v4", func(t *testing.T) {

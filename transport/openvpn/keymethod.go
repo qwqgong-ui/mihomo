@@ -169,7 +169,7 @@ func RecordComplete(packet []byte) (complete bool, consumed int) {
 		return false, 0
 	}
 	offset += 2 + int(binary.BigEndian.Uint16(packet[offset:offset+2]))
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if !km2StrComplete(packet, offset) {
 			return false, 0
 		}

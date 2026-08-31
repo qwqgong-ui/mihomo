@@ -274,10 +274,7 @@ func (w *v4Writer) Write(b []byte) (int, error) {
 		if payloadLimit <= 0 || payloadLimit > maxLength {
 			payloadLimit = maxLength
 		}
-		end := written + payloadLimit
-		if end > len(b) {
-			end = len(b)
-		}
+		end := min(written+payloadLimit, len(b))
 		paddingLength := w.nextFramePaddingLength(end - written)
 		if err := w.writeFrame(b[written:end], paddingLength); err != nil {
 			return written, err
@@ -301,10 +298,7 @@ func (w *v4Writer) nextPayloadLimit() uint16 {
 	w.lastWrite = now
 
 	if payloadLimit <= maxLength-1 {
-		next := int(payloadLimit) + v4FrameSize - 39
-		if next > maxLength {
-			next = maxLength
-		}
+		next := min(int(payloadLimit)+v4FrameSize-39, maxLength)
 		w.payloadLimit = uint16(next)
 	} else {
 		w.payloadLimit = maxLength
@@ -366,10 +360,7 @@ func (w *v4Writer) writeFrame(payload []byte, paddingLength int) error {
 }
 
 func swapPadding(padding, payloadCipher []byte) {
-	limit := len(padding)
-	if len(payloadCipher) < limit {
-		limit = len(payloadCipher)
-	}
+	limit := min(len(payloadCipher), len(padding))
 	for i := 0; i < limit; i += 2 {
 		padding[i], payloadCipher[i] = payloadCipher[i], padding[i]
 	}
@@ -431,7 +422,7 @@ func makeV4BitCountPadding(length, oneBits int) ([]byte, error) {
 	}
 
 	bitset := make([]byte, totalBits)
-	for i := 0; i < oneBits; i++ {
+	for i := range oneBits {
 		bitset[i] = 1
 	}
 	for i := totalBits - 1; i > 0; i-- {

@@ -193,10 +193,7 @@ func (c *verifiedConn) Write(p []byte) (int, error) {
 	defer c.writeMu.Unlock()
 	total := len(p)
 	for len(p) > 0 {
-		length := len(p)
-		if length > maxTLSPlaintext {
-			length = maxTLSPlaintext
-		}
+		length := min(len(p), maxTLSPlaintext)
 		if err := c.writeRecord(p[:length]); err != nil {
 			return total - len(p), err
 		}

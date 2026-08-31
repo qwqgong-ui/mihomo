@@ -100,10 +100,7 @@ func (sl *SkipList[K, V]) Insert(key K, value V) {
 	level := sl.randomLevel()
 	node = newSkipListNode(level, key, value)
 
-	minLevel := level
-	if sl.level < level {
-		minLevel = sl.level
-	}
+	minLevel := min(sl.level, level)
 	for i := 0; i < minLevel; i++ {
 		node.next[i] = prevs[i].next[i]
 		prevs[i].next[i] = node

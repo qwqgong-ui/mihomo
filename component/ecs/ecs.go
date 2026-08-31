@@ -196,12 +196,9 @@ func discover(ctx context.Context, reason string) {
 		families = append(families, false)
 	}
 	for _, ipv4 := range families {
-		ipv4 := ipv4 // go.mod targets go1.20, the loop variable is shared
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			store(ctx, ipv4, reason)
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -247,7 +244,6 @@ func discoverPrefix(ctx context.Context, ipv4 bool) (netip.Prefix, error) {
 	}
 	results := make(chan result, len(probes))
 	for _, probe := range probes {
-		probe := probe // go.mod targets go1.20, the loop variable is shared
 		go func() {
 			addr, err := probe()
 			results <- result{addr, err}

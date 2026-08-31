@@ -153,7 +153,7 @@ func TestDomainSetOversizedKey(t *testing.T) {
 
 func BenchmarkDomainSetHas(b *testing.B) {
 	tree := trie.New[struct{}]()
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		assert.NoError(b, tree.Insert("+."+strconv.Itoa(i)+".example.com", struct{}{}))
 	}
 	set := tree.NewDomainSet()

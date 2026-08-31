@@ -339,10 +339,7 @@ func (c *RecordConn) Write(p []byte) (int, error) {
 		if maxPlain <= 0 {
 			return total, errors.New("frame size too small")
 		}
-		n := len(p)
-		if n > maxPlain {
-			n = maxPlain
-		}
+		n := min(len(p), maxPlain)
 		chunk := p[:n]
 		p = p[n:]
 

@@ -13,7 +13,7 @@ func TestDropParkerReleasesInOrder(t *testing.T) {
 	var released []int
 	done := make(chan struct{})
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		i := i
 		p.Park(time.Duration(i+1)*20*time.Millisecond, func() {
 			mutex.Lock()
@@ -52,7 +52,7 @@ func TestDropParkerEvictsOldestWhenFull(t *testing.T) {
 	p := &dropParker{}
 
 	evicted := make(chan int, maxParkedDrops+1)
-	for i := 0; i < maxParkedDrops+2; i++ {
+	for i := range maxParkedDrops + 2 {
 		i := i
 		p.Park(time.Hour, func() { evicted <- i })
 	}

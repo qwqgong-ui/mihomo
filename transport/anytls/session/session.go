@@ -402,10 +402,7 @@ func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
 	defer buffer.Release()
 
 	for written := 0; written < dataLen; {
-		chunk := dataLen - written
-		if chunk > maxFrameDataLen {
-			chunk = maxFrameDataLen
-		}
+		chunk := min(dataLen-written, maxFrameDataLen)
 		buffer.WriteByte(cmdPSH)
 		binary.BigEndian.PutUint32(buffer.Extend(4), sid)
 		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(chunk))

@@ -2,7 +2,6 @@ package mkcp
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"net"
@@ -13,8 +12,7 @@ import (
 )
 
 func TestRoundTrip(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -51,8 +49,7 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestFullDuplex(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -112,8 +109,7 @@ func TestFullDuplex(t *testing.T) {
 func TestRoundTripHeaders(t *testing.T) {
 	for _, header := range []string{"srtp", "utp", "wechat-video", "dtls", "wireguard"} {
 		t.Run(header, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			ctx := t.Context()
 
 			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 			require.NoError(t, err)

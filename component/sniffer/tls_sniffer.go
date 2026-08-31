@@ -267,10 +267,7 @@ func SniffTLS(b []byte) (*string, error) {
 
 		payloadOffset := wireOffset + tlsRecordHeaderLen
 		recordEnd := payloadOffset + recordLen
-		payloadEnd := len(b)
-		if payloadEnd > recordEnd {
-			payloadEnd = recordEnd
-		}
+		payloadEnd := min(len(b), recordEnd)
 		if payloadEnd < payloadOffset {
 			payloadEnd = payloadOffset
 		}

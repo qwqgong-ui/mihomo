@@ -177,7 +177,7 @@ func (a *AEAD) Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, erro
 }
 
 func IncreaseNonce(nonce []byte) []byte {
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		nonce[11-i]++
 		if nonce[11-i] != 0 {
 			break

@@ -65,7 +65,7 @@ func (srv *Service) Stop() {
 func (srv *Service) update() error {
 	var response *ntp.Response
 	var err error
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		response, err = ntp.Exchange(srv.ctx, srv.dialer, srv.server)
 		if err != nil {
 			if srv.ctx.Err() != nil {

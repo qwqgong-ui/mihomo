@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -121,7 +122,7 @@ func (c *ControlChannel) checkReplayLocked(packetID, unixTime uint32) error {
 			for i := controlReplayWindow - 1; i >= shift; i-- {
 				r.slots[i] = r.slots[i-shift]
 			}
-			for i := 0; i < shift; i++ {
+			for i := range shift {
 				r.slots[i] = 0
 			}
 		}
@@ -307,10 +308,7 @@ func (c *ControlChannel) takeAcksLocked(max int) []uint32 {
 	// reliable_ack_write): move ackPending[:n] into the MRU front and keep
 	// the remainder pending for the next packet. This preserves ACKs that
 	// the per-packet cap would otherwise drop.
-	n := len(c.ackPending)
-	if n > max {
-		n = max
-	}
+	n := min(len(c.ackPending), max)
 	// Move ackPending[:n] (newest last) into the MRU front, preserving their
 	// relative order, exactly like copy_acks_to_mru's backward loop.
 	for i := n - 1; i >= 0; i-- {
@@ -340,10 +338,7 @@ func (c *ControlChannel) takeAcksLocked(max int) []uint32 {
 		c.lruAcks = c.lruAcks[:reliableAckSize]
 	}
 	// Serialize from the MRU: up to max, but never more than the MRU holds.
-	k := len(c.lruAcks)
-	if k > max {
-		k = max
-	}
+	k := min(len(c.lruAcks), max)
 	return append([]uint32(nil), c.lruAcks[:k]...)
 }
 
@@ -928,10 +923,8 @@ func (c *ControlChannel) interruptWrite() {
 }
 
 func appendAck(acks []uint32, ack uint32) []uint32 {
-	for _, existing := range acks {
-		if existing == ack {
-			return acks
-		}
+	if slices.Contains(acks, ack) {
+		return acks
 	}
 	return append(acks, ack)
 }
@@ -1058,10 +1051,7 @@ func (c *ControlConn) Write(b []byte) (int, error) {
 	}
 	written := 0
 	for len(b) > 0 {
-		n := len(b)
-		if n > maxTLSControlPayload {
-			n = maxTLSControlPayload
-		}
+		n := min(len(b), maxTLSControlPayload)
 		if _, err := c.channel.Send(opCtx, PControlV1, b[:n]); err != nil {
 			c.mu.Lock()
 			closed := c.closed

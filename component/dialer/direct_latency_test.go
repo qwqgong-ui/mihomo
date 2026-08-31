@@ -51,10 +51,7 @@ func percentiles(samples []time.Duration) latencyStats {
 		if len(sorted) == 0 {
 			return 0
 		}
-		index := int(float64(len(sorted))*p/100+0.5) - 1
-		if index < 0 {
-			index = 0
-		}
+		index := max(int(float64(len(sorted))*p/100+0.5)-1, 0)
 		if index >= len(sorted) {
 			index = len(sorted) - 1
 		}
@@ -66,7 +63,7 @@ func percentiles(samples []time.Duration) latencyStats {
 func measure(t *testing.T, name string, iterations int, dial func() (net.Conn, error)) latencyStats {
 	t.Helper()
 	// Warm up caches and let the allocator settle before sampling.
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		conn, err := dial()
 		if err != nil {
 			t.Fatalf("%s warmup failed: %v", name, err)
@@ -74,7 +71,7 @@ func measure(t *testing.T, name string, iterations int, dial func() (net.Conn, e
 		_ = conn.Close()
 	}
 	samples := make([]time.Duration, 0, iterations)
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		start := time.Now()
 		conn, err := dial()
 		elapsed := time.Since(start)

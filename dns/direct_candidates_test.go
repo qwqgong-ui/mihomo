@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -229,10 +230,5 @@ func TestDirectCandidatesSourceCacheIsNetworkScoped(t *testing.T) {
 }
 
 func containsAddr(addrs []netip.Addr, want netip.Addr) bool {
-	for _, addr := range addrs {
-		if addr == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(addrs, want)
 }

@@ -10,7 +10,7 @@ import (
 )
 
 func TestClientAEADSeed_IsStableForPrivAndPub(t *testing.T) {
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		priv, pub, err := GenKeyPair()
 		require.NoError(t, err)
 
@@ -22,7 +22,7 @@ func TestClientAEADSeed_IsStableForPrivAndPub(t *testing.T) {
 }
 
 func TestClientAEADSeed_Supports32ByteMasterScalar(t *testing.T) {
-	for i := 0; i < 256; i++ {
+	for range 256 {
 		var seed [64]byte
 		_, err := rand.Read(seed[:])
 		require.NoError(t, err)
@@ -48,7 +48,7 @@ func TestClientAEADSeed_Supports32ByteMasterScalar(t *testing.T) {
 }
 
 func TestServerAEADSeed_LeavesPublicKeyAsIs(t *testing.T) {
-	for i := 0; i < 64; i++ {
+	for range 64 {
 		priv, pub, err := GenKeyPair()
 		require.NoError(t, err)
 		require.Equal(t, pub, ServerAEADSeed(pub))

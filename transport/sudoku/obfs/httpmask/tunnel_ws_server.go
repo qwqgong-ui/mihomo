@@ -19,7 +19,7 @@ func looksLikeWebSocketUpgrade(headers map[string]string) bool {
 		return false
 	}
 	conn := headers["connection"]
-	for _, part := range strings.Split(conn, ",") {
+	for part := range strings.SplitSeq(conn, ",") {
 		if strings.EqualFold(strings.TrimSpace(part), "upgrade") {
 			return true
 		}

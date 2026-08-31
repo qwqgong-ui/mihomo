@@ -139,10 +139,10 @@ type ConnectionState = utls.ConnectionState
 
 type Config = utls.Config
 
-var tlsCertificateRequestInfoCtxOffset = utils.MustOK(reflect.TypeOf((*tls.CertificateRequestInfo)(nil)).Elem().FieldByName("ctx")).Offset
-var tlsClientHelloInfoCtxOffset = utils.MustOK(reflect.TypeOf((*tls.ClientHelloInfo)(nil)).Elem().FieldByName("ctx")).Offset
-var tlsConnectionStateEkmOffset = utils.MustOK(reflect.TypeOf((*tls.ConnectionState)(nil)).Elem().FieldByName("ekm")).Offset
-var utlsConnectionStateEkmOffset = utils.MustOK(reflect.TypeOf((*utls.ConnectionState)(nil)).Elem().FieldByName("ekm")).Offset
+var tlsCertificateRequestInfoCtxOffset = utils.MustOK(reflect.TypeFor[tls.CertificateRequestInfo]().FieldByName("ctx")).Offset
+var tlsClientHelloInfoCtxOffset = utils.MustOK(reflect.TypeFor[tls.ClientHelloInfo]().FieldByName("ctx")).Offset
+var tlsConnectionStateEkmOffset = utils.MustOK(reflect.TypeFor[tls.ConnectionState]().FieldByName("ekm")).Offset
+var utlsConnectionStateEkmOffset = utils.MustOK(reflect.TypeFor[utls.ConnectionState]().FieldByName("ekm")).Offset
 
 func tlsConnectionState(state utls.ConnectionState) (tlsState tls.ConnectionState) {
 	tlsState = tls.ConnectionState{

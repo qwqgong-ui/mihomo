@@ -498,7 +498,7 @@ func makeProtectedQUICInitialPacket(t *testing.T, destConnID []byte, labels quic
 	aead, err := cipher.NewGCM(block)
 	require.NoError(t, err)
 	nonce := bytes.Clone(labels.iv)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		nonce[len(nonce)-1-i] ^= byte(uint64(packetNumber) >> (8 * i))
 	}
 	packet := aead.Seal(bytes.Clone(header), nonce, plaintext, header)
@@ -508,7 +508,7 @@ func makeProtectedQUICInitialPacket(t *testing.T, destConnID []byte, labels quic
 	mask := make([]byte, headerProtection.BlockSize())
 	headerProtection.Encrypt(mask, packet[packetNumberOffset+4:packetNumberOffset+4+headerProtection.BlockSize()])
 	packet[0] ^= mask[0] & 0x0f
-	for i := 0; i < packetNumberLength; i++ {
+	for i := range packetNumberLength {
 		packet[packetNumberOffset+i] ^= mask[1+i]
 	}
 	return packet, packetNumberOffset

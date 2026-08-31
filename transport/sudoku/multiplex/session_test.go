@@ -217,7 +217,7 @@ func TestStreamConcurrentWritesRemainContiguous(t *testing.T) {
 	start := make(chan struct{})
 	errs := make(chan error, writers)
 	var wg sync.WaitGroup
-	for i := 0; i < writers; i++ {
+	for i := range writers {
 		wg.Add(1)
 		go func(marker byte) {
 			defer wg.Done()

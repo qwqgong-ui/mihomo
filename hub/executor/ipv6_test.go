@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"context"
 	"net/netip"
 	"testing"
 	"time"
@@ -12,8 +11,7 @@ import (
 )
 
 func TestDebounceNetworkUpdates(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	updates := make(chan struct{}, 3)
 	callbacks := make(chan struct{}, 2)
 	go debounceNetworkUpdates(ctx, updates, 20*time.Millisecond, func() {

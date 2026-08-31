@@ -85,7 +85,7 @@ func (s *Socks) Address() string {
 // Listen implements constant.InboundListener
 func (s *Socks) Listen(tunnel C.Tunnel) error {
 	lc := s.ListenConfig()
-	for _, addr := range strings.Split(s.RawAddress(), ",") {
+	for addr := range strings.SplitSeq(s.RawAddress(), ",") {
 		config := LC.AuthServer{
 			Enable:         true,
 			Listen:         addr,

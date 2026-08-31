@@ -243,10 +243,7 @@ func (p *preparedConnPool) waitReady(ctx context.Context, closed <-chan struct{}
 }
 
 func (p *preparedConnPool) expire(item *preparedConn) {
-	delay := time.Until(item.expiresAt)
-	if delay < 0 {
-		delay = 0
-	}
+	delay := max(time.Until(item.expiresAt), 0)
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	<-timer.C

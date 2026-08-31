@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1584,7 +1585,7 @@ func parseAuthPendingTimeout(msg string) (*PushReply, error) {
 	rest = strings.TrimPrefix(rest, ",")
 	// OpenVPN caps explicit timeouts at max(reneg-sec/2, hand-window).
 	// Mihomo currently implements the reference defaults: max(1800, 60).
-	for _, part := range strings.Split(rest, ",") {
+	for part := range strings.SplitSeq(rest, ",") {
 		fields := strings.Fields(part)
 		if len(fields) != 2 || fields[0] != "timeout" {
 			continue
@@ -1689,12 +1690,7 @@ func appendUniquePrefixes(prev, next []netip.Prefix) []netip.Prefix {
 }
 
 func containsPrefix(list []netip.Prefix, p netip.Prefix) bool {
-	for _, q := range list {
-		if q == p {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, p)
 }
 
 func appendUniqueAddrs(prev, next []netip.Addr) []netip.Addr {
@@ -1711,12 +1707,7 @@ func appendUniqueAddrs(prev, next []netip.Addr) []netip.Addr {
 }
 
 func containsAddr(list []netip.Addr, a netip.Addr) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, a)
 }
 
 func appendUniqueStrings(prev, next []string) []string {
@@ -1733,12 +1724,7 @@ func appendUniqueStrings(prev, next []string) []string {
 }
 
 func containsString(list []string, s string) bool {
-	for _, t := range list {
-		if t == s {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(list, s)
 }
 
 func (c *Client) tlsConfig() (*tls.Config, error) {

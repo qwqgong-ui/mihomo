@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -496,7 +497,7 @@ func sendSessionControl(client *http.Client, controlURL, headerHost string, mode
 	defer cancel()
 
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := range maxAttempts {
 		req, err := http.NewRequestWithContext(closeCtx, http.MethodPost, controlURL, nil)
 		if err != nil {
 			return err
@@ -1193,12 +1194,10 @@ type pollConn struct {
 }
 
 func isDialError(err error) bool {
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		return isDialError(urlErr.Err)
 	}
-	var opErr *net.OpError
-	if errors.As(err, &opErr) {
+	if opErr, ok := errors.AsType[*net.OpError](err); ok {
 		if opErr.Op == "dial" || opErr.Op == "connect" {
 			return true
 		}
@@ -1223,8 +1222,7 @@ func isRetryableHTTPTransportError(err error) bool {
 	}
 
 	// Unwrap common wrappers.
-	var urlErr *url.Error
-	if errors.As(err, &urlErr) {
+	if urlErr, ok := errors.AsType[*url.Error](err); ok {
 		return isRetryableHTTPTransportError(urlErr.Err)
 	}
 
@@ -1236,8 +1234,7 @@ func isRetryableHTTPTransportError(err error) bool {
 		return true
 	}
 
-	var netErr net.Error
-	if errors.As(err, &netErr) {
+	if netErr, ok := errors.AsType[net.Error](err); ok {
 		return netErr.Timeout() || netErr.Temporary()
 	}
 	return false
@@ -2252,12 +2249,7 @@ func (s *TunnelServer) handleStream(rawConn net.Conn, req *httpRequestHeader, he
 }
 
 func (s *TunnelServer) isAllowedBasePath(path string) bool {
-	for _, p := range paths {
-		if path == p {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(paths, path)
 }
 
 func newRequestBodyReader(conn net.Conn, headers map[string]string) (io.Reader, error) {

@@ -19,7 +19,7 @@ import (
 
 func TestUnseededHash(t *testing.T) {
 	m := map[uint64]struct{}{}
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		h := new(Hash)
 		m[h.Sum64()] = struct{}{}
 	}
@@ -31,7 +31,7 @@ func TestUnseededHash(t *testing.T) {
 func TestSeededHash(t *testing.T) {
 	s := MakeSeed()
 	m := map[uint64]struct{}{}
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		h := new(Hash)
 		h.SetSeed(s)
 		m[h.Sum64()] = struct{}{}
@@ -127,7 +127,7 @@ func TestHashHighBytes(t *testing.T) {
 	// See issue 34925.
 	const N = 10
 	m := map[uint64]struct{}{}
-	for i := 0; i < N; i++ {
+	for range N {
 		h := new(Hash)
 		h.WriteString("foo")
 		m[h.Sum64()>>32] = struct{}{}
@@ -530,5 +530,5 @@ func TypeFor[T any]() reflect.Type {
 	if t := reflect.TypeOf(v); t != nil {
 		return t // optimize for T being a non-interface kind
 	}
-	return reflect.TypeOf((*T)(nil)).Elem() // only for an interface kind
+	return reflect.TypeFor[T]() // only for an interface kind
 }

@@ -56,7 +56,7 @@ func (t *TProxy) Address() string {
 
 // Listen implements constant.InboundListener
 func (t *TProxy) Listen(tunnel C.Tunnel) error {
-	for _, addr := range strings.Split(t.RawAddress(), ",") {
+	for addr := range strings.SplitSeq(t.RawAddress(), ",") {
 		lTCP, err := tproxy.New(addr, tunnel, t.Additions()...)
 		if err != nil {
 			return err
