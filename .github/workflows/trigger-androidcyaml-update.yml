@@ -102,29 +102,27 @@ jobs:
 
           core = os.environ["MIHOMO_COMMIT"]
           gradle_path = pathlib.Path("AndroidCyaml/app/build.gradle.kts")
-          script_path = pathlib.Path("AndroidCyaml/scripts/build_mihomo.sh")
+          marker_path = pathlib.Path("AndroidCyaml/mihomo.version")
           gradle = gradle_path.read_text()
-          script = script_path.read_text()
 
-          gradle_core = re.search(r'val mihomoCommit = "([0-9a-f]{40})"', gradle)
-          script_core = re.search(r'readonly MIHOMO_COMMIT="([0-9a-f]{40})"', script)
           code_match = re.search(r"versionCode = ([0-9]+)", gradle)
           name_match = re.search(r'versionName = "([0-9]+)\.([0-9]+)\.([0-9]+)"', gradle)
-          if not all((gradle_core, script_core, code_match, name_match)):
-              raise SystemExit("AndroidCyaml patch target format changed")
+          if not all((code_match, name_match)):
+              raise SystemExit("AndroidCyaml version format changed")
 
           output_path = pathlib.Path(os.environ["GITHUB_OUTPUT"])
-          if gradle_core.group(1) == core and script_core.group(1) == core:
+          tracked_core = marker_path.read_text().strip() if marker_path.exists() else ""
+          if tracked_core == core:
               output_path.write_text("changed=false\n")
               raise SystemExit(0)
+          if tracked_core and not re.fullmatch(r"[0-9a-f]{40}", tracked_core):
+              raise SystemExit("AndroidCyaml mihomo.version format changed")
 
           old_code = int(code_match.group(1))
           major, minor, patch = map(int, name_match.groups())
           new_code = old_code + 1
           new_name = f"{major}.{minor}.{patch + 1}"
 
-          gradle = gradle[:gradle_core.start(1)] + core + gradle[gradle_core.end(1):]
-          script = script[:script_core.start(1)] + core + script[script_core.end(1):]
           gradle = re.sub(r"versionCode = [0-9]+", f"versionCode = {new_code}", gradle, count=1)
           gradle = re.sub(
               r'versionName = "[0-9]+\.[0-9]+\.[0-9]+"',
@@ -133,7 +131,7 @@ jobs:
               count=1,
           )
           gradle_path.write_text(gradle)
-          script_path.write_text(script)
+          marker_path.write_text(f"{core}\n")
           output_path.write_text(f"changed=true\nversion={new_name}\n")
           PY
 
@@ -148,6 +146,6 @@ jobs:
           git -C AndroidCyaml config user.name "github-actions[bot]"
           git -C AndroidCyaml config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C AndroidCyaml diff --check
-          git -C AndroidCyaml add app/build.gradle.kts scripts/build_mihomo.sh
+          git -C AndroidCyaml add app/build.gradle.kts mihomo.version
           git -C AndroidCyaml commit -m "build: use mihomo ${MIHOMO_COMMIT::8} and bump to ${VERSION}"
           git -C AndroidCyaml push origin HEAD:main
