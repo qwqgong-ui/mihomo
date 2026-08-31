@@ -247,6 +247,16 @@ func applyRuntimeIPv6AvailabilityLocked(systemAvailable bool) {
 	}
 }
 
+// SetSystemIPv6Available lets an embedding platform provide its authoritative
+// physical-network IPv6 state without reloading the configuration or rebuilding
+// the platform VPN. Hosts without a native monitor, such as Android VPN apps,
+// call this from their network callback.
+func SetSystemIPv6Available(available bool) {
+	mux.Lock()
+	defer mux.Unlock()
+	applyRuntimeIPv6AvailabilityLocked(available)
+}
+
 // SetIPv6Enabled changes the configured IPv6 intent (e.g. from the REST API)
 // without losing the DNS/TUN IPv6 settings needed for a later availability
 // transition, and starts/stops the network-change monitor to match.

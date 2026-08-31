@@ -8,6 +8,7 @@ import (
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/mihomo/component/process"
+	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/transport/xhttp"
 )
 
@@ -26,6 +27,10 @@ func SetBrowserTransport(factory BrowserTransportFactory, supportsStreamUp bool)
 		xhttp.ExternalTransportFactory(factory),
 		xhttp.ExternalTransportCapabilities{StreamUp: supportsStreamUp},
 	)
+}
+
+func SetSystemIPv6Available(available bool) {
+	executor.SetSystemIPv6Available(available)
 }
 
 func ResetProcessResolver() {

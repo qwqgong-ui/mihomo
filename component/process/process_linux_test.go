@@ -1,6 +1,7 @@
 package process
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -65,6 +66,25 @@ func TestFindProcessNameByAddrWithMatcher(t *testing.T) {
 	}))
 	if err == nil {
 		t.Fatal("rejecting candidate lookup unexpectedly found a process")
+	}
+}
+
+func TestEndpointResolverFailureIsAuthoritative(t *testing.T) {
+	oldResolver := externalEndpointResolver
+	t.Cleanup(func() { externalEndpointResolver = oldResolver })
+	wantErr := errors.New("platform lookup failed")
+	SetEndpointResolver(func(string, netip.AddrPort, netip.AddrPort) (uint32, string, error) {
+		return 0, "", wantErr
+	})
+
+	_, _, err := FindProcessNameByAddrWithMatcher(
+		TCP,
+		netip.MustParseAddrPort("127.0.0.1:12345"),
+		netip.MustParseAddrPort("127.0.0.1:443"),
+		nil,
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("endpoint resolver error = %v, want %v", err, wantErr)
 	}
 }
 
