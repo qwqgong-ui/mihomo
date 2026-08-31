@@ -9,9 +9,9 @@ type SnellServer struct {
 	UDP       bool
 	ObfsMode  string
 	ObfsHost  string
-	ShadowTLS ShadowTLS `yaml:"shadow-tls" json:"shadow-tls,omitempty"`
-	ResTLS    ResTLS    `yaml:"res-tls" json:"res-tls,omitempty"`
-	JLSConfig JLSConfig `yaml:"jls-config" json:"jls-config,omitempty"`
+	ShadowTLS ShadowTLS `yaml:"shadow-tls" json:"shadow-tls"`
+	ResTLS    ResTLS    `yaml:"res-tls" json:"res-tls"`
+	JLSConfig JLSConfig `yaml:"jls-config" json:"jls-config"`
 }
 
 func (c SnellServer) String() string {

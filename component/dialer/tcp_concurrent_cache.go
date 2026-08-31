@@ -40,10 +40,7 @@ func fastPathTimeoutFor(rtt time.Duration) time.Duration {
 	if rtt <= 0 {
 		return tcpConcurrentFastPathTimeout
 	}
-	timeout := max(rtt*fastPathRTTMultiplier, minFastPathTimeout)
-	if timeout > maxFastPathTimeout {
-		timeout = maxFastPathTimeout
-	}
+	timeout := min(max(rtt*fastPathRTTMultiplier, minFastPathTimeout), maxFastPathTimeout)
 	return timeout
 }
 

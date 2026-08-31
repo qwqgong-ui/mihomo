@@ -25,14 +25,14 @@ type VmessServer struct {
 	ClientAuthType  string
 	ClientAuthCert  string
 	EchKey          string
-	ShadowTLS       ShadowTLS       `yaml:"shadow-tls" json:"shadow-tls,omitempty"`
-	ResTLS          ResTLS          `yaml:"res-tls" json:"res-tls,omitempty"`
-	JLSConfig       JLSConfig       `yaml:"jls-config" json:"jls-config,omitempty"`
-	RealityConfig   reality.Config  `yaml:"reality-config" json:"reality-config,omitempty"`
-	TLSMirrorConfig TLSMirrorConfig `yaml:"tlsmirror-config" json:"tlsmirror-config,omitempty"`
-	MekyaConfig     MekyaConfig     `yaml:"mekya-config" json:"mekya-config,omitempty"`
-	MKCPConfig      MKCPConfig      `yaml:"mkcp-config" json:"mkcp-config,omitempty"`
-	MuxOption       sing.MuxOption  `yaml:"mux-option" json:"mux-option,omitempty"`
+	ShadowTLS       ShadowTLS       `yaml:"shadow-tls" json:"shadow-tls"`
+	ResTLS          ResTLS          `yaml:"res-tls" json:"res-tls"`
+	JLSConfig       JLSConfig       `yaml:"jls-config" json:"jls-config"`
+	RealityConfig   reality.Config  `yaml:"reality-config" json:"reality-config"`
+	TLSMirrorConfig TLSMirrorConfig `yaml:"tlsmirror-config" json:"tlsmirror-config"`
+	MekyaConfig     MekyaConfig     `yaml:"mekya-config" json:"mekya-config"`
+	MKCPConfig      MKCPConfig      `yaml:"mkcp-config" json:"mkcp-config"`
+	MuxOption       sing.MuxOption  `yaml:"mux-option" json:"mux-option"`
 }
 
 type TLSMirrorConfig struct {
@@ -40,8 +40,8 @@ type TLSMirrorConfig struct {
 	Dest                          string                         `yaml:"dest" json:"dest,omitempty"`
 	Proxy                         string                         `yaml:"proxy" json:"proxy,omitempty"`
 	ExplicitNonceCipherSuites     []uint16                       `yaml:"explicit-nonce-ciphersuites" json:"explicit-nonce-ciphersuites,omitempty"`
-	DeferInstanceDerivedWriteTime TLSMirrorTimeSpec              `yaml:"defer-instance-derived-write-time" json:"defer-instance-derived-write-time,omitempty"`
-	TransportLayerPadding         TLSMirrorTransportLayerPadding `yaml:"transport-layer-padding" json:"transport-layer-padding,omitempty"`
+	DeferInstanceDerivedWriteTime TLSMirrorTimeSpec              `yaml:"defer-instance-derived-write-time" json:"defer-instance-derived-write-time"`
+	TransportLayerPadding         TLSMirrorTransportLayerPadding `yaml:"transport-layer-padding" json:"transport-layer-padding"`
 	ConnectionEnrolment           *TLSMirrorConnectionEnrolment  `yaml:"connection-enrolment" json:"connection-enrolment,omitempty"`
 	SequenceWatermarkingEnabled   bool                           `yaml:"sequence-watermarking-enabled" json:"sequence-watermarking-enabled,omitempty"`
 }

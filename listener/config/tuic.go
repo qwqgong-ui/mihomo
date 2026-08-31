@@ -24,7 +24,7 @@ type TuicServer struct {
 	MaxDatagramFrameSize  int               `yaml:"max-datagram-frame-size" json:"max-datagram-frame-size,omitempty"`
 	CWND                  int               `yaml:"cwnd" json:"cwnd,omitempty"`
 	BBRProfile            string            `yaml:"bbr-profile" json:"bbr-profile,omitempty"`
-	MuxOption             sing.MuxOption    `yaml:"mux-option" json:"mux-option,omitempty"`
+	MuxOption             sing.MuxOption    `yaml:"mux-option" json:"mux-option"`
 }
 
 func (t TuicServer) String() string {

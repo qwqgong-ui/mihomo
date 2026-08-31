@@ -13,7 +13,7 @@ type MekyaConfig struct {
 	MaxWriteDurationMs             int        `yaml:"max-write-duration-ms" json:"max-write-duration-ms,omitempty"`
 	MaxSimultaneousWriteConnection int        `yaml:"max-simultaneous-write-connection" json:"max-simultaneous-write-connection,omitempty"`
 	PacketWritingBuffer            int        `yaml:"packet-writing-buffer" json:"packet-writing-buffer,omitempty"`
-	KCP                            MKCPConfig `yaml:"kcp" json:"kcp,omitempty"`
+	KCP                            MKCPConfig `yaml:"kcp" json:"kcp"`
 }
 
 func (c MekyaConfig) Build() mekya.Config {

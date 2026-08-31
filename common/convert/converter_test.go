@@ -21,7 +21,7 @@ func requireMieru(t *testing.T) {
 func TestConvertsV2Ray_normal(t *testing.T) {
 	hy2test := "hysteria2://letmein@example.com:8443/?insecure=1&obfs=salamander&obfs-password=gawrgura&pinSHA256=65b3acd7db555768304a16abb6f4366c1a0c0bb5cec81429617f0150d7d66726&sni=real.example.com&up=114&down=514&alpn=h3,h4#hy2test"
 
-	expected := []map[string]interface{}{
+	expected := []map[string]any{
 		{
 			"name":             "hy2test",
 			"type":             "hysteria2",

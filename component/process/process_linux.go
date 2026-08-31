@@ -671,21 +671,21 @@ func searchProcNetFileByPort(path string, targetIP netip.Addr, targetPort uint16
 }
 
 func parseHexAddrPort(s string, isV6 bool) (netip.Addr, uint16, error) {
-	colon := strings.IndexByte(s, ':')
-	if colon < 0 {
+	before, after, ok := strings.Cut(s, ":")
+	if !ok {
 		return netip.Addr{}, 0, fmt.Errorf("invalid addr:port: %s", s)
 	}
 
-	port64, err := strconv.ParseUint(s[colon+1:], 16, 16)
+	port64, err := strconv.ParseUint(after, 16, 16)
 	if err != nil {
 		return netip.Addr{}, 0, err
 	}
 
 	var addr netip.Addr
 	if isV6 {
-		addr, err = parseHexIPv6(s[:colon])
+		addr, err = parseHexIPv6(before)
 	} else {
-		addr, err = parseHexIPv4(s[:colon])
+		addr, err = parseHexIPv4(before)
 	}
 	return addr, uint16(port64), err
 }

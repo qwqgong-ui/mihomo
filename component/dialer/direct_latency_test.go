@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 )
@@ -46,7 +46,7 @@ type latencyStats struct {
 
 func percentiles(samples []time.Duration) latencyStats {
 	sorted := append([]time.Duration(nil), samples...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	slices.Sort(sorted)
 	at := func(p float64) time.Duration {
 		if len(sorted) == 0 {
 			return 0

@@ -27,11 +27,11 @@ type VlessServer struct {
 	ClientAuthCert  string
 	EchKey          string
 	AllowInsecure   bool
-	ShadowTLS       ShadowTLS      `yaml:"shadow-tls" json:"shadow-tls,omitempty"`
-	ResTLS          ResTLS         `yaml:"res-tls" json:"res-tls,omitempty"`
-	JLSConfig       JLSConfig      `yaml:"jls-config" json:"jls-config,omitempty"`
-	RealityConfig   reality.Config `yaml:"reality-config" json:"reality-config,omitempty"`
-	MuxOption       sing.MuxOption `yaml:"mux-option" json:"mux-option,omitempty"`
+	ShadowTLS       ShadowTLS      `yaml:"shadow-tls" json:"shadow-tls"`
+	ResTLS          ResTLS         `yaml:"res-tls" json:"res-tls"`
+	JLSConfig       JLSConfig      `yaml:"jls-config" json:"jls-config"`
+	RealityConfig   reality.Config `yaml:"reality-config" json:"reality-config"`
+	MuxOption       sing.MuxOption `yaml:"mux-option" json:"mux-option"`
 }
 
 type XHTTPConfig struct {

@@ -28,9 +28,9 @@ type Hysteria2Server struct {
 	CWND                  int               `yaml:"cwnd" json:"cwnd,omitempty"`
 	BBRProfile            string            `yaml:"bbr-profile" json:"bbr-profile,omitempty"`
 	UdpMTU                int               `yaml:"udp-mtu" json:"udp-mtu,omitempty"`
-	MuxOption             sing.MuxOption    `yaml:"mux-option" json:"mux-option,omitempty"`
+	MuxOption             sing.MuxOption    `yaml:"mux-option" json:"mux-option"`
 
-	RealmOpts Hysteria2RealmOption `yaml:"realm-opts" json:"realm-opts,omitempty"`
+	RealmOpts Hysteria2RealmOption `yaml:"realm-opts" json:"realm-opts"`
 
 	// quic-go special config
 	InitialStreamReceiveWindow     uint64 `yaml:"initial-stream-receive-window" json:"initial-stream-receive-window,omitempty"`

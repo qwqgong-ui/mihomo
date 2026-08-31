@@ -3,7 +3,7 @@ package sudoku
 import (
 	"fmt"
 	"math/bits"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -205,7 +205,7 @@ func newCustomLayout(pattern string) (*byteLayout, error) {
 			}
 		}
 	}
-	sort.Slice(padding, func(i, j int) bool { return padding[i] < padding[j] })
+	slices.Sort(padding)
 	if len(padding) == 0 {
 		return nil, fmt.Errorf("custom table produced empty padding pool")
 	}

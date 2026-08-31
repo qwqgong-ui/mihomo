@@ -103,12 +103,12 @@ func NewObfsUDPHopClientPacketConn(server string, serverPorts string, hopInterva
 		recvQueue:   make(chan *udpPacket, packetQueueSize),
 		closeChan:   make(chan struct{}),
 		bufPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return make([]byte, udpBufferSize)
 			},
 		},
 		oobPool: sync.Pool{
-			New: func() interface{} {
+			New: func() any {
 				return make([]byte, oobBufferSize)
 			},
 		},

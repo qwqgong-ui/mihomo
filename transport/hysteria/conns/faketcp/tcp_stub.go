@@ -1,5 +1,4 @@
 //go:build !linux || no_fake_tcp
-// +build !linux no_fake_tcp
 
 package faketcp
 

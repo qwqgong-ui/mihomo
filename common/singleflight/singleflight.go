@@ -24,7 +24,7 @@ var errGoexit = errors.New("runtime.Goexit was called")
 // A panicError is an arbitrary value recovered from a panic
 // with the stack trace during the execution of given function.
 type panicError struct {
-	value interface{}
+	value any
 	stack []byte
 }
 
@@ -42,7 +42,7 @@ func (p *panicError) Unwrap() error {
 	return err
 }
 
-func newPanicError(v interface{}) error {
+func newPanicError(v any) error {
 	stack := debug.Stack()
 
 	// The first line of the stack trace is of the form "goroutine N [status]:"

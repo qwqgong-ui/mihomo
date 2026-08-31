@@ -54,10 +54,7 @@ const (
 // max number of additional goroutines that participate in cooperative resize;
 // "resize owner" goroutine isn't counted
 var maxResizeHelpers = func() int32 {
-	v := max(int32(parallelism()-1), 1)
-	if v > maxResizeHelpersLimit {
-		v = maxResizeHelpersLimit
-	}
+	v := min(max(int32(parallelism()-1), 1), maxResizeHelpersLimit)
 	return v
 }()
 
@@ -145,7 +142,7 @@ type mapTable[K comparable, V any] struct {
 }
 
 type counterStripe struct {
-	c int64
+	c atomic.Int64
 	// Padding to prevent false sharing.
 	_ [cacheLineSize - 8]byte
 }
@@ -1203,13 +1200,13 @@ func appendToBucket[K comparable, V any](h2 uint8, e *entry[K, V], b *bucketPadd
 
 func (table *mapTable[K, V]) addSize(bucketIdx uint64, delta int) {
 	cidx := bucketIdx & uint64(len(table.size)-1)
-	atomic.AddInt64(&table.size[cidx].c, int64(delta))
+	table.size[cidx].c.Add(int64(delta))
 }
 
 func (table *mapTable[K, V]) sumSize() int64 {
 	sum := int64(0)
 	for i := range table.size {
-		sum += atomic.LoadInt64(&table.size[i].c)
+		sum += table.size[i].c.Load()
 	}
 	return sum
 }

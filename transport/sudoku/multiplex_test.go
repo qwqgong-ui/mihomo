@@ -127,8 +127,8 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	var handshakes int64
-	var streams int64
+	var handshakes atomic.Int64
+	var streams atomic.Int64
 	done := make(chan struct{})
 
 	go func() {
@@ -143,7 +143,7 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 		if err != nil {
 			return
 		}
-		atomic.AddInt64(&handshakes, 1)
+		handshakes.Add(1)
 
 		session, err := ReadServerSession(c, meta)
 		if err != nil {
@@ -169,7 +169,7 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 				_ = stream.Close()
 				return
 			}
-			atomic.AddInt64(&streams, 1)
+			streams.Add(1)
 			go func(c net.Conn) {
 				defer c.Close()
 				_, _ = io.Copy(c, c)
@@ -231,10 +231,10 @@ func TestMultiplex_TCP_Echo(t *testing.T) {
 		t.Fatalf("server did not exit")
 	}
 
-	if got := atomic.LoadInt64(&handshakes); got != 1 {
+	if got := handshakes.Load(); got != 1 {
 		t.Fatalf("unexpected handshake count: %d", got)
 	}
-	if got := atomic.LoadInt64(&streams); got < 6 {
+	if got := streams.Load(); got < 6 {
 		t.Fatalf("unexpected stream count: %d", got)
 	}
 }

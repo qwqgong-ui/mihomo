@@ -37,7 +37,7 @@ type ShadowQuicServer struct {
 	DisableMTUDiscovery   bool                  `yaml:"disable-mtu-discovery" json:"disable-mtu-discovery,omitempty"`
 	CWND                  int                   `yaml:"cwnd" json:"cwnd,omitempty"`
 	BBRProfile            string                `yaml:"bbr-profile" json:"bbr-profile,omitempty"`
-	MuxOption             sing.MuxOption        `yaml:"mux-option" json:"mux-option,omitempty"`
+	MuxOption             sing.MuxOption        `yaml:"mux-option" json:"mux-option"`
 }
 
 func (s ShadowQuicServer) String() string {

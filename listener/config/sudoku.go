@@ -26,7 +26,7 @@ type SudokuServer struct {
 	Fallback               string   `json:"fallback,omitempty"`
 
 	// mihomo private extension (not the part of standard Sudoku protocol)
-	MuxOption sing.MuxOption `json:"mux-option,omitempty"`
+	MuxOption sing.MuxOption `json:"mux-option"`
 }
 
 func (s SudokuServer) String() string {

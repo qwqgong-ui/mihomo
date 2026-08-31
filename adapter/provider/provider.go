@@ -39,7 +39,7 @@ type providerForApi struct {
 	Proxies          []C.Proxy         `json:"proxies"`
 	TestUrl          string            `json:"testUrl"`
 	ExpectedStatus   string            `json:"expectedStatus"`
-	UpdatedAt        time.Time         `json:"updatedAt,omitempty"`
+	UpdatedAt        time.Time         `json:"updatedAt"`
 	SubscriptionInfo *SubscriptionInfo `json:"subscriptionInfo,omitempty"`
 }
 

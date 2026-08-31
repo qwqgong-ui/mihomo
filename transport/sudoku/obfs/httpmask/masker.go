@@ -64,12 +64,12 @@ var (
 
 var (
 	rngPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			return rand.New(rand.NewSource(time.Now().UnixNano()))
 		},
 	}
 	headerBufPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			b := make([]byte, 0, 1024)
 			return &b
 		},

@@ -12,7 +12,7 @@ var (
 )
 
 // MarshalYAML implements the yaml.Marshaler interface.
-func (om *OrderedMap[K, V]) MarshalYAML() (interface{}, error) {
+func (om *OrderedMap[K, V]) MarshalYAML() (any, error) {
 	if om == nil {
 		return []byte("null"), nil
 	}

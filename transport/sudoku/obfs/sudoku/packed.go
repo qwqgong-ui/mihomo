@@ -110,7 +110,7 @@ func (pc *PackedConn) writeProtectedPrefix(out []byte, p []byte) ([]byte, int) {
 
 	gap := pc.nextProtectedPrefixGap()
 	effective := 0
-	for i := 0; i < limit; i++ {
+	for i := range limit {
 		pc.bitBuf = (pc.bitBuf << 8) | uint64(p[i])
 		pc.bitCount += 8
 		for pc.bitCount >= 6 {
