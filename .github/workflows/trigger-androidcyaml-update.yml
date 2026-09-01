@@ -76,17 +76,14 @@ jobs:
             git@github.com:qwqgong-ui/AndroidCyaml.git \
             AndroidCyaml
 
-      - name: Verify the AndroidCyaml facade source
+      - name: Verify the AndroidCyaml integration sources
         shell: bash
         run: |
           set -euo pipefail
           git -C mihomo diff --check
           test -f mihomo/androidcyaml/doc.go
-          if [[ -d AndroidCyaml/patches/mihomo ]] && \
-            find AndroidCyaml/patches/mihomo -maxdepth 1 -type f -name '*.patch' -print -quit | grep -q .; then
-            echo "::error::AndroidCyaml must consume the mihomo facade without source patches"
-            exit 1
-          fi
+          test -f AndroidCyaml/scripts/build_mihomo.sh
+          git -C AndroidCyaml diff --check
 
       - name: Update AndroidCyaml main
         id: bump
