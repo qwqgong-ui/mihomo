@@ -56,6 +56,88 @@ func TestRuntimeIPv6StateTransitionsBothDirections(t *testing.T) {
 	}
 }
 
+func TestRuntimeIPv6StatePrefersRememberedPlatformAvailability(t *testing.T) {
+	state := runtimeIPv6State{}
+	detections := 0
+	detect := func() bool {
+		detections++
+		return true
+	}
+
+	available := state.currentSystemAvailable(detect)
+	if !available || detections != 1 {
+		t.Fatalf("native availability = %v with %d detections, want true with 1", available, detections)
+	}
+	state.systemAvailableKnown = true
+	state.systemAvailable = false
+	if state.currentSystemAvailable(detect) || detections != 1 {
+		t.Fatalf("remembered unavailable sample was ignored; detections=%d", detections)
+	}
+	state.systemAvailable = true
+	if !state.currentSystemAvailable(detect) || detections != 1 {
+		t.Fatalf("remembered available sample was ignored; detections=%d", detections)
+	}
+}
+
+func TestSetSystemIPv6AvailableBeforePrepareIsAuthoritative(t *testing.T) {
+	originalCheck := checkSystemIPv6
+	originalController := runtimeIPv6Controller
+	originalDisableIPv6 := resolver.DisableIPv6.Load()
+	t.Cleanup(func() {
+		checkSystemIPv6 = originalCheck
+		stopRuntimeIPv6MonitorLocked()
+		runtimeIPv6Controller = originalController
+		resolver.DisableIPv6.Store(originalDisableIPv6)
+	})
+
+	runtimeIPv6Controller = runtimeIPv6State{}
+	detections := 0
+	checkSystemIPv6 = func() bool {
+		detections++
+		return true
+	}
+	SetSystemIPv6Available(false)
+
+	cfg := &config.Config{General: &config.General{IPv6: true}, DNS: &config.DNS{}}
+	prepareRuntimeIPv6(cfg)
+
+	if detections != 0 {
+		t.Fatalf("native IPv6 detection ran %d times despite an authoritative platform sample", detections)
+	}
+	if cfg.General.IPv6Active || !resolver.DisableIPv6.Load() {
+		t.Fatalf("pre-start unavailable sample produced active=%v resolverDisabled=%v", cfg.General.IPv6Active, resolver.DisableIPv6.Load())
+	}
+}
+
+func TestResetRuntimeIPv6KeepsPlatformSampleOnly(t *testing.T) {
+	originalController := runtimeIPv6Controller
+	t.Cleanup(func() { runtimeIPv6Controller = originalController })
+
+	runtimeIPv6Controller = runtimeIPv6State{
+		generation:           7,
+		configured:           true,
+		active:               true,
+		initialized:          true,
+		systemAvailable:      false,
+		systemAvailableKnown: true,
+		general:              &config.General{IPv6: true, IPv6Active: true},
+		dns:                  &config.DNS{},
+		tun:                  LC.Tun{FileDescriptor: 7},
+	}
+	resetRuntimeIPv6Locked()
+
+	state := runtimeIPv6Controller
+	if state.initialized || state.configured || state.active || state.general != nil || state.dns != nil || state.tun.FileDescriptor != 0 {
+		t.Fatalf("stopped runtime state was retained: %+v", state)
+	}
+	if !state.systemAvailableKnown || state.systemAvailable {
+		t.Fatalf("platform sample was not retained: known=%v available=%v", state.systemAvailableKnown, state.systemAvailable)
+	}
+	if state.generation != 8 {
+		t.Fatalf("generation = %d, want 8", state.generation)
+	}
+}
+
 func TestTunConfigForIPv6AvailabilityMasksOnlyRuntimeCopy(t *testing.T) {
 	v4Prefix := netip.MustParsePrefix("192.0.2.0/24")
 	v6Prefix := netip.MustParsePrefix("2001:db8::/32")

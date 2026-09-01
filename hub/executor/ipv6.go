@@ -51,15 +51,27 @@ type runtimeIPv6NetworkMonitor interface {
 // masked) values so a later availability flip can restore them without a
 // full config reload.
 type runtimeIPv6State struct {
-	generation  uint64
-	cancel      context.CancelFunc
-	monitor     runtimeIPv6NetworkMonitor
-	configured  bool
-	active      bool
-	initialized bool
-	general     *config.General
-	dns         *config.DNS
-	tun         LC.Tun
+	generation           uint64
+	cancel               context.CancelFunc
+	monitor              runtimeIPv6NetworkMonitor
+	configured           bool
+	active               bool
+	initialized          bool
+	systemAvailable      bool
+	systemAvailableKnown bool
+	general              *config.General
+	dns                  *config.DNS
+	tun                  LC.Tun
+}
+
+// currentSystemAvailable returns the embedding platform's last authoritative
+// sample when one has been supplied. Standalone hosts keep using native
+// detection, so Android integration does not change their behaviour.
+func (s *runtimeIPv6State) currentSystemAvailable(detect func() bool) bool {
+	if s.systemAvailableKnown {
+		return s.systemAvailable
+	}
+	return detect()
 }
 
 // setSystemAvailable recomputes active from the configured intent and the
@@ -93,7 +105,7 @@ func prepareRuntimeIPv6(cfg *config.Config) {
 	runtimeIPv6Controller.general = cfg.General
 	runtimeIPv6Controller.dns = cfg.DNS
 	runtimeIPv6Controller.tun = cfg.General.Tun
-	runtimeIPv6Controller.active = cfg.General.IPv6 && checkSystemIPv6()
+	runtimeIPv6Controller.active = cfg.General.IPv6 && runtimeIPv6Controller.currentSystemAvailable(checkSystemIPv6)
 	cfg.General.IPv6Active = runtimeIPv6Controller.active
 	configuredIPv6.Store(cfg.General.IPv6)
 
@@ -156,6 +168,21 @@ func stopRuntimeIPv6MonitorLocked() {
 		_ = runtimeIPv6Controller.monitor.Close()
 		runtimeIPv6Controller.monitor = nil
 	}
+}
+
+// resetRuntimeIPv6Locked releases references owned by the stopped config while
+// retaining the platform sample. An in-process embedding may prime the next
+// ApplyConfig before it starts, and that update must not touch a stale DNS/TUN
+// instance from the previous generation.
+func resetRuntimeIPv6Locked() {
+	stopRuntimeIPv6MonitorLocked()
+	runtimeIPv6Controller.generation++
+	runtimeIPv6Controller.configured = false
+	runtimeIPv6Controller.active = false
+	runtimeIPv6Controller.initialized = false
+	runtimeIPv6Controller.general = nil
+	runtimeIPv6Controller.dns = nil
+	runtimeIPv6Controller.tun = LC.Tun{}
 }
 
 // monitorRuntimeIPv6 runs for the lifetime of one config generation's
@@ -250,10 +277,16 @@ func applyRuntimeIPv6AvailabilityLocked(systemAvailable bool) {
 // SetSystemIPv6Available lets an embedding platform provide its authoritative
 // physical-network IPv6 state without reloading the configuration or rebuilding
 // the platform VPN. Hosts without a native monitor, such as Android VPN apps,
-// call this from their network callback.
+// call this from their network callback. Calls made before the first ApplyConfig
+// are retained and become the initial runtime state.
 func SetSystemIPv6Available(available bool) {
 	mux.Lock()
 	defer mux.Unlock()
+	runtimeIPv6Controller.systemAvailable = available
+	runtimeIPv6Controller.systemAvailableKnown = true
+	if !runtimeIPv6Controller.initialized {
+		return
+	}
 	applyRuntimeIPv6AvailabilityLocked(available)
 }
 
@@ -276,7 +309,7 @@ func SetIPv6Enabled(enabled bool) {
 	runtimeIPv6Controller.general.IPv6 = enabled
 	available := false
 	if enabled {
-		available = checkSystemIPv6()
+		available = runtimeIPv6Controller.currentSystemAvailable(checkSystemIPv6)
 	}
 	applyRuntimeIPv6AvailabilityLocked(available)
 	startRuntimeIPv6MonitorLocked()

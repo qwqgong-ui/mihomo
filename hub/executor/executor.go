@@ -553,7 +553,7 @@ func updateIPTables(cfg *config.Config) {
 
 func Shutdown() {
 	mux.Lock()
-	stopRuntimeIPv6MonitorLocked()
+	resetRuntimeIPv6Locked()
 	mux.Unlock()
 
 	listener.Cleanup()
