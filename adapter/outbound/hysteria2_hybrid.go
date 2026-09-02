@@ -410,12 +410,19 @@ func (c *hybridQUICPacketConn) readPacketConn(packetConn net.PacketConn) {
 			c.deliver(hybridQUICRead{err: err})
 			return
 		}
-		if source != nil && source.String() == hybridQUICControlAddress {
-			c.handleAck(buffer[:n])
-			continue
+		if source == nil || source.String() == hybridQUICControlAddress {
+			if c.handleAck(buffer[:n]) {
+				continue
+			}
 		}
 		target, ok := outboundUDPAddrPort(source)
 		if !ok {
+			// The control address is a name, and the tunnel is under no
+			// obligation to hand it back as one: a datagram addressed to a
+			// name can return with no usable address at all. An
+			// acknowledgement is identified by what it carries rather than
+			// where it claims to be from, so it survives that.
+			c.handleAck(buffer[:n])
 			continue
 		}
 		c.deliver(hybridQUICRead{data: append([]byte(nil), buffer[:n]...), target: target})
