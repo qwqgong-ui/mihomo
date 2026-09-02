@@ -1,190 +1,101 @@
 package outbound
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/component/resolver"
-	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/sing-quic/hysteria2"
-	"github.com/miekg/dns"
 )
 
 const (
 	hybridQUICControlAddress = "hybrid-quic.invalid:443"
-	hybridQUICMagic          = "HQV1"
-	hybridQUICInitial        = byte(1)
-	quicVersion1             = uint32(1)
-	quicVersion2             = uint32(0x6b3343cf)
+	// HQV2 drops two fields HQV1 carried: the raw port the client reported for
+	// itself, which the server now observes, and the requirement that the
+	// target be a literal address, which forced a fake-IP client to un-map its
+	// own synthetic destination before it could register. The magic is bumped
+	// so an HQV1 peer fails cleanly instead of misreading a shifted header.
+	hybridQUICMagic   = "HQV2"
+	hybridQUICInitial = byte(1)
+	hybridQUICAck     = byte(2)
+
+	hybridTargetDomain = byte(0)
+	hybridTargetIPv4   = byte(4)
+	hybridTargetIPv6   = byte(6)
+
+	hybridAckOK = byte(0)
+
+	quicVersion1 = uint32(1)
+	quicVersion2 = uint32(0x6b3343cf)
 )
 
-var hybridQUICDNSAddress = netip.MustParseAddrPort("1.1.1.1:53")
-
-const hybridTargetCacheMaxEntries = 256
-
-type hybridTargetCacheEntry struct {
-	addr      netip.Addr
-	expiresAt time.Time
+// hybridTarget is a destination as the application asked for it. A name is kept
+// as a name: the server resolves it, so a fake-IP client never has to turn its
+// own synthetic address back into a real one, and the destination stays
+// independent of a ClientHello that ECH may have encrypted.
+type hybridTarget struct {
+	name string // set for a domain destination, empty otherwise
+	addr netip.Addr
+	port uint16
 }
 
-type hybridTargetCache struct {
-	mu      sync.Mutex
-	entries map[string]hybridTargetCacheEntry
-	now     func() time.Time
+func (t hybridTarget) isDomain() bool { return t.name != "" }
+
+// eligible reports whether this destination may use the raw relay at all. Port
+// 443 only: raw QUIC to 443 is indistinguishable from ordinary traffic, and raw
+// QUIC to anything else is not.
+func (t hybridTarget) eligible() bool {
+	if t.port != 443 {
+		return false
+	}
+	if t.isDomain() {
+		return true
+	}
+	return isHybridPublicTarget(t.addr)
 }
 
-func newHybridTargetCache() *hybridTargetCache {
-	return &hybridTargetCache{
-		entries: make(map[string]hybridTargetCacheEntry),
-		now:     time.Now,
+func (t hybridTarget) netAddr() net.Addr {
+	if t.isDomain() {
+		return nil
 	}
+	return net.UDPAddrFromAddrPort(netip.AddrPortFrom(t.addr, t.port))
 }
 
-func hybridTargetCacheKey(host string) string {
-	return strings.TrimSuffix(strings.ToLower(host), ".")
-}
-
-func (c *hybridTargetCache) get(host string) (netip.Addr, bool) {
-	if c == nil {
-		return netip.Addr{}, false
-	}
-	key := hybridTargetCacheKey(host)
-	now := c.now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	entry, loaded := c.entries[key]
-	if !loaded {
-		return netip.Addr{}, false
-	}
-	if !now.Before(entry.expiresAt) {
-		delete(c.entries, key)
-		return netip.Addr{}, false
-	}
-	return entry.addr, true
-}
-
-func (c *hybridTargetCache) set(host string, addr netip.Addr, ttl time.Duration) {
-	if c == nil || ttl <= 0 || !isHybridPublicTarget(addr) {
-		return
-	}
-	key := hybridTargetCacheKey(host)
-	now := c.now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if len(c.entries) >= hybridTargetCacheMaxEntries {
-		for existingKey, entry := range c.entries {
-			if !now.Before(entry.expiresAt) {
-				delete(c.entries, existingKey)
-			}
+// parseHybridDestination reads the destination the tunnel handed to WriteTo. A
+// fake-IP flow arrives as a name (tunnel clears DstIP for fake-IP and keeps
+// Host), and everything else as an address.
+func parseHybridDestination(destination net.Addr) (hybridTarget, bool) {
+	if udpAddr, ok := destination.(*net.UDPAddr); ok && udpAddr != nil {
+		addrPort := udpAddr.AddrPort()
+		if !addrPort.IsValid() {
+			return hybridTarget{}, false
 		}
+		return hybridTarget{addr: addrPort.Addr().Unmap(), port: addrPort.Port()}, true
 	}
-	if len(c.entries) >= hybridTargetCacheMaxEntries {
-		// The cache is deliberately small. Evict one arbitrary entry instead of
-		// allowing untrusted destination names to grow it without bound.
-		for existingKey := range c.entries {
-			delete(c.entries, existingKey)
-			break
-		}
-	}
-	c.entries[key] = hybridTargetCacheEntry{addr: addr.Unmap(), expiresAt: now.Add(ttl)}
-}
-
-type hybridTargetQuery func(context.Context, string, uint16) (netip.Addr, time.Duration, error)
-
-func resolveHybridTarget(ctx context.Context, host string, prefer C.DNSPrefer, cache *hybridTargetCache, query hybridTargetQuery) (netip.Addr, error) {
-	if target, loaded := cache.get(host); loaded {
-		return target, nil
-	}
-
-	// Dual stack favors IPv6 for hybrid QUIC. IPv4 remains the fallback when
-	// the destination has no usable AAAA response.
-	queryTypes := []uint16{dns.TypeAAAA, dns.TypeA}
-	switch prefer {
-	case C.IPv4Only:
-		queryTypes = queryTypes[1:]
-	case C.IPv6Only:
-		queryTypes = queryTypes[:1]
-	case C.IPv4Prefer:
-		queryTypes[0], queryTypes[1] = queryTypes[1], queryTypes[0]
-	}
-
-	var queryErrors []error
-	for _, queryType := range queryTypes {
-		target, ttl, err := query(ctx, host, queryType)
-		if err == nil && isHybridPublicTarget(target) {
-			cache.set(host, target, ttl)
-			return target, nil
-		}
-		queryErrors = append(queryErrors, err)
-	}
-	return netip.Addr{}, errors.Join(queryErrors...)
-}
-
-func (h *Hysteria2) resolveHybridTargetViaHY2(ctx context.Context, host string) (netip.Addr, error) {
-	return resolveHybridTarget(ctx, host, h.prefer, h.hybridTargetCache, h.queryHybridTargetViaHY2)
-}
-
-func (h *Hysteria2) queryHybridTargetViaHY2(ctx context.Context, host string, queryType uint16) (netip.Addr, time.Duration, error) {
-	pc, err := h.client.ListenPacket(ctx)
+	host, portText, err := net.SplitHostPort(destination.String())
 	if err != nil {
-		return netip.Addr{}, 0, err
+		return hybridTarget{}, false
 	}
-	deadline := time.Now().Add(3 * time.Second)
-	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
-		deadline = ctxDeadline
-	}
-	_ = pc.SetDeadline(deadline)
-
-	request := new(dns.Msg)
-	request.SetQuestion(dns.Fqdn(host), queryType)
-	wire, err := request.Pack()
+	port, err := strconv.ParseUint(portText, 10, 16)
 	if err != nil {
-		_ = pc.Close()
-		return netip.Addr{}, 0, err
+		return hybridTarget{}, false
 	}
-	if _, err = pc.WriteTo(wire, net.UDPAddrFromAddrPort(hybridQUICDNSAddress)); err != nil {
-		_ = pc.Close()
-		return netip.Addr{}, 0, err
+	if addr, addrErr := netip.ParseAddr(host); addrErr == nil {
+		return hybridTarget{addr: addr.Unmap(), port: uint16(port)}, true
 	}
-	responseWire := make([]byte, 4096)
-	n, _, err := pc.ReadFrom(responseWire)
-	_ = pc.Close()
-	if err != nil {
-		return netip.Addr{}, 0, err
+	host = strings.TrimSuffix(host, ".")
+	if host == "" || len(host) > 255 {
+		return hybridTarget{}, false
 	}
-	response := new(dns.Msg)
-	if err = response.Unpack(responseWire[:n]); err != nil {
-		return netip.Addr{}, 0, err
-	}
-	if response.Id != request.Id || !response.Response || response.Rcode != dns.RcodeSuccess {
-		return netip.Addr{}, 0, errors.New("invalid hybrid QUIC DNS response")
-	}
-	for _, answer := range response.Answer {
-		var target netip.Addr
-		switch record := answer.(type) {
-		case *dns.A:
-			if queryType == dns.TypeA {
-				target, _ = netip.AddrFromSlice(record.A)
-			}
-		case *dns.AAAA:
-			if queryType == dns.TypeAAAA {
-				target, _ = netip.AddrFromSlice(record.AAAA)
-			}
-		}
-		target = target.Unmap()
-		if isHybridPublicTarget(target) {
-			return target, time.Duration(answer.Header().Ttl) * time.Second, nil
-		}
-	}
-	return netip.Addr{}, 0, errors.New("hybrid QUIC DNS response has no public address")
+	return hybridTarget{name: host, port: uint16(port)}, true
 }
 
 type hybridQUICPacketConn struct {
@@ -193,23 +104,27 @@ type hybridQUICPacketConn struct {
 	newRaw      func() (net.PacketConn, error)
 	newFallback func() (net.PacketConn, error)
 
-	mu       sync.Mutex
-	flows    map[netip.AddrPort]*hybridQUICFlow
-	readCh   chan hybridQUICRead
-	closed   chan struct{}
-	closeOne sync.Once
-	fallback net.PacketConn
-
+	mu         sync.Mutex
+	flows      map[hybridTarget]*hybridQUICFlow
+	flowsByID  map[[16]byte]*hybridQUICFlow
+	readCh     chan hybridQUICRead
+	closed     chan struct{}
+	closeOne   sync.Once
+	fallback   net.PacketConn
 	deadlineMu sync.Mutex
 	readTimer  *time.Timer
 }
 
 type hybridQUICFlow struct {
-	owner      *hybridQUICPacketConn
-	id         [16]byte
-	target     netip.AddrPort
-	raw        net.PacketConn
+	owner  *hybridQUICPacketConn
+	id     [16]byte
+	target hybridTarget
+	raw    net.PacketConn
+	// registered is set once the flow's Initial has gone out over the tunnel.
+	// rejected is set if the server declined the registration, which is the one
+	// case where continuing on the raw path would black-hole the connection.
 	registered bool
+	rejected   bool
 }
 
 type hybridQUICRead struct {
@@ -224,7 +139,8 @@ func newHybridQUICPacketConn(hy2 net.PacketConn, relay netip.AddrPort, newRaw, n
 		relay:       relay,
 		newRaw:      newRaw,
 		newFallback: newFallback,
-		flows:       make(map[netip.AddrPort]*hybridQUICFlow),
+		flows:       make(map[hybridTarget]*hybridQUICFlow),
+		flowsByID:   make(map[[16]byte]*hybridQUICFlow),
 		readCh:      make(chan hybridQUICRead, 64),
 		closed:      make(chan struct{}),
 	}
@@ -233,14 +149,20 @@ func newHybridQUICPacketConn(hy2 net.PacketConn, relay netip.AddrPort, newRaw, n
 }
 
 func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
-	target, ok := outboundUDPAddrPort(destination)
-	if !ok || target.Port() != 443 || !isHybridPublicTarget(target.Addr()) {
+	target, ok := parseHybridDestination(destination)
+	if !ok || !target.eligible() {
 		return c.writeFallback(payload, destination)
 	}
 
 	c.mu.Lock()
 	flow := c.flows[target]
 	if flow == nil {
+		if !isQUICInitial(payload) {
+			// A flow only becomes eligible by starting with an Initial, which
+			// is what carries the registration.
+			c.mu.Unlock()
+			return c.writeFallback(payload, destination)
+		}
 		var err error
 		flow, err = c.newFlowLocked(target)
 		if err != nil {
@@ -248,10 +170,21 @@ func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (in
 			return c.writeFallback(payload, destination)
 		}
 		c.flows[target] = flow
+		c.flowsByID[flow.id] = flow
 	}
+	rejected := flow.rejected
+	registered := flow.registered
 	c.mu.Unlock()
 
+	if rejected {
+		return c.writeFallback(payload, destination)
+	}
+
 	if isQUICInitial(payload) {
+		// Every Initial goes over the tunnel: a large ClientHello spans several
+		// of them and the server needs them all, and this is also what lets the
+		// server claim the Initial's connection ID before any raw packet can
+		// name it.
 		control := flow.initialMessage(payload)
 		n, err := c.hy2.WriteTo(control, hybridControlAddr{})
 		if err != nil {
@@ -266,16 +199,13 @@ func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (in
 		return len(payload), nil
 	}
 
-	c.mu.Lock()
-	registered := flow.registered
-	c.mu.Unlock()
 	if !registered {
-		// A flow that did not begin with a recognizable Initial is not eligible
-		// for raw relay. Preserve ordinary HY2 behavior instead of opening it.
 		return c.writeFallback(payload, destination)
 	}
-	n, err := flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
-	return n, err
+	// This packet is what opens the return path. It is a real packet of the
+	// connection rather than a probe, and the server has not sent anything on
+	// the raw path before now, so there is nothing to punch a hole for first.
+	return flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
 }
 
 func (c *hybridQUICPacketConn) writeFallback(payload []byte, destination net.Addr) (int, error) {
@@ -294,7 +224,7 @@ func (c *hybridQUICPacketConn) writeFallback(payload []byte, destination net.Add
 	return fallback.WriteTo(payload, destination)
 }
 
-func (c *hybridQUICPacketConn) newFlowLocked(target netip.AddrPort) (*hybridQUICFlow, error) {
+func (c *hybridQUICPacketConn) newFlowLocked(target hybridTarget) (*hybridQUICFlow, error) {
 	raw, err := c.newRaw()
 	if err != nil {
 		return nil, err
@@ -304,40 +234,53 @@ func (c *hybridQUICPacketConn) newFlowLocked(target netip.AddrPort) (*hybridQUIC
 		_ = raw.Close()
 		return nil, err
 	}
-	// Open the stateful IPv6 firewall path before the server sends the first
-	// target response to this otherwise-silent raw socket. The relay drops this
-	// non-Initial packet because the tuple is not registered yet.
-	if n, probeErr := raw.WriteTo([]byte{0}, net.UDPAddrFromAddrPort(c.relay)); probeErr != nil || n != 1 {
-		_ = raw.Close()
-		if probeErr != nil {
-			return nil, probeErr
-		}
-		return nil, errors.New("short hybrid QUIC raw probe write")
-	}
 	go flow.readRaw()
 	return flow, nil
 }
 
 func (f *hybridQUICFlow) initialMessage(payload []byte) []byte {
-	message := make([]byte, 42+len(payload))
-	copy(message[:4], hybridQUICMagic)
-	message[4] = hybridQUICInitial
-	copy(message[5:21], f.id[:])
-	local, _ := outboundUDPAddrPort(f.raw.LocalAddr())
-	port := local.Port()
-	binary.BigEndian.PutUint16(message[21:23], port)
-	if f.target.Addr().Is4() {
-		message[23] = 4
-		addr := f.target.Addr().As4()
-		copy(message[36:40], addr[:])
-	} else {
-		message[23] = 6
-		addr := f.target.Addr().As16()
-		copy(message[24:40], addr[:])
+	target := f.target
+	var addressed []byte
+	switch {
+	case target.isDomain():
+		addressed = make([]byte, 0, 2+len(target.name))
+		addressed = append(addressed, hybridTargetDomain, byte(len(target.name)))
+		addressed = append(addressed, target.name...)
+	case target.addr.Is4():
+		addr := target.addr.As4()
+		addressed = append([]byte{hybridTargetIPv4}, addr[:]...)
+	default:
+		addr := target.addr.As16()
+		addressed = append([]byte{hybridTargetIPv6}, addr[:]...)
 	}
-	binary.BigEndian.PutUint16(message[40:42], f.target.Port())
-	copy(message[42:], payload)
-	return message
+
+	message := make([]byte, 0, 21+len(addressed)+2+len(payload))
+	message = append(message, hybridQUICMagic...)
+	message = append(message, hybridQUICInitial)
+	message = append(message, f.id[:]...)
+	message = append(message, addressed...)
+	message = binary.BigEndian.AppendUint16(message, target.port)
+	return append(message, payload...)
+}
+
+// handleAck applies a registration result. Only a rejection changes anything:
+// the server has no flow for this id, so raw packets would be dropped and the
+// connection would stall on a path that will never answer.
+func (c *hybridQUICPacketConn) handleAck(message []byte) bool {
+	if len(message) < 22 || string(message[:4]) != hybridQUICMagic || message[4] != hybridQUICAck {
+		return false
+	}
+	var id [16]byte
+	copy(id[:], message[5:21])
+	if message[21] == hybridAckOK {
+		return true
+	}
+	c.mu.Lock()
+	if flow := c.flowsByID[id]; flow != nil {
+		flow.rejected = true
+	}
+	c.mu.Unlock()
+	return true
 }
 
 func (f *hybridQUICFlow) readRaw() {
@@ -360,8 +303,14 @@ func (f *hybridQUICFlow) readRaw() {
 		if source != f.owner.relay {
 			continue
 		}
+		// A domain flow has no address of its own to report. The tunnel already
+		// learned one from the replies the server sent before the raw path was
+		// bound, so reporting the relay would only confuse the mapping; report
+		// the target address when there is one and let the tunnel keep its own
+		// association otherwise.
+		reported := netip.AddrPortFrom(f.target.addr, f.target.port)
 		data := append([]byte(nil), buffer[:n]...)
-		f.owner.deliver(hybridQUICRead{data: data, target: f.target})
+		f.owner.deliver(hybridQUICRead{data: data, target: reported})
 	}
 }
 
@@ -385,6 +334,10 @@ func (c *hybridQUICPacketConn) readPacketConn(packetConn net.PacketConn) {
 			}
 			c.deliver(hybridQUICRead{err: err})
 			return
+		}
+		if source != nil && source.String() == hybridQUICControlAddress {
+			c.handleAck(buffer[:n])
+			continue
 		}
 		target, ok := outboundUDPAddrPort(source)
 		if !ok {
@@ -523,10 +476,6 @@ func outboundUDPAddrPort(addr net.Addr) (netip.AddrPort, bool) {
 	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
 }
 
-func isHybridPublicIPv6(addr netip.Addr) bool {
-	return addr.Is6() && isHybridPublicTarget(addr)
-}
-
 func isHybridPublicTarget(addr netip.Addr) bool {
 	addr = addr.Unmap()
 	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsUnspecified() {
@@ -535,8 +484,7 @@ func isHybridPublicTarget(addr netip.Addr) bool {
 	// The default fake-IP pool is 198.18.0.1/16, which sits in the benchmarking
 	// range rather than an RFC 1918 one: every test above passes it. A synthetic
 	// address has no meaning to the relay, so it must never be registered as a
-	// target -- today ResolveUDP happens to substitute a real address before
-	// this is reached, but nothing about that ordering is enforced here.
+	// target.
 	return !resolver.IsFakeIP(addr)
 }
 
@@ -558,8 +506,8 @@ func hybridRelayAddr(client *hysteria2.Client) (netip.AddrPort, error) {
 	if !ok {
 		return netip.AddrPort{}, errors.New("hybrid QUIC has no established tunnel")
 	}
-	if !isHybridPublicIPv6(relay.Addr()) {
-		return netip.AddrPort{}, errors.New("hybrid QUIC relay is not public IPv6")
+	if !isHybridPublicTarget(relay.Addr()) {
+		return netip.AddrPort{}, errors.New("hybrid QUIC relay is not public")
 	}
 	return relay, nil
 }

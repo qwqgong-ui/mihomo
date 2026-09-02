@@ -2,120 +2,13 @@ package outbound
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
-	"errors"
 	"net"
 	"net/netip"
 	"testing"
-	"time"
 
-	C "github.com/metacubex/mihomo/constant"
-	"github.com/miekg/dns"
+	M "github.com/metacubex/sing/common/metadata"
 )
-
-func TestResolveHybridTargetPreference(t *testing.T) {
-	ipv4 := netip.MustParseAddr("192.0.2.1")
-	ipv6 := netip.MustParseAddr("2001:db8::1")
-	tests := []struct {
-		name        string
-		prefer      C.DNSPrefer
-		want        netip.Addr
-		wantQueries []uint16
-	}{
-		{name: "dual prefers IPv6", prefer: C.DualStack, want: ipv6, wantQueries: []uint16{dns.TypeAAAA}},
-		{name: "IPv4 only", prefer: C.IPv4Only, want: ipv4, wantQueries: []uint16{dns.TypeA}},
-		{name: "IPv6 only", prefer: C.IPv6Only, want: ipv6, wantQueries: []uint16{dns.TypeAAAA}},
-		{name: "IPv4 preferred", prefer: C.IPv4Prefer, want: ipv4, wantQueries: []uint16{dns.TypeA}},
-		{name: "IPv6 preferred", prefer: C.IPv6Prefer, want: ipv6, wantQueries: []uint16{dns.TypeAAAA}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var queries []uint16
-			query := func(_ context.Context, _ string, queryType uint16) (netip.Addr, time.Duration, error) {
-				queries = append(queries, queryType)
-				if queryType == dns.TypeAAAA {
-					return ipv6, time.Minute, nil
-				}
-				return ipv4, time.Minute, nil
-			}
-			got, err := resolveHybridTarget(context.Background(), "example.com", test.prefer, newHybridTargetCache(), query)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != test.want {
-				t.Fatalf("target = %s, want %s", got, test.want)
-			}
-			if !equalQueryTypes(queries, test.wantQueries) {
-				t.Fatalf("queries = %v, want %v", queries, test.wantQueries)
-			}
-		})
-	}
-}
-
-func TestResolveHybridTargetDualFallsBackToIPv4(t *testing.T) {
-	ipv4 := netip.MustParseAddr("192.0.2.1")
-	var queries []uint16
-	query := func(_ context.Context, _ string, queryType uint16) (netip.Addr, time.Duration, error) {
-		queries = append(queries, queryType)
-		if queryType == dns.TypeAAAA {
-			return netip.Addr{}, 0, errors.New("no AAAA address")
-		}
-		return ipv4, time.Minute, nil
-	}
-	got, err := resolveHybridTarget(context.Background(), "example.com", C.DualStack, newHybridTargetCache(), query)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != ipv4 {
-		t.Fatalf("target = %s, want %s", got, ipv4)
-	}
-	if want := []uint16{dns.TypeAAAA, dns.TypeA}; !equalQueryTypes(queries, want) {
-		t.Fatalf("queries = %v, want %v", queries, want)
-	}
-}
-
-func TestResolveHybridTargetCacheTTL(t *testing.T) {
-	cache := newHybridTargetCache()
-	now := time.Unix(1000, 0)
-	cache.now = func() time.Time { return now }
-	ipv6 := netip.MustParseAddr("2001:db8::1")
-	queries := 0
-	query := func(_ context.Context, _ string, _ uint16) (netip.Addr, time.Duration, error) {
-		queries++
-		return ipv6, time.Minute, nil
-	}
-
-	for _, host := range []string{"Example.COM.", "example.com"} {
-		got, err := resolveHybridTarget(context.Background(), host, C.DualStack, cache, query)
-		if err != nil || got != ipv6 {
-			t.Fatalf("target = %s, err = %v", got, err)
-		}
-	}
-	if queries != 1 {
-		t.Fatalf("queries before expiry = %d, want 1", queries)
-	}
-
-	now = now.Add(time.Minute)
-	if _, err := resolveHybridTarget(context.Background(), "example.com", C.DualStack, cache, query); err != nil {
-		t.Fatal(err)
-	}
-	if queries != 2 {
-		t.Fatalf("queries after expiry = %d, want 2", queries)
-	}
-}
-
-func equalQueryTypes(left, right []uint16) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
-}
 
 func TestIsQUICInitial(t *testing.T) {
 	tests := []struct {
@@ -146,37 +39,187 @@ func TestIsQUICInitial(t *testing.T) {
 	}
 }
 
-func TestHybridInitialMessageWireFormat(t *testing.T) {
-	raw, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
-	if err != nil {
-		t.Fatal(err)
+// The tunnel hands a fake-IP flow its original name, which is what lets the
+// server resolve the destination instead of the client.
+func TestParseHybridDestination(t *testing.T) {
+	tests := []struct {
+		name        string
+		destination net.Addr
+		want        hybridTarget
+		wantOK      bool
+	}{
+		{
+			name:        "udp address",
+			destination: net.UDPAddrFromAddrPort(netip.MustParseAddrPort("[2606:4700:4700::1111]:443")),
+			want:        hybridTarget{addr: netip.MustParseAddr("2606:4700:4700::1111"), port: 443},
+			wantOK:      true,
+		},
+		{
+			name:        "fqdn",
+			destination: M.ParseSocksaddrHostPort("example.com", 443),
+			want:        hybridTarget{name: "example.com", port: 443},
+			wantOK:      true,
+		},
+		{
+			name:        "fqdn keeps a non-443 port for the caller to reject",
+			destination: M.ParseSocksaddrHostPort("example.com", 8443),
+			want:        hybridTarget{name: "example.com", port: 8443},
+			wantOK:      true,
+		},
 	}
-	defer raw.Close()
-	flow := &hybridQUICFlow{
-		target: netip.MustParseAddrPort("[2606:4700:4700::1111]:443"),
-		raw:    raw,
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := parseHybridDestination(test.destination)
+			if ok != test.wantOK || got != test.want {
+				t.Fatalf("parseHybridDestination() = %+v, %v; want %+v, %v", got, ok, test.want, test.wantOK)
+			}
+		})
 	}
-	copy(flow.id[:], []byte("0123456789abcdef"))
-	payload := quicLongHeader(0xc0, quicVersion1)
-	message := flow.initialMessage(payload)
+}
 
+func TestHybridTargetEligibility(t *testing.T) {
+	tests := []struct {
+		name   string
+		target hybridTarget
+		want   bool
+	}{
+		{name: "public v6", target: hybridTarget{addr: netip.MustParseAddr("2606:4700:4700::1111"), port: 443}, want: true},
+		{name: "public v4", target: hybridTarget{addr: netip.MustParseAddr("1.1.1.1"), port: 443}, want: true},
+		{name: "domain", target: hybridTarget{name: "example.com", port: 443}, want: true},
+		{name: "wrong port", target: hybridTarget{addr: netip.MustParseAddr("1.1.1.1"), port: 8443}},
+		{name: "private", target: hybridTarget{addr: netip.MustParseAddr("192.168.1.1"), port: 443}},
+		{name: "loopback", target: hybridTarget{addr: netip.MustParseAddr("127.0.0.1"), port: 443}},
+		// The default fake-IP pool sits in the benchmarking range, which passes
+		// every ordinary "is this public" test.
+		{name: "fake ip range is not private", target: hybridTarget{addr: netip.MustParseAddr("198.18.0.5"), port: 443}, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.target.eligible(); got != test.want {
+				t.Fatalf("eligible() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestHybridInitialMessageWireFormat(t *testing.T) {
+	payload := quicLongHeader(0xc0, quicVersion1)
+
+	t.Run("ipv6", func(t *testing.T) {
+		flow := &hybridQUICFlow{target: hybridTarget{addr: netip.MustParseAddr("2606:4700:4700::1111"), port: 443}}
+		copy(flow.id[:], "0123456789abcdef")
+		message := flow.initialMessage(payload)
+
+		assertHybridHeader(t, message, flow.id)
+		if message[21] != hybridTargetIPv6 {
+			t.Fatalf("address type = %d, want %d", message[21], hybridTargetIPv6)
+		}
+		if netip.AddrFrom16([16]byte(message[22:38])) != flow.target.addr {
+			t.Fatal("target address was not encoded")
+		}
+		if got := binary.BigEndian.Uint16(message[38:40]); got != 443 {
+			t.Fatalf("target port = %d", got)
+		}
+		if !bytes.Equal(message[40:], payload) {
+			t.Fatal("Initial payload changed")
+		}
+	})
+
+	t.Run("ipv4", func(t *testing.T) {
+		flow := &hybridQUICFlow{target: hybridTarget{addr: netip.MustParseAddr("1.1.1.1"), port: 443}}
+		copy(flow.id[:], "0123456789abcdef")
+		message := flow.initialMessage(payload)
+
+		assertHybridHeader(t, message, flow.id)
+		if message[21] != hybridTargetIPv4 {
+			t.Fatalf("address type = %d, want %d", message[21], hybridTargetIPv4)
+		}
+		if netip.AddrFrom4([4]byte(message[22:26])) != flow.target.addr {
+			t.Fatal("target address was not encoded")
+		}
+		if got := binary.BigEndian.Uint16(message[26:28]); got != 443 {
+			t.Fatalf("target port = %d", got)
+		}
+		if !bytes.Equal(message[28:], payload) {
+			t.Fatal("Initial payload changed")
+		}
+	})
+
+	t.Run("domain", func(t *testing.T) {
+		name := "example.com"
+		flow := &hybridQUICFlow{target: hybridTarget{name: name, port: 443}}
+		copy(flow.id[:], "0123456789abcdef")
+		message := flow.initialMessage(payload)
+
+		assertHybridHeader(t, message, flow.id)
+		if message[21] != hybridTargetDomain {
+			t.Fatalf("address type = %d, want %d", message[21], hybridTargetDomain)
+		}
+		if int(message[22]) != len(name) {
+			t.Fatalf("name length = %d, want %d", message[22], len(name))
+		}
+		end := 23 + len(name)
+		if string(message[23:end]) != name {
+			t.Fatalf("name = %q, want %q", message[23:end], name)
+		}
+		if got := binary.BigEndian.Uint16(message[end : end+2]); got != 443 {
+			t.Fatalf("target port = %d", got)
+		}
+		if !bytes.Equal(message[end+2:], payload) {
+			t.Fatal("Initial payload changed")
+		}
+	})
+}
+
+// A rejected registration has to move the flow off the raw path: the server
+// holds no flow for that id, so nothing there would ever answer.
+func TestHybridAckRejectionFallsBack(t *testing.T) {
+	conn := &hybridQUICPacketConn{
+		flows:     make(map[hybridTarget]*hybridQUICFlow),
+		flowsByID: make(map[[16]byte]*hybridQUICFlow),
+	}
+	flow := &hybridQUICFlow{target: hybridTarget{name: "example.com", port: 443}}
+	copy(flow.id[:], "0123456789abcdef")
+	conn.flows[flow.target] = flow
+	conn.flowsByID[flow.id] = flow
+
+	if !conn.handleAck(hybridAckMessage(flow.id, hybridAckOK)) {
+		t.Fatal("an ack was not recognized")
+	}
+	if flow.rejected {
+		t.Fatal("a successful ack rejected the flow")
+	}
+
+	if !conn.handleAck(hybridAckMessage(flow.id, 1)) {
+		t.Fatal("a rejection was not recognized")
+	}
+	if !flow.rejected {
+		t.Fatal("a rejection did not move the flow off the raw path")
+	}
+
+	if conn.handleAck([]byte("not an ack at all....")) {
+		t.Fatal("unrelated data was treated as an ack")
+	}
+}
+
+func hybridAckMessage(id [16]byte, status byte) []byte {
+	message := make([]byte, 0, 22)
+	message = append(message, hybridQUICMagic...)
+	message = append(message, hybridQUICAck)
+	message = append(message, id[:]...)
+	return append(message, status)
+}
+
+func assertHybridHeader(t *testing.T, message []byte, id [16]byte) {
+	t.Helper()
 	if got := string(message[:4]); got != hybridQUICMagic {
-		t.Fatalf("magic = %q", got)
+		t.Fatalf("magic = %q, want %q", got, hybridQUICMagic)
 	}
-	if message[4] != hybridQUICInitial || !bytes.Equal(message[5:21], flow.id[:]) {
-		t.Fatal("operation or flow id was not encoded")
+	if message[4] != hybridQUICInitial {
+		t.Fatalf("operation = %d, want %d", message[4], hybridQUICInitial)
 	}
-	if got := binary.BigEndian.Uint16(message[21:23]); got != raw.LocalAddr().(*net.UDPAddr).AddrPort().Port() {
-		t.Fatalf("raw port = %d", got)
-	}
-	if message[23] != 6 || netip.AddrFrom16([16]byte(message[24:40])) != flow.target.Addr() {
-		t.Fatal("target address was not encoded")
-	}
-	if got := binary.BigEndian.Uint16(message[40:42]); got != 443 {
-		t.Fatalf("target port = %d", got)
-	}
-	if !bytes.Equal(message[42:], payload) {
-		t.Fatal("Initial payload changed")
+	if !bytes.Equal(message[5:21], id[:]) {
+		t.Fatal("flow id was not encoded")
 	}
 }
 

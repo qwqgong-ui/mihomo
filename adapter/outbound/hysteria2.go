@@ -32,9 +32,8 @@ const defaultHopInterval = 30
 type Hysteria2 struct {
 	*Base
 
-	option            *Hysteria2Option
-	client            *hysteria2.Client
-	hybridTargetCache *hybridTargetCache
+	option *Hysteria2Option
+	client *hysteria2.Client
 }
 
 type Hysteria2Option struct {
@@ -117,28 +116,6 @@ func (h *Hysteria2) hybridQUICEnabled() bool {
 	return h.option.HybridQUIC == nil || *h.option.HybridQUIC
 }
 
-// ResolveUDP keeps ordinary HY2 remote DNS behavior except for eligible
-// hybrid QUIC traffic. A hybrid registration must carry one concrete public
-// target IP; the server never infers it from a domain or SNI.
-func (h *Hysteria2) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
-	if err := h.Base.ResolveUDP(ctx, metadata); err != nil {
-		return err
-	}
-	if !h.hybridQUICEnabled() || metadata.DstPort != 443 || metadata.Host == "" {
-		return nil
-	}
-	// Resolve through the authenticated HY2 path. The ordinary/default resolver
-	// may intentionally return a synthetic fake-IP, while a direct resolver can
-	// be poisoned on networks that block Google and other QUIC destinations.
-	target, err := h.resolveHybridTargetViaHY2(ctx, metadata.Host)
-	if err != nil || !isHybridPublicTarget(target) {
-		return nil
-	}
-	metadata.DstIP = target
-	metadata.Host = ""
-	return nil
-}
-
 func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
@@ -151,11 +128,18 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 		return nil, errors.New("packetConn is nil")
 	}
 	defaultRoute := h.option.Interface == "" && h.option.RoutingMark == 0 && h.option.DialerProxy == "" && h.option.DialerForAPI == nil
-	if h.hybridQUICEnabled() && defaultRoute && metadata.DstPort == 443 && metadata.DstIP.IsValid() && isHybridPublicTarget(metadata.DstIP) {
+	// The destination is screened per packet in WriteTo, where the name a
+	// fake-IP flow carries is still intact; here it is enough that the port can
+	// be eligible at all.
+	if h.hybridQUICEnabled() && defaultRoute && metadata.DstPort == 443 {
 		relay, resolveErr := hybridRelayAddr(h.client)
 		if resolveErr == nil {
+			rawNetwork := "udp4"
+			if relay.Addr().Is6() {
+				rawNetwork = "udp6"
+			}
 			pc = newHybridQUICPacketConn(N.NewThreadSafePacketConn(pc), relay, func() (net.PacketConn, error) {
-				return h.dialer.ListenPacket(context.Background(), "udp6", "", relay)
+				return h.dialer.ListenPacket(context.Background(), rawNetwork, "", relay)
 			}, func() (net.PacketConn, error) {
 				fallback, fallbackErr := h.client.ListenPacket(context.Background())
 				if fallbackErr != nil {
@@ -199,8 +183,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			Prefer:       option.IPVersion,
 			RemoteDNS:    true,
 		}),
-		option:            &option,
-		hybridTargetCache: newHybridTargetCache(),
+		option: &option,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 
