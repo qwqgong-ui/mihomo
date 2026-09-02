@@ -3,7 +3,6 @@ package dns
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/netip"
 	"time"
 
@@ -651,7 +650,6 @@ func NewResolver(config Config) (rs Resolvers) {
 	r.defaultResolver = defaultResolver
 	rs.Resolver = r
 	rs.DirectResolver = &directResolver{Resolver: &Resolver{}}
-	registerPersistentCache("main", r.cache)
 	rs.BootstrapResolver = defaultResolver
 
 	if len(config.ProxyServer) != 0 {
@@ -662,7 +660,6 @@ func NewResolver(config Config) (rs Resolvers) {
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 			policy:      makePolicy(config.ProxyServerPolicy),
 		}
-		registerPersistentCache("proxy-server", rs.ProxyResolver.cache)
 	}
 
 	if len(config.DirectServer) != 0 {
@@ -672,11 +669,9 @@ func NewResolver(config Config) (rs Resolvers) {
 			cache:       config.newCache(),
 			ipv6Timeout: time.Duration(config.IPv6Timeout) * time.Millisecond,
 		}}
-		registerPersistentCache("direct", rs.DirectResolver.cache)
-		for index := range rs.DirectResolver.main {
+		for range rs.DirectResolver.main {
 			sourceCache := config.newCache()
 			rs.DirectResolver.sourceCaches = append(rs.DirectResolver.sourceCaches, sourceCache)
-			registerPersistentCache(fmt.Sprintf("direct-source-%d", index+1), sourceCache)
 		}
 		if config.DirectFollowPolicy {
 			rs.DirectResolver.policy = r.policy

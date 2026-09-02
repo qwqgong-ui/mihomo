@@ -248,7 +248,7 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 						// RTT sample from it.
 						tcpConcurrentCache.Set(key, cachedIP)
 					} else {
-						tcpConcurrentCache.SetWithRTT(key, cachedIP, time.Since(fastStart))
+						tcpConcurrentCache.SetWithRTT(key, cachedIP, measuredDialDuration(fastStart))
 					}
 					return result
 				}
@@ -272,22 +272,17 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 		}
 	}
 
-	fallbackStart := time.Now()
 	result := fallback(ctx, network, ips, port, opt)
 	if result.error == nil && result.ip.IsValid() {
-		// Prefer the winning candidate's own measured connect time over the
+		// Use the winning candidate's own measured connect time, never the
 		// wall-clock span of the whole fallback call: when fallback is a
 		// dual-stack race, a non-preferred winner can sit ready for up to
-		// dualStackFallbackTimeout before being returned, which would
-		// otherwise inflate the RTT sample with unrelated waiting. When the
-		// TFO lazy dialer is in play neither measurement means anything
-		// (dialContext returns a stub before any network I/O), so no
-		// sample is recorded at all.
-		rtt := result.dialDuration
-		if rtt <= 0 && !tfoDialIsAsynchronous(opt) {
-			rtt = time.Since(fallbackStart)
-		}
-		tcpConcurrentCache.SetWithRTT(key, result.ip, rtt)
+		// dualStackFallbackTimeout before being returned, and timing the call
+		// would fold that unrelated waiting into the sample. dialDuration is
+		// zero only when the dial was never really timed -- the lazy TFO
+		// dialer returns a stub before any network I/O -- and SetWithRTT then
+		// keeps the winner without recording a sample for it.
+		tcpConcurrentCache.SetWithRTT(key, result.ip, result.dialDuration)
 	}
 	return result
 }

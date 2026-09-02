@@ -793,7 +793,7 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, 
 		result := dialResult{ip: ips[0]}
 		result.Conn, result.error = dialContext(ctx, network, ips[0], port, opt)
 		if measureLatency {
-			result.dialDuration = time.Since(start)
+			result.dialDuration = measuredDialDuration(start)
 		}
 		return result
 	}
@@ -824,7 +824,7 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, 
 			}
 		}()
 		result.Conn, result.error = dialContext(ctx, network, ip, port, racingOpt)
-		result.dialDuration = time.Since(start)
+		result.dialDuration = measuredDialDuration(start)
 	}
 
 	for _, ip := range ips {
@@ -849,15 +849,36 @@ func serialDialContext(ctx context.Context, network string, ips []netip.Addr, po
 	if len(ips) == 0 {
 		return dialResult{error: ErrorNoIpAddress}
 	}
+	measureLatency := !tfoDialIsAsynchronous(opt)
 	var errs []error
 	for _, ip := range ips {
+		start := time.Now()
 		if conn, err := dialContext(ctx, network, ip, port, opt); err == nil {
-			return dialResult{ip: ip, Conn: conn}
+			result := dialResult{ip: ip, Conn: conn}
+			if measureLatency {
+				result.dialDuration = measuredDialDuration(start)
+			}
+			return result
 		} else {
 			errs = append(errs, err)
 		}
 	}
 	return dialResult{error: errors.Join(errs...)}
+}
+
+// measuredDialDuration reports how long a real connect took, floored at one
+// nanosecond so that a genuinely instant dial stays distinguishable from one
+// that was never timed at all.
+//
+// Every consumer of dialDuration reads a zero value as "no sample": the lazy
+// TFO dialer returns a stub before any network I/O, so timing it measures
+// nothing. Windows' monotonic clock is coarse enough that time.Since across a
+// fast connect routinely returns exactly 0, which without this floor makes a
+// real measurement indistinguishable from that sentinel -- and the winner is
+// then either dropped or replaced by a wall-clock span that includes unrelated
+// waiting.
+func measuredDialDuration(start time.Time) time.Duration {
+	return max(time.Since(start), time.Nanosecond)
 }
 
 type dialResult struct {

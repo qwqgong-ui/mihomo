@@ -25,17 +25,46 @@ var winners = struct {
 	entries map[winnerKey]winnerEntry
 }{entries: make(map[winnerKey]winnerEntry)}
 
+// maxWinners bounds the table. An entry is only dropped when a later lookup of
+// that exact key finds it expired, so a destination visited once and never
+// again would otherwise sit here for the life of the process. Winners are a
+// warm preference with a 30s life; losing some of them costs a race, not
+// correctness.
+const maxWinners = 2048
+
 func Store(host, adapter string, ip netip.Addr) {
 	ip = ip.Unmap()
 	if host == "" || adapter == "" || !ip.IsValid() {
 		return
 	}
+	now := time.Now()
+	key := winnerKey{host: canonicalHost(host), adapter: adapter, ipv6: ip.Is6()}
 	winners.Lock()
-	winners.entries[winnerKey{host: canonicalHost(host), adapter: adapter, ipv6: ip.Is6()}] = winnerEntry{
+	if _, replacing := winners.entries[key]; !replacing && len(winners.entries) >= maxWinners {
+		sweepExpiredLocked(now)
+		if len(winners.entries) >= maxWinners {
+			// Everything still live: drop one arbitrary entry rather than let
+			// destination names grow the table without bound.
+			for existing := range winners.entries {
+				delete(winners.entries, existing)
+				break
+			}
+		}
+	}
+	winners.entries[key] = winnerEntry{
 		ip:      ip,
-		expires: time.Now().Add(winnerTTL),
+		expires: now.Add(winnerTTL),
 	}
 	winners.Unlock()
+}
+
+// sweepExpiredLocked must be called with winners held.
+func sweepExpiredLocked(now time.Time) {
+	for key, entry := range winners.entries {
+		if now.After(entry.expires) {
+			delete(winners.entries, key)
+		}
+	}
 }
 
 // Prefer returns a recent path winner only while it remains in the current DNS

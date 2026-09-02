@@ -240,6 +240,10 @@ func updateNTP(c *config.NTP) {
 func updateDNS(c *config.DNS, generalIPv6 bool) {
 	if !c.Enable {
 		ecs.Setup(false)
+		// Nothing is left to snapshot, and leaving the previous generation
+		// registered would keep its caches -- and the resolver graph behind
+		// them -- alive and written to the cache file.
+		dns.RegisterPersistentCaches(dns.Resolvers{})
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
 		resolver.DefaultService = nil
@@ -315,6 +319,10 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	lc := inbound.NewListenConfig()
 	lc.SetRouteMark(c.ListenRoutingMark)
 	dns.ReCreateServer(c.Listen, lc, s)
+
+	// The runtime's own resolvers are the set persisted to the cache file;
+	// an outbound's private resolver must never take their place.
+	dns.RegisterPersistentCaches(r)
 
 	// after the resolvers are in place: STUN server names are resolved
 	// through the direct resolver

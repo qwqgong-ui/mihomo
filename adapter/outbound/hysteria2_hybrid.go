@@ -12,7 +12,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/sing-quic/hysteria2"
 	"github.com/miekg/dns"
 )
 
@@ -527,24 +529,37 @@ func isHybridPublicIPv6(addr netip.Addr) bool {
 
 func isHybridPublicTarget(addr netip.Addr) bool {
 	addr = addr.Unmap()
-	return addr.IsValid() && addr.IsGlobalUnicast() && !addr.IsPrivate() && !addr.IsLoopback() && !addr.IsLinkLocalUnicast() && !addr.IsUnspecified()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsUnspecified() {
+		return false
+	}
+	// The default fake-IP pool is 198.18.0.1/16, which sits in the benchmarking
+	// range rather than an RFC 1918 one: every test above passes it. A synthetic
+	// address has no meaning to the relay, so it must never be registered as a
+	// target -- today ResolveUDP happens to substitute a real address before
+	// this is reached, but nothing about that ordering is enforced here.
+	return !resolver.IsFakeIP(addr)
 }
 
-func resolveHybridRelay(ctx context.Context, server string, port int) (netip.AddrPort, error) {
-	if addr, err := netip.ParseAddr(server); err == nil {
-		if !isHybridPublicIPv6(addr) {
-			return netip.AddrPort{}, errors.New("hybrid QUIC relay is not public IPv6")
-		}
-		return netip.AddrPortFrom(addr, uint16(port)), nil
+// hybridRelayAddr reports where the raw relay path must send, taken from the
+// live tunnel rather than from a name lookup.
+//
+// The relay has to be the exact server the registration was just delivered to
+// over that tunnel, and DNS cannot promise that. A second lookup of the server
+// name can return a different host when it has several address records, and
+// resolving it again through net.DefaultResolver would additionally hand the
+// proxy server's name to the system resolver, which is the one place mihomo
+// never sends it. Reading the connection also tracks port hopping for free:
+// hopLoop rewrites the remote address in place.
+func hybridRelayAddr(client *hysteria2.Client) (netip.AddrPort, error) {
+	if client == nil {
+		return netip.AddrPort{}, errors.New("hybrid QUIC has no client")
 	}
-	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip6", server)
-	if err != nil {
-		return netip.AddrPort{}, err
+	relay, ok := client.RemoteAddr()
+	if !ok {
+		return netip.AddrPort{}, errors.New("hybrid QUIC has no established tunnel")
 	}
-	for _, addr := range addresses {
-		if isHybridPublicIPv6(addr) {
-			return netip.AddrPortFrom(addr, uint16(port)), nil
-		}
+	if !isHybridPublicIPv6(relay.Addr()) {
+		return netip.AddrPort{}, errors.New("hybrid QUIC relay is not public IPv6")
 	}
-	return netip.AddrPort{}, errors.New("hybrid QUIC relay has no public IPv6")
+	return relay, nil
 }

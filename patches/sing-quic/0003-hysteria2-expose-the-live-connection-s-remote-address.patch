@@ -1,0 +1,55 @@
+From 4ccf66d9e61bfd162ef9ce6d1cc9443519382145 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Wed, 2 Sep 2026 11:13:00 +0800
+Subject: [PATCH] hysteria2: expose the live connection's remote address
+
+---
+ hysteria2/remote_addr.go | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+ create mode 100644 hysteria2/remote_addr.go
+
+diff --git a/hysteria2/remote_addr.go b/hysteria2/remote_addr.go
+new file mode 100644
+index 0000000..a176fd1
+--- /dev/null
++++ b/hysteria2/remote_addr.go
+@@ -0,0 +1,36 @@
++package hysteria2
++
++import (
++	"net"
++	"net/netip"
++)
++
++// RemoteAddr reports the address of the server this client currently holds an
++// active QUIC connection to, if any.
++//
++// It is deliberately the live connection's address rather than a re-resolution
++// of the configured server name. The two can differ: the initial dial picks a
++// random port out of `ports`, hopLoop then moves the connection to another one
++// every hop interval, and a server name with several address records can hand a
++// second lookup a different host entirely. A caller that has to reach the exact
++// server an established tunnel is talking to -- to open a second, non-tunnelled
++// path to it -- cannot get that from DNS.
++//
++// ok is false when no connection is currently established.
++func (c *Client) RemoteAddr() (addrPort netip.AddrPort, ok bool) {
++	c.connAccess.Lock()
++	conn := c.conn
++	c.connAccess.Unlock()
++	if conn == nil || !conn.active() || conn.quicConn == nil {
++		return netip.AddrPort{}, false
++	}
++	udpAddr, isUDP := conn.quicConn.RemoteAddr().(*net.UDPAddr)
++	if !isUDP || udpAddr == nil {
++		return netip.AddrPort{}, false
++	}
++	addrPort = udpAddr.AddrPort()
++	if !addrPort.IsValid() {
++		return netip.AddrPort{}, false
++	}
++	return netip.AddrPortFrom(addrPort.Addr().Unmap(), addrPort.Port()), true
++}
+-- 
+2.55.0.windows.3
+

@@ -23,6 +23,11 @@ const (
 	directUDPRaceBytes          = 16 * 1024
 	directUDPRaceWindow         = 300 * time.Millisecond
 	directUDPQUICServerCIDLimit = 32
+
+	// maxTransientDirectUDPReadErrors bounds how many non-terminal read
+	// errors one family reader absorbs before giving up, so an error that
+	// never clears cannot spin the loop indefinitely.
+	maxTransientDirectUDPReadErrors = 64
 )
 
 type directUDPReadResult struct {
@@ -276,16 +281,26 @@ func (c *directUDPRacePacketConn) ensureConn(ctx context.Context, family int, re
 
 func (c *directUDPRacePacketConn) readLoop(pc net.PacketConn) {
 	epc := N.NewEnhancePacketConn(pc)
+	transientErrors := 0
 	for {
 		data, put, addr, err := epc.WaitReadFrom()
-		if err != nil && !isTerminalDirectUDPReadError(err) {
+		if err != nil && !isTerminalDirectUDPReadError(err) && transientErrors < maxTransientDirectUDPReadErrors {
 			// An unconnected UDP socket can surface an asynchronous ICMP error
 			// from one loser without identifying its destination. Consume that
 			// error and keep the family reader alive for the other candidates.
+			//
+			// Only a bounded number of times: an error that is neither
+			// terminal nor self-clearing (a platform returning EINVAL on the
+			// socket, say) would otherwise spin this loop at full speed
+			// forever. Past the budget it is treated as terminal instead.
+			transientErrors++
 			if put != nil {
 				put()
 			}
 			continue
+		}
+		if err == nil {
+			transientErrors = 0
 		}
 		result := directUDPReadResult{data: data, put: put, addr: addr, err: err}
 		if err != nil {

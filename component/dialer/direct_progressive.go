@@ -211,7 +211,7 @@ func runProgressiveDirectRace(
 			result := progressiveConnectResult{
 				dialResult: dialResult{ip: ip, Conn: conn, error: err},
 				ipv6:       ipv6,
-				rtt:        time.Since(started),
+				rtt:        measuredDialDuration(started),
 			}
 			select {
 			case connects <- result:
@@ -261,7 +261,7 @@ func runProgressiveDirectRace(
 			result := progressiveConnectResult{
 				dialResult: dialResult{ip: ip, Conn: conn, error: err},
 				ipv6:       ipv6,
-				rtt:        time.Since(started),
+				rtt:        measuredDialDuration(started),
 				fast:       true,
 			}
 			select {

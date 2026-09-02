@@ -100,6 +100,20 @@ func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 }
 
 func (h *Hysteria2) hybridQUICEnabled() bool {
+	// Port hopping moves the tunnel to a fresh port every hop interval, and
+	// even the first connection picks a random one out of `ports` rather than
+	// `port`. The raw relay socket is pinned to a single port for the life of
+	// the flow, so it would both miss the server the registration landed on
+	// and turn the bulk of the traffic into exactly the stable high-volume
+	// flow that `ports` exists to avoid. With only `ports` set, `port` is
+	// legitimately 0, which would silently pin the relay to port 0.
+	//
+	// A relay port other than 443 is refused for the same reason the target
+	// side is: raw QUIC to 443 is indistinguishable from ordinary traffic,
+	// raw QUIC to anything else is not.
+	if h.option.Ports != "" || h.option.Port != 443 {
+		return false
+	}
 	return h.option.HybridQUIC == nil || *h.option.HybridQUIC
 }
 
@@ -138,7 +152,7 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	}
 	defaultRoute := h.option.Interface == "" && h.option.RoutingMark == 0 && h.option.DialerProxy == "" && h.option.DialerForAPI == nil
 	if h.hybridQUICEnabled() && defaultRoute && metadata.DstPort == 443 && metadata.DstIP.IsValid() && isHybridPublicTarget(metadata.DstIP) {
-		relay, resolveErr := resolveHybridRelay(ctx, h.option.Server, h.option.Port)
+		relay, resolveErr := hybridRelayAddr(h.client)
 		if resolveErr == nil {
 			pc = newHybridQUICPacketConn(N.NewThreadSafePacketConn(pc), relay, func() (net.PacketConn, error) {
 				return h.dialer.ListenPacket(context.Background(), "udp6", "", relay)

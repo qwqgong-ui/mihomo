@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"fmt"
 	"maps"
 	"strings"
 	"sync"
@@ -63,6 +64,14 @@ var (
 	persistMu     sync.Mutex
 	persistCaches = make(map[string]dnsCache)
 	storeOnce     sync.Once
+
+	// restored guards the one-time replay of the previous run's answers.
+	// updateDNS runs again on every config reload *and* on every runtime
+	// IPv6 availability flip, each time building fresh caches; replaying
+	// the on-disk snapshot into them would resurrect answers the user just
+	// reconfigured away, and would carry one network's unscoped answers
+	// (main/proxy-server/direct) across a network switch.
+	restored bool
 )
 
 // registerPersistentCache remembers the live cache so StoreCache can snapshot
@@ -84,6 +93,48 @@ func registerPersistentCache(name string, c dnsCache) {
 	persistMu.Unlock()
 }
 
+// RegisterPersistentCaches makes one generation of resolvers the set that is
+// snapshotted to the cache file, replacing whatever the previous generation
+// registered.
+//
+// Only the runtime's own resolvers belong here. NewResolver is also used to
+// build the private resolvers of individual outbounds (wireguard, masque,
+// openvpn, zerotier); registering from inside the constructor filed those
+// under the same names as the global ones, so an outbound's private answers
+// were persisted in place of the real main resolver's and restored into it on
+// the next start.
+//
+// The registry is replaced wholesale rather than added to: updateDNS runs
+// again on every reload and on every runtime IPv6 availability flip, and a
+// resolver the new configuration no longer builds would otherwise keep its
+// cache -- and the resolver graph behind it -- alive and on disk forever.
+func RegisterPersistentCaches(rs Resolvers) {
+	persistMu.Lock()
+	clear(persistCaches)
+	persistMu.Unlock()
+
+	if rs.Resolver != nil {
+		registerPersistentCache("main", rs.Resolver.cache)
+	}
+	if rs.ProxyResolver != nil {
+		registerPersistentCache("proxy-server", rs.ProxyResolver.cache)
+	}
+	direct := rs.DirectResolver
+	if direct == nil || direct.Resolver == nil {
+		return
+	}
+	registerPersistentCache("direct", direct.cache)
+	for index, sourceCache := range direct.sourceCaches {
+		if index >= len(direct.main) {
+			break
+		}
+		// Keyed by the upstream's own address, never by its position alone:
+		// reordering direct-nameserver must not hand one upstream the answers
+		// persisted for another.
+		registerPersistentCache(fmt.Sprintf("direct-source-%d-%s", index+1, direct.main[index].Address()), sourceCache)
+	}
+}
+
 // LoadPersistentCache restores previously persisted answers into every
 // registered cache and starts the periodic snapshot. Call it from the runtime
 // after the DNS resolvers are in place, never during their construction.
@@ -96,9 +147,16 @@ func LoadPersistentCache() {
 	if len(caches) == 0 {
 		return
 	}
-	entries := cachefile.Cache().DNSCache()
-	for name, c := range caches {
-		loadCache(name, c, entries)
+
+	persistMu.Lock()
+	replay := !restored
+	restored = true
+	persistMu.Unlock()
+	if replay {
+		entries := cachefile.Cache().DNSCache()
+		for name, c := range caches {
+			loadCache(name, c, entries)
+		}
 	}
 	storeOnce.Do(startStoreLoop)
 }
