@@ -210,6 +210,23 @@ func hybridAckMessage(id [16]byte, status byte) []byte {
 	return append(message, status)
 }
 
+// hybridAckWithTarget is the acknowledgement a successful registration gets: it
+// carries the address the server resolved the name to, which is the only way a
+// name flow can label what comes back on the raw path.
+func hybridAckWithTarget(id [16]byte, target netip.AddrPort) []byte {
+	message := hybridAckMessage(id, hybridAckOK)
+	if addr := target.Addr(); addr.Is4() {
+		v4 := addr.As4()
+		message = append(message, hybridTargetIPv4)
+		message = append(message, v4[:]...)
+	} else {
+		v6 := addr.As16()
+		message = append(message, hybridTargetIPv6)
+		message = append(message, v6[:]...)
+	}
+	return binary.BigEndian.AppendUint16(message, target.Port())
+}
+
 func assertHybridHeader(t *testing.T, message []byte, id [16]byte) {
 	t.Helper()
 	if got := string(message[:4]); got != hybridQUICMagic {

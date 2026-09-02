@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/sing-quic/hysteria2"
 )
 
@@ -48,6 +49,14 @@ type hybridTarget struct {
 }
 
 func (t hybridTarget) isDomain() bool { return t.name != "" }
+
+func (t hybridTarget) String() string {
+	host := t.name
+	if !t.isDomain() {
+		host = t.addr.String()
+	}
+	return net.JoinHostPort(host, strconv.FormatUint(uint64(t.port), 10))
+}
 
 // eligible reports whether this destination may use the raw relay at all. Port
 // 443 only: raw QUIC to 443 is indistinguishable from ordinary traffic, and raw
@@ -125,6 +134,22 @@ type hybridQUICFlow struct {
 	// case where continuing on the raw path would black-hole the connection.
 	registered bool
 	rejected   bool
+	// resolved is the address the server reported for a registered name, and is
+	// what the raw path's replies are labelled with. Guarded by owner.mu.
+	resolved netip.AddrPort
+}
+
+// reportAddr is the address a datagram off the raw path is attributed to. For a
+// literal destination that is the destination itself; for a name it is what the
+// server resolved, which is the same address its replies over the tunnel
+// carried, so the sender's mapping resolves a datagram from either path.
+func (f *hybridQUICFlow) reportAddr() netip.AddrPort {
+	if !f.target.isDomain() {
+		return netip.AddrPortFrom(f.target.addr, f.target.port)
+	}
+	f.owner.mu.Lock()
+	defer f.owner.mu.Unlock()
+	return f.resolved
 }
 
 type hybridQUICRead struct {
@@ -200,6 +225,11 @@ func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (in
 	}
 
 	if !registered {
+		// Only before the flow has registered. Once its Initial has gone out
+		// over the relay, the rest of the connection has to follow it: the
+		// fallback is a separate tunnel session, and splitting one QUIC
+		// connection across two of them shows the target two different source
+		// endpoints and its handshake never completes.
 		return c.writeFallback(payload, destination)
 	}
 	// This packet is what opens the return path. It is a real packet of the
@@ -272,15 +302,60 @@ func (c *hybridQUICPacketConn) handleAck(message []byte) bool {
 	}
 	var id [16]byte
 	copy(id[:], message[5:21])
-	if message[21] == hybridAckOK {
+	if message[21] != hybridAckOK {
+		c.mu.Lock()
+		if flow := c.flowsByID[id]; flow != nil {
+			flow.rejected = true
+		}
+		c.mu.Unlock()
 		return true
 	}
+
+	resolved, ok := parseHybridAckTarget(message[22:])
 	c.mu.Lock()
-	if flow := c.flowsByID[id]; flow != nil {
-		flow.rejected = true
+	flow := c.flowsByID[id]
+	if flow != nil && ok {
+		// A name was registered, so the replies coming back on the raw path
+		// have no address the client could have known. This is the one the
+		// server actually opened the flow to.
+		flow.resolved = resolved
 	}
 	c.mu.Unlock()
+	if flow != nil {
+		log.Debugln("[HY2] hybrid QUIC relay ready for %s --> %s", flow.target, resolved)
+	}
 	return true
+}
+
+// parseHybridAckTarget reads the address a successful registration resolved to.
+// It is absent when the client registered a literal address, which it can label
+// its own replies with.
+func parseHybridAckTarget(tail []byte) (netip.AddrPort, bool) {
+	if len(tail) < 1 {
+		return netip.AddrPort{}, false
+	}
+	var addr netip.Addr
+	switch tail[0] {
+	case hybridTargetIPv4:
+		if len(tail) < 1+4+2 {
+			return netip.AddrPort{}, false
+		}
+		addr = netip.AddrFrom4([4]byte(tail[1:5]))
+		tail = tail[5:]
+	case hybridTargetIPv6:
+		if len(tail) < 1+16+2 {
+			return netip.AddrPort{}, false
+		}
+		addr = netip.AddrFrom16([16]byte(tail[1:17])).Unmap()
+		tail = tail[17:]
+	default:
+		return netip.AddrPort{}, false
+	}
+	resolved := netip.AddrPortFrom(addr, binary.BigEndian.Uint16(tail[:2]))
+	if !resolved.IsValid() {
+		return netip.AddrPort{}, false
+	}
+	return resolved, true
 }
 
 func (f *hybridQUICFlow) readRaw() {
@@ -303,12 +378,12 @@ func (f *hybridQUICFlow) readRaw() {
 		if source != f.owner.relay {
 			continue
 		}
-		// A domain flow has no address of its own to report. The tunnel already
-		// learned one from the replies the server sent before the raw path was
-		// bound, so reporting the relay would only confuse the mapping; report
-		// the target address when there is one and let the tunnel keep its own
-		// association otherwise.
-		reported := netip.AddrPortFrom(f.target.addr, f.target.port)
+		// A name flow has no address of its own: under fake-IP the only one the
+		// client holds is synthetic. The registration acknowledgement carries
+		// the address the server resolved, which is also what its replies over
+		// the tunnel were attributed to, so both paths label a datagram the
+		// same way and the sender's mapping resolves either one.
+		reported := f.reportAddr()
 		data := append([]byte(nil), buffer[:n]...)
 		f.owner.deliver(hybridQUICRead{data: data, target: reported})
 	}

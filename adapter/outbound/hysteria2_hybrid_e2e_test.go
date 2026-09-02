@@ -189,10 +189,17 @@ func TestHybridClientRegistersNameThenRelaysRaw(t *testing.T) {
 		t.Fatalf("%d packets went raw before the Initial was registered", len(sent))
 	}
 
+	// The registration is acknowledged with the address the name resolved to.
+	// Until that lands the flow has no address to label a raw reply with, so it
+	// stays on the tunnel.
+	var id [16]byte
+	copy(id[:], control.data[5:21])
+	target := netip.MustParseAddrPort("[2606:4700:4700::1111]:443")
+	h.hy2.deliver(hybridAckWithTarget(id, target), hybridControlAddr{})
+
 	// The server's early replies arrive over the tunnel, attributed to the
 	// target it resolved. That is what the client learns the target's
 	// connection ID from, and it must surface as an ordinary read.
-	target := netip.MustParseAddrPort("[2606:4700:4700::1111]:443")
 	h.hy2.deliver([]byte("server hello"), net.UDPAddrFromAddrPort(target))
 	_, addr, data := h.readWithin(t, 2*time.Second)
 	if string(data) != "server hello" {
@@ -205,8 +212,15 @@ func TestHybridClientRegistersNameThenRelaysRaw(t *testing.T) {
 	// Anything that is not an Initial now takes the raw path. This packet is
 	// also what opens the return path: no probe was ever sent.
 	handshake := hybridHandshakePacket()
-	if _, err = h.conn.WriteTo(handshake, destination); err != nil {
-		t.Fatalf("WriteTo(handshake): %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err = h.conn.WriteTo(handshake, destination); err != nil {
+			t.Fatalf("WriteTo(handshake): %v", err)
+		}
+		if len(h.raw.sent()) > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 	rawSent := h.raw.awaitSent(t, 1)[0]
 	if rawSent.addr.String() != h.relay.String() {
