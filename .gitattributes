@@ -1,0 +1,6 @@
+# Everything under patches/ is applied byte for byte to a dependency checkout,
+# either as a patch or as a file copied over one. git apply matches its own
+# context lines against the module source, which always has LF endings, so a
+# checkout that rewrites these files -- core.autocrlf is true by default in
+# Git for Windows -- makes every hunk fail to apply with no obvious cause.
+patches/** -text
