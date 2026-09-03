@@ -178,9 +178,11 @@ func TestProgressiveDirectTCPConcurrentFailureFallsBackToAllCandidates(t *testin
 		t.Fatal(err)
 	}
 	_ = conn.Close()
-	waitForAttemptCount(t, dial, cachedIP, 2)
-	if dial.count(otherIP) != 1 {
-		t.Fatalf("fallback attempts for other candidate = %d, want 1", dial.count(otherIP))
+	waitForAttemptCount(t, dial, otherIP, 1)
+	// The refused address is never dialed again: the fallback race covers the
+	// candidates that have not been tried, not the one that just failed.
+	if dial.count(cachedIP) != 1 {
+		t.Fatalf("attempts for refused cached address = %d, want 1", dial.count(cachedIP))
 	}
 	if winner, loaded := cache.Get(key); !loaded || winner != otherIP {
 		t.Fatalf("replacement TCP winner = %s, loaded=%v; want %s, true", winner, loaded, otherIP)
@@ -228,9 +230,11 @@ func TestProgressiveDirectTCPConcurrentTimeoutFallsBackToAllCandidates(t *testin
 	if elapsed := time.Since(started); elapsed < minFastPathTimeout {
 		t.Fatalf("fallback started before cached fast-path timeout: %s", elapsed)
 	}
-	waitForAttemptCount(t, dial, cachedIP, 2)
-	if dial.count(otherIP) != 1 {
-		t.Fatalf("fallback attempts for other candidate = %d, want 1", dial.count(otherIP))
+	waitForAttemptCount(t, dial, otherIP, 1)
+	// The timed-out attempt keeps running rather than being cancelled and
+	// re-issued, so the address is only ever dialed once.
+	if dial.count(cachedIP) != 1 {
+		t.Fatalf("attempts for timed-out cached address = %d, want 1", dial.count(cachedIP))
 	}
 	if winner, loaded := cache.Get(key); !loaded || winner != otherIP {
 		t.Fatalf("replacement TCP winner = %s, loaded=%v; want %s, true", winner, loaded, otherIP)
@@ -294,5 +298,138 @@ func TestDirectNetworkScopePrefersPlatformEnvironment(t *testing.T) {
 	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
 	if got := directNetworkScope(option{interfaceName: "ignored"}); got != "environment|wifi-fingerprint" {
 		t.Fatalf("direct network scope = %q", got)
+	}
+}
+
+func TestProgressiveDirectRacesBothCachedWinners(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previousConcurrent := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
+	SetDirectNetworkEnvironment("tcp-cache-second-test")
+	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
+
+	deadIP := netip.MustParseAddr("192.0.2.2")
+	spareIP := netip.MustParseAddr("192.0.2.3")
+	otherIP := netip.MustParseAddr("192.0.2.1")
+	key, ok := tcpConcurrentCacheScopedKey("second.example", "443", "tcp", "environment|tcp-cache-second-test")
+	if !ok {
+		t.Fatal("missing scoped TCP winner cache key")
+	}
+	cache.SetWithRTT(key, deadIP, 5*time.Millisecond)
+	cache.SetWithRTT(key, spareIP, 9*time.Millisecond)
+
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{otherIP, deadIP, spareIP}, Source: -1}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	progressive := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 4)}
+	blocked := make(chan struct{})
+	t.Cleanup(func() { close(blocked) })
+	dial := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
+		otherIP: {{release: blocked}},
+		// The faster cached winner is a black hole: it never answers and
+		// never reports an error, so only racing its peer can settle this.
+		deadIP:  {{release: nil}},
+		spareIP: {{release: closedTestGate()}},
+	})
+
+	started := time.Now()
+	conn, err := directProgressiveDialContext(context.Background(), "tcp", "second.example:443", option{netDialer: dial}, progressive)
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	// Both winners start together, so the dead one costs nothing: waiting out
+	// its budget first would have taken at least minFastPathTimeout.
+	if elapsed >= minFastPathTimeout {
+		t.Fatalf("dial took %s; the second winner was not raced alongside the first", elapsed)
+	}
+	if dial.count(deadIP) != 1 || dial.count(spareIP) != 1 {
+		t.Fatalf("attempt counts = dead:%d spare:%d; want 1 and 1", dial.count(deadIP), dial.count(spareIP))
+	}
+	// The candidates held behind the fast path are never released.
+	if dial.count(otherIP) != 0 {
+		t.Fatalf("attempts for the held candidate = %d, want 0", dial.count(otherIP))
+	}
+	// The black hole is pruned when the shared budget expires, even though
+	// the destination was already settled by its peer.
+	deadline := time.Now().Add(time.Second)
+	for {
+		winners, loaded := cache.Winners(key)
+		if loaded && len(winners) == 1 && winners[0].IP == spareIP {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("winners = %v, loaded=%v; want only %s", winners, loaded, spareIP)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestProgressiveDirectRecordsRunnerUpAsSecondWinner(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previousConcurrent := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previousConcurrent) })
+	SetDirectNetworkEnvironment("tcp-cache-runnerup-test")
+	t.Cleanup(func() { SetDirectNetworkEnvironment("") })
+
+	fastIP := netip.MustParseAddr("192.0.2.1")
+	slowIP := netip.MustParseAddr("192.0.2.2")
+	key, ok := tcpConcurrentCacheScopedKey("runnerup.example", "443", "tcp", "environment|tcp-cache-runnerup-test")
+	if !ok {
+		t.Fatal("missing scoped TCP winner cache key")
+	}
+
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{fastIP, slowIP}, Source: -1}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	progressive := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 4)}
+
+	dial := NetDialerFunc(func(ctx context.Context, _, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		delay := 5 * time.Millisecond
+		if host == slowIP.String() {
+			delay = 25 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+		client, peer := net.Pipe()
+		_ = peer.Close()
+		return client, nil
+	})
+
+	conn, err := directProgressiveDialContext(context.Background(), "tcp", "runnerup.example:443", option{netDialer: dial}, progressive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	// One race has to leave both a winner and a runner-up behind, otherwise
+	// the fast path never has a second address to fall back on.
+	deadline := time.Now().Add(time.Second)
+	for {
+		winners, loaded := cache.Winners(key)
+		if loaded && len(winners) == 2 && winners[0].IP == fastIP && winners[1].IP == slowIP {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("winners = %v, loaded=%v; want %s then %s", winners, loaded, fastIP, slowIP)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }

@@ -464,7 +464,7 @@ func TestFastPathTimeoutForBounds(t *testing.T) {
 	}{
 		{"no sample uses default", 0, tcpConcurrentFastPathTimeout},
 		{"tiny rtt is floored", time.Millisecond, minFastPathTimeout},
-		{"typical rtt is doubled", 40 * time.Millisecond, 80 * time.Millisecond},
+		{"typical rtt is tripled", 40 * time.Millisecond, 120 * time.Millisecond},
 		{"huge rtt is capped", 10 * time.Second, maxFastPathTimeout},
 	}
 	for _, c := range cases {
@@ -659,4 +659,62 @@ func TestDualStackConcurrentReturnsPreferredWinnerIP(t *testing.T) {
 		t.Fatalf("dual-stack result = %s, %v; want %s, nil", result.ip, result.error, ipv6)
 	}
 	_ = result.Conn.Close()
+}
+
+func TestTCPConcurrentCacheKeepsTwoFastestWinners(t *testing.T) {
+	cache := NewTCPConcurrentCache(4, 30*time.Minute)
+	key := "example.test:443/tcp"
+	slow := netip.MustParseAddr("192.0.2.3")
+	fast := netip.MustParseAddr("192.0.2.1")
+	middle := netip.MustParseAddr("192.0.2.2")
+
+	cache.SetWithRTT(key, slow, 30*time.Millisecond)
+	cache.SetWithRTT(key, fast, 5*time.Millisecond)
+	winners, loaded := cache.Winners(key)
+	if !loaded || len(winners) != 2 {
+		t.Fatalf("winners = %v, loaded=%v; want two entries", winners, loaded)
+	}
+	if winners[0].IP != fast || winners[1].IP != slow {
+		t.Fatalf("winners = %v; want fastest first", winners)
+	}
+	if got, _ := cache.Get(key); got != fast {
+		t.Fatalf("Get = %s, want the fastest winner %s", got, fast)
+	}
+
+	// A third address displaces the slowest one, never the fastest.
+	cache.SetIfFaster(key, middle, 10*time.Millisecond)
+	winners, _ = cache.Winners(key)
+	if len(winners) != tcpConcurrentWinnersKept {
+		t.Fatalf("winners = %v; want the list capped at %d", winners, tcpConcurrentWinnersKept)
+	}
+	if winners[0].IP != fast || winners[1].IP != middle {
+		t.Fatalf("winners = %v; want %s then %s", winners, fast, middle)
+	}
+
+	// A repeat success without a sample must not erase the latency held.
+	cache.Set(key, fast)
+	winners, _ = cache.Winners(key)
+	if winners[0].IP != fast || winners[0].RTT != 5*time.Millisecond {
+		t.Fatalf("winners = %v; want %s to keep its 5ms sample", winners, fast)
+	}
+}
+
+func TestTCPConcurrentCacheRemoveKeepsRemainingWinner(t *testing.T) {
+	cache := NewTCPConcurrentCache(4, 30*time.Minute)
+	key := "example.test:443/tcp"
+	first := netip.MustParseAddr("192.0.2.1")
+	second := netip.MustParseAddr("192.0.2.2")
+	cache.SetWithRTT(key, first, 5*time.Millisecond)
+	cache.SetWithRTT(key, second, 9*time.Millisecond)
+
+	cache.Remove(key, first)
+	winners, loaded := cache.Winners(key)
+	if !loaded || len(winners) != 1 || winners[0].IP != second {
+		t.Fatalf("winners after removing %s = %v, loaded=%v; want only %s", first, winners, loaded, second)
+	}
+
+	cache.Remove(key, second)
+	if winners, loaded := cache.Winners(key); loaded || winners != nil {
+		t.Fatalf("winners after removing the last one = %v, loaded=%v; want the entry gone", winners, loaded)
+	}
 }

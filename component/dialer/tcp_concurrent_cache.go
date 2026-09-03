@@ -1,9 +1,11 @@
 package dialer
 
 import (
+	"cmp"
 	"context"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,15 +24,74 @@ const (
 	// timeout so a very fast local RTT sample doesn't starve a slightly
 	// slower retry, and a very slow sample doesn't stall the fallback race
 	// for too long.
-	minFastPathTimeout    = 30 * time.Millisecond
-	maxFastPathTimeout    = 500 * time.Millisecond
-	fastPathRTTMultiplier = 2
+	minFastPathTimeout = 30 * time.Millisecond
+	maxFastPathTimeout = 500 * time.Millisecond
+	// fastPathRTTMultiplier turns one past sample into a budget for the next
+	// connect. A single sample is a poor predictor on a jittery link -- Wi-Fi
+	// routinely puts the same destination anywhere between one and three
+	// times its median -- and every budget that expires early costs a whole
+	// extra round of connects, so the multiplier is deliberately generous.
+	fastPathRTTMultiplier = 3
+
+	// tcpConcurrentWinnersKept is how many measured winners one destination
+	// remembers. With a single winner the fast path has nothing to try when
+	// that address goes dead, so the race restarts from the full candidate
+	// set; a second one covers the common case (one CDN node withdrawn while
+	// the rest of the answer stays good) for one extra connect.
+	tcpConcurrentWinnersKept = 2
 )
 
+// tcpConcurrentWinner is one address that completed a connect, together with
+// the latency measured for it. A non-positive RTT means no usable sample was
+// captured, not that the connect was instant.
+type tcpConcurrentWinner struct {
+	IP  netip.Addr
+	RTT time.Duration
+}
+
 type tcpConcurrentCacheEntry struct {
-	winner   netip.Addr
-	rtt      time.Duration
+	// winners is ordered fastest first, holds distinct addresses, and is
+	// capped at tcpConcurrentWinnersKept. Addresses without a sample sort
+	// last, since nothing is known about them yet.
+	winners  []tcpConcurrentWinner
 	expireAt time.Time
+}
+
+// insertWinner merges winner into winners under the invariants above. A
+// non-positive RTT records no sample, so an address already present keeps the
+// latency it had rather than losing it.
+func insertWinner(winners []tcpConcurrentWinner, winner tcpConcurrentWinner) []tcpConcurrentWinner {
+	winner.IP = winner.IP.Unmap()
+	merged := make([]tcpConcurrentWinner, 0, len(winners)+1)
+	for _, current := range winners {
+		if current.IP == winner.IP {
+			if winner.RTT <= 0 {
+				winner.RTT = current.RTT
+			}
+			continue
+		}
+		merged = append(merged, current)
+	}
+	merged = append(merged, winner)
+	slices.SortStableFunc(merged, func(a, b tcpConcurrentWinner) int {
+		switch {
+		case a.RTT <= 0 && b.RTT <= 0:
+			return 0
+		case a.RTT <= 0:
+			return 1
+		case b.RTT <= 0:
+			return -1
+		}
+		return cmp.Compare(a.RTT, b.RTT)
+	})
+	if len(merged) > tcpConcurrentWinnersKept {
+		merged = merged[:tcpConcurrentWinnersKept]
+	}
+	return merged
+}
+
+func sameWinners(a, b []tcpConcurrentWinner) bool {
+	return slices.Equal(a, b)
 }
 
 // fastPathTimeoutFor derives the fast-path dial budget from the last
@@ -86,23 +147,33 @@ func (c *TCPConcurrentCache) getEntry(key string) (tcpConcurrentCacheEntry, bool
 	return entry, true
 }
 
-// Get returns an unexpired cached winner.
-func (c *TCPConcurrentCache) Get(key string) (netip.Addr, bool) {
+// Winners returns the unexpired cached winners for a destination, fastest
+// first. The slice is a copy and callers may retain it.
+func (c *TCPConcurrentCache) Winners(key string) ([]tcpConcurrentWinner, bool) {
 	entry, loaded := c.getEntry(key)
-	if !loaded {
-		return netip.Addr{}, false
+	if !loaded || len(entry.winners) == 0 {
+		return nil, false
 	}
-	return entry.winner, true
+	return slices.Clone(entry.winners), true
 }
 
-// RTT returns the connect latency observed the last time this destination's
-// winner was recorded, if any sample was captured.
+// Get returns the fastest unexpired cached winner.
+func (c *TCPConcurrentCache) Get(key string) (netip.Addr, bool) {
+	entry, loaded := c.getEntry(key)
+	if !loaded || len(entry.winners) == 0 {
+		return netip.Addr{}, false
+	}
+	return entry.winners[0].IP, true
+}
+
+// RTT returns the connect latency observed for the fastest winner, if any
+// sample was captured for it.
 func (c *TCPConcurrentCache) RTT(key string) (time.Duration, bool) {
 	entry, loaded := c.getEntry(key)
-	if !loaded || entry.rtt <= 0 {
+	if !loaded || len(entry.winners) == 0 || entry.winners[0].RTT <= 0 {
 		return 0, false
 	}
-	return entry.rtt, true
+	return entry.winners[0].RTT, true
 }
 
 // Set records a successful TCP winner and starts a fresh lifetime, without a
@@ -114,7 +185,9 @@ func (c *TCPConcurrentCache) Set(key string, winner netip.Addr) {
 
 // SetWithRTT records a successful TCP winner together with how long the
 // winning connect took, so future fast-path attempts to this destination can
-// size their timeout from real latency instead of the fixed default.
+// size their timeout from real latency instead of the fixed default. The
+// address joins any winner already held for the destination rather than
+// replacing it, up to tcpConcurrentWinnersKept.
 func (c *TCPConcurrentCache) SetWithRTT(key string, winner netip.Addr, rtt time.Duration) {
 	if c == nil || key == "" || !winner.IsValid() {
 		return
@@ -122,15 +195,22 @@ func (c *TCPConcurrentCache) SetWithRTT(key string, winner netip.Addr, rtt time.
 	if rtt < 0 {
 		rtt = 0
 	}
-	c.entries.Set(key, tcpConcurrentCacheEntry{
-		winner:   winner.Unmap(),
-		rtt:      rtt,
-		expireAt: c.now().Add(c.ttl),
+	now := c.now()
+	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
+		winners := current.winners
+		if !loaded || !now.Before(current.expireAt) {
+			winners = nil
+		}
+		return tcpConcurrentCacheEntry{
+			winners:  insertWinner(winners, tcpConcurrentWinner{IP: winner, RTT: rtt}),
+			expireAt: now.Add(c.ttl),
+		}, false
 	})
 }
 
-// SetIfFaster records winner only when it is the first measured candidate or
-// beats the still-live sample already stored for the scoped destination.
+// SetIfFaster records winner only when it earns a place among the still-live
+// samples already stored for the scoped destination -- either a free slot or
+// a latency better than one of the winners held.
 func (c *TCPConcurrentCache) SetIfFaster(key string, winner netip.Addr, rtt time.Duration) bool {
 	if c == nil || key == "" || !winner.IsValid() || rtt <= 0 {
 		return false
@@ -138,13 +218,41 @@ func (c *TCPConcurrentCache) SetIfFaster(key string, winner netip.Addr, rtt time
 	now := c.now()
 	updated := false
 	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
-		if loaded && now.Before(current.expireAt) && current.rtt > 0 && current.rtt <= rtt {
+		winners := current.winners
+		if !loaded || !now.Before(current.expireAt) {
+			winners = nil
+		}
+		merged := insertWinner(winners, tcpConcurrentWinner{IP: winner, RTT: rtt})
+		if loaded && now.Before(current.expireAt) && sameWinners(merged, winners) {
 			return current, false
 		}
 		updated = true
-		return tcpConcurrentCacheEntry{winner: winner.Unmap(), rtt: rtt, expireAt: now.Add(c.ttl)}, false
+		return tcpConcurrentCacheEntry{winners: merged, expireAt: now.Add(c.ttl)}, false
 	})
 	return updated
+}
+
+// Remove drops a single winner that has stopped working, keeping whatever
+// other winner the destination still has. The destination is forgotten
+// entirely once its last winner is removed.
+func (c *TCPConcurrentCache) Remove(key string, winner netip.Addr) {
+	if c == nil || key == "" || !winner.IsValid() {
+		return
+	}
+	winner = winner.Unmap()
+	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
+		if !loaded {
+			return current, true
+		}
+		remaining := slices.DeleteFunc(slices.Clone(current.winners), func(held tcpConcurrentWinner) bool {
+			return held.IP == winner
+		})
+		if len(remaining) == 0 {
+			return tcpConcurrentCacheEntry{}, true
+		}
+		current.winners = remaining
+		return current, false
+	})
 }
 
 // Delete removes a destination from the cache.
@@ -211,13 +319,29 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 		return fallback(ctx, network, ips, port, opt)
 	}
 
-	if cachedIP, loaded := tcpConcurrentCache.Get(key); loaded {
-		if !containsTCPConcurrentCandidate(ips, cachedIP) {
+	// Each cached winner still named by the current answer gets its own
+	// budget, in order, before the full race starts. One withdrawn CDN node
+	// then costs a single extra connect instead of a restart from scratch.
+	winners, loaded := tcpConcurrentCache.Winners(key)
+	if loaded {
+		winners = slices.DeleteFunc(winners, func(winner tcpConcurrentWinner) bool {
+			return !containsTCPConcurrentCandidate(ips, winner.IP)
+		})
+		if len(winners) == 0 {
 			tcpConcurrentCache.Delete(key)
-		} else {
-			fastCtx, cancelFast := context.WithCancel(ctx)
-			fastResult := make(chan dialResult)
-			fastStart := time.Now()
+		}
+	}
+	if len(winners) > 0 {
+		fastCtx, cancelFast := context.WithCancel(ctx)
+		fastResult := make(chan dialResult, len(winners))
+		fastStart := time.Now()
+		budget := time.Duration(0)
+		for _, winner := range winners {
+			// One shared budget covering the group follows its slowest
+			// member: a faster winner's sample says nothing about when the
+			// others should be given up on.
+			budget = max(budget, fastPathTimeoutFor(winner.RTT))
+			cachedIP := winner.IP
 			go func() {
 				result := dialResult{ip: cachedIP}
 				result.Conn, result.error = dialContext(fastCtx, network, cachedIP, port, opt)
@@ -229,47 +353,60 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 					}
 				}
 			}()
+		}
 
-			rtt, _ := tcpConcurrentCache.RTT(key)
-			fastTimer := time.NewTimer(fastPathTimeoutFor(rtt))
+		fastTimer := time.NewTimer(budget)
+		stopFastTimer := func() {
+			if !fastTimer.Stop() {
+				select {
+				case <-fastTimer.C:
+				default:
+				}
+			}
+		}
+		outstanding := len(winners)
+	fastRace:
+		for outstanding > 0 {
 			select {
 			case result := <-fastResult:
-				if !fastTimer.Stop() {
-					select {
-					case <-fastTimer.C:
-					default:
-					}
-				}
-				cancelFast()
+				outstanding--
 				if result.error == nil {
+					stopFastTimer()
+					cancelFast()
 					if tfoDialIsAsynchronous(opt) {
 						// The fast-path dial handed back a stub instantly;
 						// keep the winner but don't record a bogus near-zero
 						// RTT sample from it.
-						tcpConcurrentCache.Set(key, cachedIP)
+						tcpConcurrentCache.Set(key, result.ip)
 					} else {
-						tcpConcurrentCache.SetWithRTT(key, cachedIP, measuredDialDuration(fastStart))
+						tcpConcurrentCache.SetWithRTT(key, result.ip, measuredDialDuration(fastStart))
 					}
 					return result
 				}
 				if ctx.Err() != nil {
+					stopFastTimer()
+					cancelFast()
 					return dialResult{error: ctx.Err()}
 				}
-				tcpConcurrentCache.Delete(key)
+				tcpConcurrentCache.Remove(key, result.ip)
 			case <-fastTimer.C:
-				cancelFast()
-				tcpConcurrentCache.Delete(key)
-			case <-ctx.Done():
-				if !fastTimer.Stop() {
-					select {
-					case <-fastTimer.C:
-					default:
-					}
+				// Nothing the cache offered answered in time, so none of them
+				// deserves to be tried first again.
+				for _, winner := range winners {
+					tcpConcurrentCache.Remove(key, winner.IP)
 				}
+				break fastRace
+			case <-ctx.Done():
+				stopFastTimer()
 				cancelFast()
 				return dialResult{error: ctx.Err()}
 			}
 		}
+		// Whatever is still running when the budget expires is abandoned
+		// rather than joined to the race below, which redials every candidate
+		// anyway.
+		stopFastTimer()
+		cancelFast()
 	}
 
 	result := fallback(ctx, network, ips, port, opt)

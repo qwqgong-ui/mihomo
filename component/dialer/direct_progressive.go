@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -141,24 +142,35 @@ func runProgressiveDirectRace(
 		ipv6 bool
 	}
 	var queued []queuedCandidate
-	var cachedIP netip.Addr
-	var cachedRTT time.Duration
+	var cachedWinners []tcpConcurrentWinner
+	cachedIPv6 := false
 	cachePending := false
 	if cacheKey != "" && GetTcpConcurrent() {
-		cachedIP, cachePending = tcpConcurrentCache.Get(cacheKey)
+		cachedWinners, cachePending = tcpConcurrentCache.Winners(cacheKey)
 		if cachePending {
-			cachedRTT, _ = tcpConcurrentCache.RTT(cacheKey)
-			cachedFamilyUnavailable := cachedIP.Is4() && network == "tcp6" ||
-				cachedIP.Is6() && (network == "tcp4" || R.DisableIPv6.Load())
-			if cachedFamilyUnavailable {
+			cachedWinners = slices.DeleteFunc(cachedWinners, func(winner tcpConcurrentWinner) bool {
+				return winner.IP.Is4() && network == "tcp6" ||
+					winner.IP.Is6() && (network == "tcp4" || R.DisableIPv6.Load())
+			})
+			if len(cachedWinners) == 0 {
 				tcpConcurrentCache.Delete(cacheKey)
 				cachePending = false
+			} else {
+				// The fast path is armed by one family's DNS batch, and a
+				// winner of the other family cannot be validated against it,
+				// so the slower family's winners stay ordinary candidates.
+				cachedIPv6 = cachedWinners[0].IP.Is6()
+				cachedWinners = slices.DeleteFunc(cachedWinners, func(winner tcpConcurrentWinner) bool {
+					return winner.IP.Is6() != cachedIPv6
+				})
 			}
 		}
 	}
-	fastActive := false
+	// fastInFlight holds the cached winners currently being dialed under the
+	// fast path's shared budget.
+	var fastInFlight []netip.Addr
+	fastPriority := false
 	fastSucceeded := false
-	var cancelFast context.CancelFunc
 	var fastTimer *time.Timer
 	var fastTimeout <-chan time.Time
 
@@ -174,18 +186,22 @@ func runProgressiveDirectRace(
 		resultCh <- dialResult{ip: ip, Conn: conn}
 	}
 	promote := func(result progressiveConnectResult) {
-		if result.rtt <= 0 || bestRTT > 0 && result.rtt >= bestRTT {
+		if result.rtt <= 0 {
 			return
 		}
-		first := bestRTT == 0
-		bestRTT = result.rtt
-		if cacheKey != "" {
-			if first {
-				tcpConcurrentCache.SetWithRTT(cacheKey, result.ip, result.rtt)
-			} else {
-				tcpConcurrentCache.SetIfFaster(cacheKey, result.ip, result.rtt)
-			}
+		// Every candidate that connected is offered to the winner cache, not
+		// only the ones that beat the best so far. The runner-up is exactly
+		// what the fast path needs to race when the best address goes dead,
+		// and recording improvements alone would leave that slot empty: in a
+		// race, results tend to arrive fastest first, so nothing after the
+		// opening result would ever qualify.
+		tcpConcurrentCache.SetIfFaster(cacheKey, result.ip, result.rtt)
+		if bestRTT > 0 && result.rtt >= bestRTT {
+			return
 		}
+		bestRTT = result.rtt
+		// The DNS answer still names one address, so it only follows the
+		// genuine winner.
 		progressive.PromoteIP(host, result.ipv6, scope, result.ip)
 	}
 	start := func(ip netip.Addr, ipv6 bool) {
@@ -241,49 +257,64 @@ func runProgressiveDirectRace(
 		}
 		fastTimer = nil
 	}
-	startFast := func(ip netip.Addr, ipv6 bool) {
-		fastActive = true
-		fastCtx, cancel := context.WithCancel(ctx)
-		cancelFast = cancel
-		fastTimer = time.NewTimer(fastPathTimeoutFor(cachedRTT))
-		fastTimeout = fastTimer.C
-		pending++
+	// startFastGroup dials every cached winner at once under one shared
+	// budget. Trying them in turn would make a dead first winner cost its
+	// whole budget before the second one is even started, which is exactly
+	// the case the second winner exists for; racing them costs one extra
+	// connect and settles in the time of whichever answers first.
+	//
+	// The attempts are tied to the race context rather than a private one, so
+	// an expired budget releases the remaining candidates without destroying
+	// connects that may still be about to complete.
+	startFastGroup := func(winners []tcpConcurrentWinner, ipv6 bool) {
+		fastPriority = true
+		fastInFlight = fastInFlight[:0]
+		budget := time.Duration(0)
 		family := 0
 		if ipv6 {
 			family = 1
 		}
-		pendingFamily[family]++
-		go func() {
-			connectOpt := opt
-			connectOpt.tfo = false
-			started := time.Now()
-			conn, err := dialContext(fastCtx, network, ip, port, connectOpt)
-			result := progressiveConnectResult{
-				dialResult: dialResult{ip: ip, Conn: conn, error: err},
-				ipv6:       ipv6,
-				rtt:        measuredDialDuration(started),
-				fast:       true,
-			}
-			select {
-			case connects <- result:
-			case <-ctx.Done():
-				if conn != nil {
-					_ = conn.Close()
+		for _, winner := range winners {
+			// The budget covers the group, so it follows the slowest member:
+			// a faster winner's sample says nothing about when the others
+			// should be given up on.
+			budget = max(budget, fastPathTimeoutFor(winner.RTT))
+			fastInFlight = append(fastInFlight, winner.IP)
+			seen[winner.IP] = struct{}{}
+			pending++
+			pendingFamily[family]++
+			go func() {
+				connectOpt := opt
+				connectOpt.tfo = false
+				started := time.Now()
+				conn, err := dialContext(ctx, network, winner.IP, port, connectOpt)
+				result := progressiveConnectResult{
+					dialResult: dialResult{ip: winner.IP, Conn: conn, error: err},
+					ipv6:       ipv6,
+					rtt:        measuredDialDuration(started),
+					fast:       true,
 				}
-			}
-		}()
+				select {
+				case connects <- result:
+				case <-ctx.Done():
+					if conn != nil {
+						_ = conn.Close()
+					}
+				}
+			}()
+		}
+		fastTimer = time.NewTimer(budget)
+		fastTimeout = fastTimer.C
 	}
-	fallbackCached := func() {
+	// abandonFastPath stops holding candidates back for the cached winners
+	// and releases everything queued behind them. Attempts already in flight
+	// keep running: an expired budget is not evidence that a connect failed,
+	// and cancelling it throws away the round trip already spent.
+	abandonFastPath := func() {
 		cachePending = false
-		fastActive = false
+		fastPriority = false
+		fastInFlight = nil
 		stopFastTimer()
-		if cancelFast != nil {
-			cancelFast()
-			cancelFast = nil
-		}
-		if cacheKey != "" {
-			tcpConcurrentCache.Delete(cacheKey)
-		}
 		startQueued()
 	}
 	preferredDone := func() bool {
@@ -324,8 +355,11 @@ func runProgressiveDirectRace(
 			return
 		case event := <-events:
 			if event.done {
-				if cachePending && event.ipv6 == cachedIP.Is6() {
-					fallbackCached()
+				if cachePending && event.ipv6 == cachedIPv6 {
+					// That family produced nothing to validate the winners
+					// against, so they cannot be trusted for this network.
+					tcpConcurrentCache.Delete(cacheKey)
+					abandonFastPath()
 				}
 				doneFamilies++
 				if event.ipv6 {
@@ -346,18 +380,25 @@ func runProgressiveDirectRace(
 			if fastSucceeded {
 				continue
 			}
-			if cachePending || fastActive {
+			if cachePending || fastPriority {
 				for _, ip := range event.IPs {
 					queued = append(queued, queuedCandidate{ip: ip, ipv6: event.ipv6})
 				}
-				if cachePending && event.ipv6 == cachedIP.Is6() {
+				if cachePending && event.ipv6 == cachedIPv6 {
 					cachePending = false
-					if containsTCPConcurrentCandidate(event.IPs, cachedIP) {
-						log.Debugln("[TCP] progressive direct cache hit %s:%s --> %s", host, port, cachedIP)
-						startFast(cachedIP, event.ipv6)
+					// Only winners this answer still names are worth a
+					// dedicated budget; the rest are stale.
+					fastWinners := slices.DeleteFunc(cachedWinners, func(winner tcpConcurrentWinner) bool {
+						return !containsTCPConcurrentCandidate(event.IPs, winner.IP)
+					})
+					if len(fastWinners) > 0 {
+						log.Debugln("[TCP] progressive direct cache hit %s:%s --> %s (%d cached winner(s))",
+							host, port, fastWinners[0].IP, len(fastWinners))
+						startFastGroup(fastWinners, event.ipv6)
 					} else {
-						log.Debugln("[TCP] progressive direct cache expired %s:%s --> %s; racing current candidates", host, port, cachedIP)
-						fallbackCached()
+						log.Debugln("[TCP] progressive direct cache expired %s:%s; racing current candidates", host, port)
+						tcpConcurrentCache.Delete(cacheKey)
+						abandonFastPath()
 					}
 				}
 				continue
@@ -373,29 +414,30 @@ func runProgressiveDirectRace(
 				pendingFamily[0]--
 			}
 			if result.fast {
-				if !fastActive {
-					if result.Conn != nil {
-						_ = result.Conn.Close()
-					}
-					continue
-				}
-				fastActive = false
-				stopFastTimer()
-				if cancelFast != nil {
-					cancelFast()
-					cancelFast = nil
-				}
+				// A fast attempt whose budget already expired still counts:
+				// it kept running, so a late success is a real connection and
+				// a late failure still condemns that winner.
+				fastInFlight = slices.DeleteFunc(fastInFlight, func(ip netip.Addr) bool {
+					return ip == result.ip
+				})
 				if result.error != nil {
 					log.Debugln("[TCP] progressive direct cached connect failed %s:%s --> %s: %v", host, port, result.ip, result.error)
 					errs = append(errs, fmt.Errorf("cached connect %s failed: %w", result.ip, result.error))
-					if cacheKey != "" {
-						tcpConcurrentCache.Delete(cacheKey)
+					tcpConcurrentCache.Remove(cacheKey, result.ip)
+					// Only the last cached winner to fail releases the field:
+					// while another is still dialing, it may yet answer.
+					if fastPriority && len(fastInFlight) == 0 {
+						abandonFastPath()
 					}
-					startQueued()
 					continue
 				}
 				fastSucceeded = true
 				queued = nil
+				fastPriority = false
+				// The budget keeps running even though the destination is
+				// settled: a winner that never answers would otherwise stay
+				// cached forever, costing a wasted connect on every dial,
+				// because a black hole never reports an error to remove it.
 				log.Debugln("[TCP] progressive direct cached connect ready %s:%s --> %s in %s", host, port, result.ip, result.rtt)
 				promote(result)
 				deliver(result.Conn, result.ip)
@@ -441,8 +483,19 @@ func runProgressiveDirectRace(
 				heldFallback = nil
 			}
 		case <-fastTimeout:
-			log.Debugln("[TCP] progressive direct cached connect timeout %s:%s --> %s; racing current candidates", host, port, cachedIP)
-			fallbackCached()
+			// Whatever has not answered by now does not deserve to be tried
+			// first again, whether or not one of its peers already won.
+			for _, ip := range fastInFlight {
+				tcpConcurrentCache.Remove(cacheKey, ip)
+			}
+			if !fastPriority {
+				stopFastTimer()
+				fastInFlight = nil
+				continue
+			}
+			log.Debugln("[TCP] progressive direct cached connect timeout %s:%s --> %s; racing current candidates",
+				host, port, fastInFlight)
+			abandonFastPath()
 		}
 	}
 }
