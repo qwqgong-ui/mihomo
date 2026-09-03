@@ -24,6 +24,18 @@ const (
 	directUDPRaceWindow         = 300 * time.Millisecond
 	directUDPQUICServerCIDLimit = 32
 
+	// directUDPQUICRaceWindow bounds how long a QUIC target may keep fanning
+	// out while it waits for the application's own connection ID to name a
+	// winner. That signal is the better answer -- it is the peer the
+	// application actually established with, not a guess from timing -- but it
+	// does not always arrive: a server may pick a zero-length connection ID,
+	// several anycast candidates may answer with the same one, or the table may
+	// fill. It is the only thing that can name a winner for a QUIC target, so
+	// without a bound the race simply never converges: every datagram keeps
+	// being copied to every candidate for the life of the connection, and
+	// replies from all of them keep being handed up as one peer.
+	directUDPQUICRaceWindow = 3 * directUDPRaceWindow
+
 	// maxTransientDirectUDPReadErrors bounds how many non-terminal read
 	// errors one family reader absorbs before giving up, so an error that
 	// never clears cannot spin the loop indefinitely.
@@ -38,17 +50,21 @@ type directUDPReadResult struct {
 }
 
 type directUDPTarget struct {
-	logical                  netip.AddrPort
-	candidates               []netip.AddrPort
-	live                     map[netip.AddrPort]bool
-	winner                   netip.AddrPort
-	started                  time.Time
-	datagrams                int
-	bytes                    int
-	host                     string
-	adapter                  string
-	quic                     bool
-	quicConfirmed            bool
+	logical       netip.AddrPort
+	candidates    []netip.AddrPort
+	live          map[netip.AddrPort]bool
+	winner        netip.AddrPort
+	started       time.Time
+	datagrams     int
+	bytes         int
+	host          string
+	adapter       string
+	quic          bool
+	quicConfirmed bool
+	// responder is the first candidate that actually answered. For a QUIC
+	// target a reply is the only evidence a path works at all, which makes it a
+	// better thing to settle on than a candidate that merely accepted a send.
+	responder                netip.AddrPort
 	quicCandidateByServerCID map[string]netip.AddrPort
 }
 
@@ -379,8 +395,14 @@ func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, e
 			}
 		}
 	}
-	if !target.quic && !target.winner.IsValid() && !target.started.IsZero() && (now.Sub(target.started) >= directUDPRaceWindow || target.datagrams >= directUDPRaceDatagrams || target.bytes+len(payload)*len(target.candidates) > directUDPRaceBytes) {
-		target.winner = firstLiveDirectUDPCandidate(target)
+	if !target.winner.IsValid() && !target.started.IsZero() {
+		if target.quic {
+			if now.Sub(target.started) >= directUDPQUICRaceWindow {
+				target.winner = settleDirectUDPCandidate(target)
+			}
+		} else if now.Sub(target.started) >= directUDPRaceWindow || target.datagrams >= directUDPRaceDatagrams || target.bytes+len(payload)*len(target.candidates) > directUDPRaceBytes {
+			target.winner = firstLiveDirectUDPCandidate(target)
+		}
 	}
 	if target.winner.IsValid() {
 		candidates := []netip.AddrPort{target.winner}
@@ -473,6 +495,17 @@ func (c *directUDPRacePacketConn) writeCandidateSet(payload []byte, candidates [
 	return 0, errors.Join(errs...), failed
 }
 
+// settleDirectUDPCandidate picks the candidate to keep once a race has to end
+// without the application having named one. A candidate that answered is
+// preferred over one that merely accepted a send, which only means the local
+// socket took the datagram.
+func settleDirectUDPCandidate(target *directUDPTarget) netip.AddrPort {
+	if target.responder.IsValid() && target.live[target.responder] {
+		return target.responder
+	}
+	return firstLiveDirectUDPCandidate(target)
+}
+
 func firstLiveDirectUDPCandidate(target *directUDPTarget) netip.AddrPort {
 	for _, candidate := range target.candidates {
 		if target.live[candidate] {
@@ -539,8 +572,17 @@ func (c *directUDPRacePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, erro
 					}
 				}
 			}
-			if !target.quic && !target.winner.IsValid() && now.Sub(target.started) >= directUDPRaceWindow {
-				target.winner = firstLiveDirectUDPCandidate(target)
+			if target.live[source] && !target.responder.IsValid() {
+				target.responder = source
+			}
+			if !target.winner.IsValid() && !target.started.IsZero() {
+				if target.quic {
+					if now.Sub(target.started) >= directUDPQUICRaceWindow {
+						target.winner = settleDirectUDPCandidate(target)
+					}
+				} else if now.Sub(target.started) >= directUDPRaceWindow {
+					target.winner = firstLiveDirectUDPCandidate(target)
+				}
 			}
 			if target.winner.IsValid() {
 				if target.winner == source {
