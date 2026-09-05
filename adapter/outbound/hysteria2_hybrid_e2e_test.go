@@ -152,9 +152,14 @@ func hybridInitialPacket() []byte {
 
 func hybridHandshakePacket() []byte {
 	packet := make([]byte, 5)
-	packet[0] = 0xe0 // long header, v1 Handshake: not an Initial, so it goes raw
+	packet[0] = 0xe0 // long header, v1 Handshake: relayed over the tunnel
 	binary.BigEndian.PutUint32(packet[1:], quicVersion1)
 	return packet
+}
+
+// hybrid1RTTPacket is the only shape the raw path carries.
+func hybrid1RTTPacket() []byte {
+	return []byte{0x40, 0xaa, 0xbb, 0xcc, 0xdd, 0x00}
 }
 
 // A fake-IP flow reaches WriteTo as a name, which is the case the whole design
@@ -209,34 +214,65 @@ func TestHybridClientRegistersNameThenRelaysRaw(t *testing.T) {
 		t.Fatalf("tunnel reply came from %v, want %v", addr, target)
 	}
 
-	// Anything that is not an Initial now takes the raw path. This packet is
-	// also what opens the return path: no probe was ever sent.
+	// The rest of the handshake is relayed over the tunnel, not sent raw: a raw
+	// path carrying a Handshake packet would show an observer a QUIC connection
+	// that never sent a ClientHello on the tuple it is handshaking over.
 	handshake := hybridHandshakePacket()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if _, err = h.conn.WriteTo(handshake, destination); err != nil {
-			t.Fatalf("WriteTo(handshake): %v", err)
-		}
-		if len(h.raw.sent()) > 0 || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	if _, err = h.conn.WriteTo(handshake, destination); err != nil {
+		t.Fatalf("WriteTo(handshake): %v", err)
+	}
+	relayed := h.hy2.awaitSent(t, 2)[1]
+	if relayed.addr.String() != hybridQUICControlAddress {
+		t.Fatalf("the handshake went to %v, want the control address", relayed.addr)
+	}
+	if string(relayed.data[:4]) != hybridQUICMagic || relayed.data[4] != hybridQUICRelay {
+		t.Fatalf("relay header = %x", relayed.data[:5])
+	}
+	if !bytes.Equal(relayed.data[5:21], id[:]) {
+		t.Fatal("the relayed packet named another flow")
+	}
+	if !bytes.Equal(relayed.data[21:], handshake) {
+		t.Fatal("the relayed packet was rewritten")
+	}
+	if sent := h.raw.sent(); len(sent) != 0 {
+		t.Fatalf("%d handshake packets took the raw path", len(sent))
+	}
+
+	// A 1-RTT packet starts the handover. Until the raw path answers it is sent
+	// over both, so a flow the server cannot match on the raw path stays alive
+	// on the tunnel instead of being black-holed.
+	oneRTT := hybrid1RTTPacket()
+	if _, err = h.conn.WriteTo(oneRTT, destination); err != nil {
+		t.Fatalf("WriteTo(1-RTT): %v", err)
 	}
 	rawSent := h.raw.awaitSent(t, 1)[0]
 	if rawSent.addr.String() != h.relay.String() {
 		t.Fatalf("raw packet went to %v, want the relay %v", rawSent.addr, h.relay)
 	}
-	if !bytes.Equal(rawSent.data, handshake) {
+	if !bytes.Equal(rawSent.data, oneRTT) {
 		t.Fatal("the raw packet was rewritten")
+	}
+	duringHandover := h.hy2.awaitSent(t, 3)[2]
+	if duringHandover.data[4] != hybridQUICRelay || !bytes.Equal(duringHandover.data[21:], oneRTT) {
+		t.Fatal("the 1-RTT packet was not mirrored over the tunnel during the handover")
 	}
 	if len(h.fallback.sent()) != 0 {
 		t.Fatal("a registered flow used the fallback path")
 	}
 
+	// Once the raw path answers, the tunnel copy stops.
 	h.raw.deliver([]byte("raw reply"), net.UDPAddrFromAddrPort(h.relay))
 	_, _, data = h.readWithin(t, 2*time.Second)
 	if string(data) != "raw reply" {
 		t.Fatalf("raw reply = %q", data)
+	}
+	tunnelBefore := len(h.hy2.sent())
+	if _, err = h.conn.WriteTo(oneRTT, destination); err != nil {
+		t.Fatal(err)
+	}
+	h.raw.awaitSent(t, 2)
+	if len(h.hy2.sent()) != tunnelBefore {
+		t.Fatal("the tunnel still carried a 1-RTT packet after the raw path answered")
 	}
 }
 
@@ -257,7 +293,7 @@ func TestHybridClientFallsBackWhenRegistrationRejected(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err := h.conn.WriteTo(hybridHandshakePacket(), destination); err != nil {
+		if _, err := h.conn.WriteTo(hybrid1RTTPacket(), destination); err != nil {
 			t.Fatal(err)
 		}
 		if len(h.fallback.sent()) > 0 {
@@ -317,5 +353,47 @@ func TestHybridClientRejectsIneligibleDestinations(t *testing.T) {
 				t.Fatal("an ineligible destination used the raw path")
 			}
 		})
+	}
+}
+
+// A raw path the server never matched must not black-hole the connection. The
+// flow keeps every 1-RTT packet on the tunnel as well, and once the handover
+// window has passed with no answer it stops writing raw altogether.
+func TestHybridClientKeepsTunnelWhenRawPathNeverAnswers(t *testing.T) {
+	h := newHybridHarness(t)
+	destination := M.ParseSocksaddrHostPort("example.com", 443)
+
+	if _, err := h.conn.WriteTo(hybridInitialPacket(), destination); err != nil {
+		t.Fatal(err)
+	}
+	control := h.hy2.awaitSent(t, 1)[0]
+	var id [16]byte
+	copy(id[:], control.data[5:21])
+	h.hy2.deliver(hybridAckWithTarget(id, netip.MustParseAddrPort("[2606:4700:4700::1111]:443")), hybridControlAddr{})
+
+	oneRTT := hybrid1RTTPacket()
+	deadline := time.Now().Add(2 * time.Second)
+	var rawStopped bool
+	for i := 0; !rawStopped && time.Now().Before(deadline); i++ {
+		rawBefore := len(h.raw.sent())
+		tunnelBefore := len(h.hy2.sent())
+		if _, err := h.conn.WriteTo(oneRTT, destination); err != nil {
+			t.Fatal(err)
+		}
+		// Every packet reaches the target over the tunnel, whatever the raw
+		// path is doing.
+		if len(h.hy2.sent()) == tunnelBefore {
+			t.Fatal("a 1-RTT packet was not relayed over the tunnel")
+		}
+		if len(h.raw.sent()) == rawBefore {
+			rawStopped = true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !rawStopped {
+		t.Fatal("the flow kept writing to a raw path that never answered")
+	}
+	if len(h.fallback.sent()) != 0 {
+		t.Fatal("a registered flow used the fallback path")
 	}
 }

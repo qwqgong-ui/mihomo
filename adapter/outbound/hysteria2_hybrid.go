@@ -19,14 +19,24 @@ import (
 
 const (
 	hybridQUICControlAddress = "hybrid-quic.invalid:443"
-	// HQV2 drops two fields HQV1 carried: the raw port the client reported for
-	// itself, which the server now observes, and the requirement that the
-	// target be a literal address, which forced a fake-IP client to un-map its
-	// own synthetic destination before it could register. The magic is bumped
-	// so an HQV1 peer fails cleanly instead of misreading a shifted header.
-	hybridQUICMagic   = "HQV2"
+	// HQV3 takes every long-header packet off the raw path: the handshake now
+	// travels over the tunnel in both directions and the raw path carries
+	// nothing but 1-RTT packets, which needs an op that relays a packet of an
+	// already-registered flow. The magic is bumped so an HQV2 peer fails
+	// cleanly instead of meeting an op it has no case for.
+	hybridQUICMagic   = "HQV3"
 	hybridQUICInitial = byte(1)
 	hybridQUICAck     = byte(2)
+	hybridQUICRelay   = byte(3)
+
+	// hybridHandoverTimeout and hybridHandoverPackets bound the window in which
+	// a flow sends its 1-RTT packets over both paths. Both have to be exceeded
+	// before the raw path is written off: a burst can put eight packets on the
+	// wire in less than the round trip an answer needs, and an application that
+	// sends one packet and waits has not given the path a fair chance however
+	// long it waits.
+	hybridHandoverTimeout = 1500 * time.Millisecond
+	hybridHandoverPackets = 8
 
 	hybridTargetDomain = byte(0)
 	hybridTargetIPv4   = byte(4)
@@ -134,6 +144,11 @@ type hybridQUICFlow struct {
 	// case where continuing on the raw path would black-hole the connection.
 	registered bool
 	rejected   bool
+	// phase tracks the handover from the tunnel to the raw path. Guarded by
+	// owner.mu.
+	phase          hybridPhase
+	handoverExpiry time.Time
+	handoverSent   int
 	// resolved is the address the server reported for a registered name, and is
 	// what the raw path's replies are labelled with. Guarded by owner.mu.
 	resolved netip.AddrPort
@@ -143,6 +158,23 @@ type hybridQUICFlow struct {
 // literal destination that is the destination itself; for a name it is what the
 // server resolved, which is the same address its replies over the tunnel
 // carried, so the sender's mapping resolves a datagram from either path.
+// hybridPhase is where a flow is in the move from the tunnel to the raw path.
+// A flow starts on the tunnel, sends its first 1-RTT packets over both paths
+// until one comes back raw, and only then leaves the tunnel behind. Sending on
+// both is what keeps a flow the server could not match on the raw path alive
+// rather than black-holed, and the overlap costs only duplicate packet numbers,
+// which QUIC discards.
+type hybridPhase int
+
+const (
+	hybridPhaseTunnel hybridPhase = iota
+	hybridPhaseHandover
+	hybridPhaseRaw
+	// hybridPhaseStuck is a handover that timed out. The raw socket stays open
+	// but unused; the flow lives out its life on the tunnel.
+	hybridPhaseStuck
+)
+
 func (f *hybridQUICFlow) reportAddr() netip.AddrPort {
 	if !f.target.isDomain() {
 		return netip.AddrPortFrom(f.target.addr, f.target.port)
@@ -205,18 +237,25 @@ func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (in
 		return c.writeFallback(payload, destination)
 	}
 
-	if isQUICInitial(payload) {
-		// Every Initial goes over the tunnel: a large ClientHello spans several
-		// of them and the server needs them all, and this is also what lets the
-		// server claim the Initial's connection ID before any raw packet can
-		// name it.
-		control := flow.initialMessage(payload)
-		n, err := c.hy2.WriteTo(control, hybridControlAddr{})
-		if err != nil {
-			return 0, err
+	if isQUICLongHeader(payload) {
+		// The whole handshake goes over the tunnel, in this direction and the
+		// other. A raw path that carried an Initial or a Handshake would show
+		// an observer a QUIC connection that begins in the middle -- no
+		// ClientHello ever sent on a tuple that is answering with one -- which
+		// has no benign counterpart. A raw path that only ever carries 1-RTT
+		// packets is shaped exactly like an ordinary connection migration,
+		// which happens on any NAT rebinding.
+		//
+		// The first Initial registers the flow; everything after it is relayed
+		// against the id that registration established.
+		var control []byte
+		if registered {
+			control = flow.relayMessage(payload)
+		} else {
+			control = flow.initialMessage(payload)
 		}
-		if n != len(control) {
-			return 0, errors.New("short hybrid QUIC control write")
+		if err := c.writeControl(control); err != nil {
+			return 0, err
 		}
 		c.mu.Lock()
 		flow.registered = true
@@ -232,10 +271,60 @@ func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (in
 		// endpoints and its handshake never completes.
 		return c.writeFallback(payload, destination)
 	}
-	// This packet is what opens the return path. It is a real packet of the
-	// connection rather than a probe, and the server has not sent anything on
-	// the raw path before now, so there is nothing to punch a hole for first.
-	return flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
+
+	// A 1-RTT packet, and with it the handover. The raw path cannot be trusted
+	// until something has come back on it: the server matches a raw packet by
+	// the connection ID the target chose, and a target that rotates early or
+	// uses a zero-length ID is one it will never match. So the flow sends on
+	// both paths until the raw one answers, and gives up on it if none does.
+	switch c.handoverPhase(flow) {
+	case hybridPhaseRaw:
+		return flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
+	case hybridPhaseStuck:
+		if err := c.writeControl(flow.relayMessage(payload)); err != nil {
+			return 0, err
+		}
+		return len(payload), nil
+	default:
+		if err := c.writeControl(flow.relayMessage(payload)); err != nil {
+			return 0, err
+		}
+		// A failure here is not fatal: the tunnel copy has already been sent,
+		// so the packet is delivered either way.
+		_, _ = flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
+		return len(payload), nil
+	}
+}
+
+// handoverPhase reports where the flow is in the move to the raw path, starting
+// the handover on the first 1-RTT packet and abandoning it once the window has
+// passed with nothing received.
+func (c *hybridQUICPacketConn) handoverPhase(flow *hybridQUICFlow) hybridPhase {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch flow.phase {
+	case hybridPhaseTunnel:
+		flow.phase = hybridPhaseHandover
+		flow.handoverExpiry = time.Now().Add(hybridHandoverTimeout)
+	case hybridPhaseHandover:
+		flow.handoverSent++
+		if flow.handoverSent >= hybridHandoverPackets && time.Now().After(flow.handoverExpiry) {
+			flow.phase = hybridPhaseStuck
+			log.Debugln("[HY2] hybrid QUIC raw path never answered for %s, staying on the tunnel", flow.target)
+		}
+	}
+	return flow.phase
+}
+
+func (c *hybridQUICPacketConn) writeControl(control []byte) error {
+	n, err := c.hy2.WriteTo(control, hybridControlAddr{})
+	if err != nil {
+		return err
+	}
+	if n != len(control) {
+		return errors.New("short hybrid QUIC control write")
+	}
+	return nil
 }
 
 func (c *hybridQUICPacketConn) writeFallback(payload []byte, destination net.Addr) (int, error) {
@@ -290,6 +379,18 @@ func (f *hybridQUICFlow) initialMessage(payload []byte) []byte {
 	message = append(message, f.id[:]...)
 	message = append(message, addressed...)
 	message = binary.BigEndian.AppendUint16(message, target.port)
+	return append(message, payload...)
+}
+
+// relayMessage carries one packet of an already-registered flow over the
+// tunnel. It names the flow by id alone: the destination was settled by the
+// registration, and repeating it on every packet would only give a server the
+// chance to be told two different ones.
+func (f *hybridQUICFlow) relayMessage(payload []byte) []byte {
+	message := make([]byte, 0, 21+len(payload))
+	message = append(message, hybridQUICMagic...)
+	message = append(message, hybridQUICRelay)
+	message = append(message, f.id[:]...)
 	return append(message, payload...)
 }
 
@@ -383,6 +484,15 @@ func (f *hybridQUICFlow) readRaw() {
 		// the address the server resolved, which is also what its replies over
 		// the tunnel were attributed to, so both paths label a datagram the
 		// same way and the sender's mapping resolves either one.
+		// Something came back on the raw path, so the server matched this
+		// flow and the tunnel copy of each packet can stop.
+		f.owner.mu.Lock()
+		if f.phase != hybridPhaseRaw {
+			f.phase = hybridPhaseRaw
+			log.Debugln("[HY2] hybrid QUIC raw path live for %s", f.target)
+		}
+		f.owner.mu.Unlock()
+
 		reported := f.reportAddr()
 		data := append([]byte(nil), buffer[:n]...)
 		f.owner.deliver(hybridQUICRead{data: data, target: reported})
@@ -528,6 +638,17 @@ type hybridControlAddr struct{}
 
 func (hybridControlAddr) Network() string { return "udp" }
 func (hybridControlAddr) String() string  { return hybridQUICControlAddress }
+
+// isQUICLongHeader reports whether this packet belongs to the handshake. Every
+// one of them travels over the tunnel, so the raw path carries 1-RTT packets
+// and nothing else.
+func isQUICLongHeader(packet []byte) bool {
+	if len(packet) < 5 || packet[0]&0xc0 != 0xc0 {
+		return false
+	}
+	// A version of zero is Version Negotiation, which only a server sends.
+	return binary.BigEndian.Uint32(packet[1:5]) != 0
+}
 
 func isQUICInitial(packet []byte) bool {
 	if len(packet) < 5 || packet[0]&0xc0 != 0xc0 {
