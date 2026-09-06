@@ -28,6 +28,7 @@ import (
 	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/sniffer"
 	"github.com/metacubex/mihomo/component/trie"
+	"github.com/metacubex/mihomo/component/tunneldns"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
@@ -339,6 +340,9 @@ func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
 }
 
 func updateProxies(proxies map[string]C.Proxy, providers map[string]P.ProxyProvider) {
+	// The proxy set is being replaced, so what was learned about the old one --
+	// which nodes answer tunnel DNS -- no longer describes anything.
+	tunneldns.Reset()
 	tunnel.UpdateProxies(proxies, providers)
 }
 
