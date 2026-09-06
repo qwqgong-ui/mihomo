@@ -188,6 +188,13 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 				} else {
 					ctx.SetType(icontext.DNSTypeRaw)
 					msg, err = serviceResolver.ExchangeContext(ctx, r)
+					if err != nil {
+						// A service resolver that could not be reached must not
+						// be worse than having none configured: fall through to
+						// the ordinary path rather than failing the query.
+						log.Debugln("[DNS] fakeip service resolver failed for %s, falling back: %v", host, err)
+						msg, err = next(ctx, r)
+					}
 				}
 				if err != nil {
 					return msg, err

@@ -552,10 +552,40 @@ func NewResolverFromClient(client dnsClient) *Resolver {
 
 // NewFakeIPServiceResolver returns the built-in resolver used only for
 // SVCB/HTTPS queries that are synthesized by fake-IP mode. Address queries
-// never reach this resolver. The DoH transport follows routing rules so the
-// query to 1.1.1.1 is carried by the selected proxy instead of local UDP DNS.
+// never reach this resolver.
+//
+// The record is asked of the proxy server the queried domain's own traffic
+// goes through, over the reserved tunnel destination. Only that server's view
+// counts: its answer is the one the connection is actually built on, and a
+// SVCB/HTTPS record carries ech keys and alpn that no address query can carry
+// back through the proxy.
+//
+// A server that does not serve the reserved destination falls back to a public
+// resolver -- sequentially, not as a race, and remembered per node, so it
+// costs one attempt per node instead of one per query and a domain only
+// reaches the public resolver when no server could answer for it.
 func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string, cacheMaxSize int) *Resolver {
-	return NewResolver(Config{
+	config := fakeIPServiceConfig(defaultServers, cacheAlgorithm, cacheMaxSize)
+
+	bootstrap := &Resolver{
+		main:  transform(config.Default, nil),
+		cache: config.newCache(),
+	}
+	public := transform(config.Main, bootstrap)
+
+	return &Resolver{
+		ipv6:            true,
+		main:            []dnsClient{newTunnelFirstClient(newTunnelClient(), public[0])},
+		cache:           config.newCache(),
+		defaultResolver: bootstrap,
+	}
+}
+
+// fakeIPServiceConfig describes the public fallback. It is only reached for a
+// domain whose node cannot answer, and it follows routing rules so it is
+// carried by the selected proxy rather than by local UDP DNS.
+func fakeIPServiceConfig(defaultServers []NameServer, cacheAlgorithm string, cacheMaxSize int) Config {
+	return Config{
 		Main: []NameServer{{
 			Net:       "https",
 			Addr:      "https://1.1.1.1:443/dns-query",
@@ -566,7 +596,7 @@ func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string
 		IPv6:           true,
 		CacheAlgorithm: cacheAlgorithm,
 		CacheMaxSize:   cacheMaxSize,
-	}).Resolver
+	}
 }
 
 func NewResolver(config Config) (rs Resolvers) {

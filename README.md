@@ -176,7 +176,28 @@ Patches:
 
 ## Built-in Fake-IP Service Record Resolver
 
-Fake-IP 模式下仅 SVCB/HTTPS（TYPE64/65）使用内置 `https://1.1.1.1/dns-query`，且 DoH 连接按 `RULES` 走代理。A/AAAA 仍由 fake-IP 池本地合成，主 `nameserver`、`direct-nameserver` 和 `proxy-server-nameserver` 语义不变。
+Fake-IP 模式下仅 SVCB/HTTPS（TYPE64/65）走独立解析器。这类记录含 `ech` 公钥、`alpn` 等无法本地合成的内容，必须取回真实应答后仅改写地址提示。A/AAAA 仍由 fake-IP 池本地合成，主 `nameserver`、`direct-nameserver` 和 `proxy-server-nameserver` 语义不变。
+
+记录**向该域名自己会走的那台代理服务端要**，因为只有那台服务端的视角才是这条连接真正据以建立的：
+
+```
+example.com HTTPS(TYPE65)
+   ↓ 按 example.com 正常匹配规则
+JP-01
+   ↓ 从 JP-01 的隧道拨保留目的地
+server-dns.invalid:53
+   ↓ 隧道里就是一个普通 DNS Query
+JP-01 的 Xray 在 dispatcher 层内部接收，交给它自己的 DNS 解析器
+   ↓ 普通 DNS Response 原路返回
+mihomo 改写地址提示为 fake-IP
+```
+
+要点：
+
+- **节点由真实域名决定，不由保留名决定。** `server-dns.invalid` 只是隧道内部地址，不参与规则匹配、不参与 DNS 解析。拿它去匹配规则会选出第二个不相干的节点，答回来的记录没有任何连接会用到。
+- **隧道里是标准 DNS 报文**，没有自定义 header、状态码、名字编码或记录格式；应答用 `miekg/dns` 直接解析。名字在 `.invalid` TLD（RFC 6761），永不解析、永不上线。
+- **服务端只答 A/AAAA/SVCB/HTTPS、CLASS IN、单问题、Opcode QUERY**，其余一律 `REFUSED`。它解析问题后调自己的 DNS 栈再构造应答，不把报文原样转发给上游——上游用 UDP 还是 DoH、要不要 TCP 重试，都留在服务端内部。
+- **回退是顺序的，不是竞速。** 节点答不了（连不上、`REFUSED`、超时）才退回公共 `https://1.1.1.1/dns-query`，且按节点记住结论 5 分钟，所以一台不支持的服务端只探一次而不是每次查询都探。服务端答了的域名不会再被送去公共解析器。
 
 Patches:
 
