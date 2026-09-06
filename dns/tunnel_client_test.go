@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/component/fakeip"
+	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/tunneldns"
 	C "github.com/metacubex/mihomo/constant"
+	icontext "github.com/metacubex/mihomo/context"
 
 	D "github.com/miekg/dns"
 )
@@ -202,12 +207,13 @@ func TestTunnelClientKeepsARealAnswer(t *testing.T) {
 	}
 }
 
-// The public resolver is only reached when the node could not answer, and the
-// two are never asked together: a domain the server answered for is never sent
-// anywhere else.
+// The public resolver is only reached when the node could not answer. The two
+// are never asked together -- not even started together -- so a domain the
+// server answered for is never sent anywhere else. Racing them would leak
+// every queried name to the public resolver regardless of who won.
 func TestTunnelFirstClientFallsBackOnlyOnFailure(t *testing.T) {
 	served := new(D.Msg)
-	public := &countingClient{msg: new(D.Msg)}
+	public := &countingClient{msg: new(D.Msg), entered: make(chan struct{}, 1)}
 
 	client := newTunnelFirstClient(&countingClient{msg: served}, public)
 	got, err := client.ExchangeContext(context.Background(), httpsQuery("example.com"))
@@ -217,8 +223,15 @@ func TestTunnelFirstClientFallsBackOnlyOnFailure(t *testing.T) {
 	if got != served {
 		t.Fatal("the server's answer must be used")
 	}
-	if public.calls != 0 {
+	// A parallel query would have been started before the tunnel returned, so
+	// give one that was started time to arrive rather than assuming it has.
+	select {
+	case <-public.entered:
 		t.Fatal("the public resolver must not see a domain the server answered for")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if got := public.calls.Load(); got != 0 {
+		t.Fatalf("public calls = %d, want 0", got)
 	}
 
 	failing := &countingClient{err: errors.New("unsupported")}
@@ -226,8 +239,8 @@ func TestTunnelFirstClientFallsBackOnlyOnFailure(t *testing.T) {
 	if _, err := client.ExchangeContext(context.Background(), httpsQuery("example.com")); err != nil {
 		t.Fatalf("fallback: %v", err)
 	}
-	if public.calls != 1 {
-		t.Fatalf("public calls = %d, want 1", public.calls)
+	if got := public.calls.Load(); got != 1 {
+		t.Fatalf("public calls = %d, want 1", got)
 	}
 }
 
@@ -242,7 +255,7 @@ func TestTunnelFirstClientDoesNotFallBackOnCancellation(t *testing.T) {
 	if _, err := client.ExchangeContext(ctx, httpsQuery("example.com")); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if public.calls != 0 {
+	if got := public.calls.Load(); got != 0 {
 		t.Fatal("a cancelled query must not be re-sent to the public resolver")
 	}
 }
@@ -254,16 +267,132 @@ func TestTunnelClientAddress(t *testing.T) {
 }
 
 type countingClient struct {
-	msg   *D.Msg
-	err   error
-	calls int
+	msg     *D.Msg
+	err     error
+	calls   atomic.Int32
+	entered chan struct{}
 }
 
 func (c *countingClient) ExchangeContext(_ context.Context, _ *D.Msg) (*D.Msg, error) {
-	c.calls++
+	c.calls.Add(1)
+	if c.entered != nil {
+		select {
+		case c.entered <- struct{}{}:
+		default:
+		}
+	}
 	return c.msg, c.err
 }
 func (c *countingClient) Address() string  { return "counting" }
 func (c *countingClient) ResetConnection() {}
 
-var _ = time.Second
+// stubResolver stands in for the fake-IP service resolver.
+type stubResolver struct {
+	resolver.Resolver
+	msg   *D.Msg
+	err   error
+	calls atomic.Int32
+}
+
+func (r *stubResolver) ExchangeContext(_ context.Context, _ *D.Msg) (*D.Msg, error) {
+	r.calls.Add(1)
+	return r.msg, r.err
+}
+
+// A service resolver that could not be reached must not be worse than having
+// none configured. Before this, one unreachable resolver turned every
+// SVCB/HTTPS query into a failure -- so configuring it made things strictly
+// worse than leaving it out.
+func TestFakeIPFallsThroughWhenTheServiceResolverFails(t *testing.T) {
+	fakePool := newTestFakeIPPool(t, "198.18.0.0/16")
+	service := &stubResolver{err: errors.New("no node could answer")}
+
+	ordinary := new(D.Msg)
+	ordinary.Answer = []D.RR{mustRR(t, `example.com. 60 IN HTTPS 1 . alpn="h3"`)}
+	nextCalls := 0
+	next := func(_ *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
+		nextCalls++
+		reply := ordinary.Copy()
+		reply.SetReply(r)
+		reply.Answer = ordinary.Answer
+		return reply, nil
+	}
+
+	handler := withFakeIP(&fakeip.Skipper{}, fakePool, nil, 1, service)(next)
+
+	query := new(D.Msg)
+	query.SetQuestion("example.com.", D.TypeHTTPS)
+	msg, err := handler(icontext.NewDNSContext(context.Background()), query)
+	if err != nil {
+		t.Fatalf("the query must not fail because the service resolver did: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("the ordinary path must have produced an answer")
+	}
+	if service.calls.Load() != 1 {
+		t.Fatalf("service resolver calls = %d, want 1", service.calls.Load())
+	}
+	if nextCalls != 1 {
+		t.Fatalf("ordinary path calls = %d, want 1", nextCalls)
+	}
+}
+
+// A service resolver that answered is used; the ordinary path is not consulted
+// to second-guess it.
+func TestFakeIPUsesTheServiceResolverWhenItAnswers(t *testing.T) {
+	fakePool := newTestFakeIPPool(t, "198.18.0.0/16")
+
+	served := new(D.Msg)
+	served.Answer = []D.RR{mustRR(t, `example.com. 60 IN HTTPS 1 . alpn="h2" ipv4hint=192.0.2.10`)}
+	service := &stubResolver{msg: served}
+
+	nextCalls := 0
+	next := func(_ *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
+		nextCalls++
+		return r.Copy(), nil
+	}
+
+	handler := withFakeIP(&fakeip.Skipper{}, fakePool, nil, 1, service)(next)
+
+	query := new(D.Msg)
+	query.SetQuestion("example.com.", D.TypeHTTPS)
+	msg, err := handler(icontext.NewDNSContext(context.Background()), query)
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+	if nextCalls != 0 {
+		t.Fatal("an answered query must not also go down the ordinary path")
+	}
+	if len(msg.Answer) != 1 {
+		t.Fatalf("answers = %d, want the served record", len(msg.Answer))
+	}
+	// The hint is rewritten to a fake IP; the rest of the record is the
+	// server's, untouched.
+	https, ok := msg.Answer[0].(*D.HTTPS)
+	if !ok {
+		t.Fatalf("answer = %T, want an HTTPS record", msg.Answer[0])
+	}
+	var sawFakeHint bool
+	for _, value := range https.Value {
+		if hint, is := value.(*D.SVCBIPv4Hint); is {
+			for _, ip := range hint.Hint {
+				addr, _ := netip.AddrFromSlice(ip.To4())
+				if fakePool.IPNet().Contains(addr) {
+					sawFakeHint = true
+				}
+			}
+		}
+	}
+	if !sawFakeHint {
+		t.Fatal("the address hint must be rewritten into the fake-IP pool")
+	}
+}
+
+func mustRR(t *testing.T, text string) D.RR {
+	t.Helper()
+	rr, err := D.NewRR(text)
+	if err != nil {
+		t.Fatalf("rr: %v", err)
+	}
+	return rr
+}

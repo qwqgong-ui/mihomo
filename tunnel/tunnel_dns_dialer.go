@@ -29,15 +29,8 @@ var ErrTunnelDNSUnsupported = errors.New("the selected node does not serve tunne
 // instead would pick a second, unrelated node and answer with a record nothing
 // is ever built on -- and would resolve a name that has no address anywhere.
 func DialTunnelDNS(ctx context.Context, queryDomain string) (net.Conn, string, error) {
-	if queryDomain == "" {
-		return nil, "", fmt.Errorf("tunnel DNS needs a domain to select a node with")
-	}
-
-	// Selection runs against the destination the client actually wants, on the
-	// port its traffic would use, so a port or domain rule places this query
-	// exactly where it places that traffic.
-	match := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
-	if err := match.SetRemoteAddress(net.JoinHostPort(queryDomain, "443")); err != nil {
+	match, err := tunnelDNSMatchTarget(queryDomain)
+	if err != nil {
 		return nil, "", err
 	}
 	proxy, rule, err := resolveMetadata(match)
@@ -45,12 +38,14 @@ func DialTunnelDNS(ctx context.Context, queryDomain string) (net.Conn, string, e
 		return nil, "", err
 	}
 
-	node := leafProxy(proxy, match)
-	if !node.Type().CanServeTunnelDNS() {
-		return nil, node.Name(), fmt.Errorf("%w: %s is local", ErrTunnelDNSUnsupported, node.Name())
+	if proxy == nil {
+		// No rule placed this domain anywhere, so there is no node to ask.
+		return nil, "", fmt.Errorf("%w: %s matched no proxy", ErrTunnelDNSUnsupported, queryDomain)
 	}
-	if !tunneldns.Supported(node.Name()) {
-		return nil, node.Name(), fmt.Errorf("%w: %s did not answer recently", ErrTunnelDNSUnsupported, node.Name())
+
+	node := leafProxy(proxy, match)
+	if err := tunnelDNSNodeUsable(node); err != nil {
+		return nil, node.Name(), err
 	}
 
 	metadata := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
@@ -65,6 +60,43 @@ func DialTunnelDNS(ctx context.Context, queryDomain string) (net.Conn, string, e
 	logMetadata(metadata, rule, conn.Chains())
 
 	return statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, rule, 0, 0, false), node.Name(), nil
+}
+
+// tunnelDNSMatchTarget is the destination node selection runs against: the one
+// the client actually wants, on the port its traffic would use, so a port or
+// domain rule places this query exactly where it places that traffic.
+//
+// It is never the reserved name. That name has no address anywhere and belongs
+// to no rule, so matching on it would pick some unrelated node and answer with
+// a record no connection is built on.
+func tunnelDNSMatchTarget(queryDomain string) (*C.Metadata, error) {
+	if queryDomain == "" {
+		return nil, errors.New("tunnel DNS needs a domain to select a node with")
+	}
+	match := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
+	if err := match.SetRemoteAddress(net.JoinHostPort(queryDomain, "443")); err != nil {
+		return nil, err
+	}
+	return match, nil
+}
+
+// tunnelDNSNode is the part of a proxy this decision depends on.
+type tunnelDNSNode interface {
+	Name() string
+	Type() C.AdapterType
+}
+
+// tunnelDNSNodeUsable reports whether node can be asked at all: it needs a
+// proxy server behind it, and it must not already have been found not to serve
+// the reserved destination.
+func tunnelDNSNodeUsable(node tunnelDNSNode) error {
+	if !node.Type().CanServeTunnelDNS() {
+		return fmt.Errorf("%w: %s is local", ErrTunnelDNSUnsupported, node.Name())
+	}
+	if !tunneldns.Supported(node.Name()) {
+		return fmt.Errorf("%w: %s did not answer recently", ErrTunnelDNSUnsupported, node.Name())
+	}
+	return nil
 }
 
 // leafProxy walks a group down to the adapter that actually holds the
