@@ -22,11 +22,12 @@ type virtualPacket struct {
 }
 
 type virtualPacketConn struct {
-	mu      sync.Mutex
-	written []virtualPacket
-	reads   chan virtualPacket
-	closed  chan struct{}
-	once    sync.Once
+	mu       sync.Mutex
+	written  []virtualPacket
+	writeErr error
+	reads    chan virtualPacket
+	closed   chan struct{}
+	once     sync.Once
 }
 
 func newVirtualPacketConn() *virtualPacketConn {
@@ -38,9 +39,21 @@ func newVirtualPacketConn() *virtualPacketConn {
 
 func (c *virtualPacketConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
 	c.mu.Lock()
+	if err := c.writeErr; err != nil {
+		c.mu.Unlock()
+		return 0, err
+	}
 	c.written = append(c.written, virtualPacket{data: append([]byte(nil), payload...), addr: addr})
 	c.mu.Unlock()
 	return len(payload), nil
+}
+
+// failWrites makes every later write fail, which is how a raw socket that has
+// stopped working looks from the flow.
+func (c *virtualPacketConn) failWrites(err error) {
+	c.mu.Lock()
+	c.writeErr = err
+	c.mu.Unlock()
 }
 
 func (c *virtualPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
