@@ -29,14 +29,21 @@ const (
 	hybridQUICAck     = byte(2)
 	hybridQUICRelay   = byte(3)
 
-	// hybridHandoverTimeout and hybridHandoverPackets bound the window in which
-	// a flow sends its 1-RTT packets over both paths. Both have to be exceeded
-	// before the raw path is written off: a burst can put eight packets on the
-	// wire in less than the round trip an answer needs, and an application that
-	// sends one packet and waits has not given the path a fair chance however
-	// long it waits.
-	hybridHandoverTimeout = 1500 * time.Millisecond
-	hybridHandoverPackets = 8
+	// A flow that has not moved to the raw path yet sends its 1-RTT packets over
+	// the tunnel and puts a copy of one of them on the raw path now and then.
+	// One copy is all it takes to bind: the relay matches a raw packet by the
+	// connection ID the target chose, and it has held that ID since it forwarded
+	// the target's handshake reply, which is necessarily before the first 1-RTT
+	// packet exists. An ablation against a real quic-go target confirms the very
+	// first raw packet always names an ID the relay already holds
+	// (transport/internet/hysteria/hybrid_ablation_test.go in Xray-core), so
+	// duplicating a whole round trip of traffic to cover a race that does not
+	// happen only cost bandwidth. The repeat is here because a single probe can
+	// be lost, not because binding is uncertain.
+	hybridProbeInterval = 250 * time.Millisecond
+	// hybridProbeTimeout is when a flow gives up on the raw path and lives out
+	// its life on the tunnel.
+	hybridProbeTimeout = 3 * time.Second
 
 	// hybridRawSilence is how long a live raw path may go quiet before the flow
 	// stops trusting it. The path can fail long after it started working: the
@@ -152,11 +159,13 @@ type hybridQUICFlow struct {
 	// case where continuing on the raw path would black-hole the connection.
 	registered bool
 	rejected   bool
-	// phase tracks the handover from the tunnel to the raw path. Guarded by
+	// phase tracks the move from the tunnel to the raw path. Guarded by
 	// owner.mu.
-	phase          hybridPhase
-	handoverExpiry time.Time
-	handoverSent   int
+	phase hybridPhase
+	// probeDeadline is when probing stops; nextProbe is when the next 1-RTT
+	// packet is also copied to the raw path. Guarded by owner.mu.
+	probeDeadline time.Time
+	nextProbe     time.Time
 	// resolved is the address the server reported for a registered name, and is
 	// what the raw path's replies are labelled with. Guarded by owner.mu.
 	resolved netip.AddrPort
@@ -166,20 +175,30 @@ type hybridQUICFlow struct {
 }
 
 // hybridPhase is where a flow is in the move from the tunnel to the raw path.
-// A flow starts on the tunnel, sends its first 1-RTT packets over both paths
-// until one comes back raw, and only then leaves the tunnel behind. Sending on
-// both is what keeps a flow the server could not match on the raw path alive
-// rather than black-holed, and the overlap costs only duplicate packet numbers,
-// which QUIC discards.
+// A flow starts on the tunnel and stays there, probing the raw path with a copy
+// of the occasional packet, until one comes back raw; only then does it leave
+// the tunnel behind. Nothing is ever black-holed on the way: every packet is on
+// the tunnel until the raw path has proved itself, and the probe costs one
+// duplicate packet number, which QUIC discards.
 type hybridPhase int
 
 const (
 	hybridPhaseTunnel hybridPhase = iota
-	hybridPhaseHandover
 	hybridPhaseRaw
-	// hybridPhaseStuck is a handover that timed out. The raw socket stays open
+	// hybridPhaseStuck is a raw path that never answered. The socket stays open
 	// but unused; the flow lives out its life on the tunnel.
 	hybridPhaseStuck
+)
+
+// hybridPath is what one 1-RTT packet does with a flow's two paths.
+type hybridPath int
+
+const (
+	hybridPathTunnel hybridPath = iota
+	// hybridPathProbe is the tunnel, plus a copy on the raw path. The copy is
+	// what the relay binds on.
+	hybridPathProbe
+	hybridPathRaw
 )
 
 // reportAddrLocked is the address a datagram off the raw path is attributed to.
@@ -283,91 +302,99 @@ func (c *hybridQUICPacketConn) WriteTo(payload []byte, destination net.Addr) (in
 		return c.writeFallback(payload, destination)
 	}
 
-	// A 1-RTT packet, and with it the handover. The raw path cannot be trusted
-	// until something has come back on it: the server matches a raw packet by
-	// the connection ID the target chose, and a target that rotates early or
-	// uses a zero-length ID is one it will never match. So the flow sends on
-	// both paths until the raw one answers, and gives up on it if none does.
-	switch c.handoverPhase(flow) {
-	case hybridPhaseRaw:
+	// A 1-RTT packet, and with it the move to the raw path. Every packet is on
+	// the tunnel until the raw path has answered; the raw path is tried with a
+	// copy of the occasional one until it does.
+	switch c.choosePath(flow) {
+	case hybridPathRaw:
 		if _, err := flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay)); err != nil {
 			// The tunnel is a separate path and may well be fine, so a raw
 			// socket that has stopped accepting writes costs the flow its raw
-			// path, not its connection. Sending on both from here on is what
-			// lets it come back if the failure was transient.
+			// path, not its connection.
 			log.Debugln("[HY2] hybrid QUIC raw write failed for %s, falling back to the tunnel: %v", flow.target, err)
-			c.demoteToHandover(flow)
+			c.demoteToTunnel(flow)
 			if controlErr := c.writeControl(flow.relayMessage(payload)); controlErr != nil {
 				return 0, controlErr
 			}
 		}
 		return len(payload), nil
-	case hybridPhaseStuck:
+	case hybridPathProbe:
 		if err := c.writeControl(flow.relayMessage(payload)); err != nil {
 			return 0, err
 		}
+		// The probe is what the relay binds on. Failing to send it is not
+		// fatal: the tunnel already carried the packet, and the next probe
+		// tries again.
+		_, _ = flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
 		return len(payload), nil
 	default:
 		if err := c.writeControl(flow.relayMessage(payload)); err != nil {
 			return 0, err
 		}
-		// A failure here is not fatal: the tunnel copy has already been sent,
-		// so the packet is delivered either way.
-		_, _ = flow.raw.WriteTo(payload, net.UDPAddrFromAddrPort(c.relay))
 		return len(payload), nil
 	}
 }
 
-// handoverPhase reports where the flow is in the move to the raw path, starting
-// the handover on the first 1-RTT packet and abandoning it once the window has
-// passed with nothing received.
-func (c *hybridQUICPacketConn) handoverPhase(flow *hybridQUICFlow) hybridPhase {
+// choosePath reports which of a flow's two paths this 1-RTT packet takes, and
+// moves the flow between phases on the way: it starts probing on the first
+// packet, gives up once the window has passed with nothing received, and drops
+// a raw path that has gone quiet.
+func (c *hybridQUICPacketConn) choosePath(flow *hybridQUICFlow) hybridPath {
+	now := time.Now()
 	c.mu.Lock()
 	var note string
+	path := hybridPathTunnel
 	switch flow.phase {
 	case hybridPhaseTunnel:
-		flow.phase = hybridPhaseHandover
-		flow.handoverExpiry = time.Now().Add(hybridHandoverTimeout)
-	case hybridPhaseHandover:
-		flow.handoverSent++
-		if flow.handoverSent >= hybridHandoverPackets && time.Now().After(flow.handoverExpiry) {
+		if flow.probeDeadline.IsZero() {
+			flow.probeDeadline = now.Add(hybridProbeTimeout)
+		}
+		switch {
+		case now.After(flow.probeDeadline):
 			flow.phase = hybridPhaseStuck
 			note = "[HY2] hybrid QUIC raw path never answered for %s, staying on the tunnel"
+		case !now.Before(flow.nextProbe):
+			flow.nextProbe = now.Add(hybridProbeInterval)
+			path = hybridPathProbe
 		}
 	case hybridPhaseRaw:
 		// A path that worked once is not a path that works now. Going quiet for
 		// this long is how a reclaimed flow or a moved NAT mapping looks from
 		// here, and both black-hole every packet until something checks.
 		if time.Since(flow.lastRaw) > hybridRawSilence {
-			note = "[HY2] hybrid QUIC raw path went quiet for %s, sending on both paths again"
-			flow.restartHandoverLocked()
+			note = "[HY2] hybrid QUIC raw path went quiet for %s, going back to the tunnel"
+			flow.restartProbingLocked(now)
+			path = hybridPathProbe
+			flow.nextProbe = now.Add(hybridProbeInterval)
+		} else {
+			path = hybridPathRaw
 		}
 	}
-	phase := flow.phase
 	c.mu.Unlock()
 	// A log line is a blocking send on mihomo's log channel, so it stays
 	// outside the lock every write on this connection has to take.
 	if note != "" {
 		log.Debugln(note, flow.target)
 	}
-	return phase
+	return path
 }
 
-// demoteToHandover puts a flow that had settled on the raw path back on both,
-// so the tunnel carries it while the raw path is given another chance.
-func (c *hybridQUICPacketConn) demoteToHandover(flow *hybridQUICFlow) {
+// demoteToTunnel puts a flow that had settled on the raw path back on the
+// tunnel, where it probes again and either recovers or stays.
+func (c *hybridQUICPacketConn) demoteToTunnel(flow *hybridQUICFlow) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if flow.phase == hybridPhaseRaw {
-		flow.restartHandoverLocked()
+		flow.restartProbingLocked(time.Now())
 	}
 }
 
-// restartHandoverLocked reopens the handover window. Callers hold owner.mu.
-func (f *hybridQUICFlow) restartHandoverLocked() {
-	f.phase = hybridPhaseHandover
-	f.handoverSent = 0
-	f.handoverExpiry = time.Now().Add(hybridHandoverTimeout)
+// restartProbingLocked reopens the window in which the raw path is tried.
+// Callers hold owner.mu.
+func (f *hybridQUICFlow) restartProbingLocked(now time.Time) {
+	f.phase = hybridPhaseTunnel
+	f.probeDeadline = now.Add(hybridProbeTimeout)
+	f.nextProbe = time.Time{}
 	f.lastRaw = time.Time{}
 }
 

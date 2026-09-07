@@ -89,6 +89,9 @@ func TestHybridClientLeavesASilentRawPath(t *testing.T) {
 	flow.lastRaw = time.Now().Add(-hybridRawSilence - time.Second)
 	h.conn.mu.Unlock()
 
+	// The next packet goes back on the tunnel, with a copy probing the raw
+	// path, so nothing is lost while the flow works out whether it recovered.
+
 	tunnelBefore = len(h.hy2.sent())
 	rawBefore := len(h.raw.sent())
 	if _, err := h.conn.WriteTo(hybrid1RTTPacket(), destination); err != nil {
@@ -98,13 +101,13 @@ func TestHybridClientLeavesASilentRawPath(t *testing.T) {
 		t.Fatal("a flow whose raw path went quiet did not go back to the tunnel")
 	}
 	if len(h.raw.sent()) <= rawBefore {
-		t.Fatal("a flow whose raw path went quiet stopped trying it altogether")
+		t.Fatal("a flow whose raw path went quiet stopped probing it altogether")
 	}
 	h.conn.mu.Lock()
 	phase := flow.phase
 	h.conn.mu.Unlock()
-	if phase != hybridPhaseHandover {
-		t.Fatalf("phase = %d, want the handover", phase)
+	if phase != hybridPhaseTunnel {
+		t.Fatalf("phase = %d, want the tunnel", phase)
 	}
 	if len(h.fallback.sent()) != 0 {
 		t.Fatal("a registered flow used the fallback path")
@@ -137,8 +140,8 @@ func TestHybridClientSurvivesARawWriteFailure(t *testing.T) {
 	h.conn.mu.Lock()
 	phase := flow.phase
 	h.conn.mu.Unlock()
-	if phase != hybridPhaseHandover {
-		t.Fatalf("phase = %d, want the handover", phase)
+	if phase != hybridPhaseTunnel {
+		t.Fatalf("phase = %d, want the tunnel", phase)
 	}
 }
 
