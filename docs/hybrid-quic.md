@@ -1,0 +1,51 @@
+# Generic hybrid QUIC
+
+Enable hybrid on the already selected proxy node:
+
+```yaml
+proxies:
+  - name: first-xray
+    type: vless
+    server: FIRST_XRAY_ADDRESS
+    port: 443
+    uuid: YOUR_UUID
+    udp: true
+    hybrid-quic: true
+    # Keep this node's existing TLS/transport settings.
+```
+
+The option is disabled by default and is shared by domain-preserving stream
+proxies, including VLESS, Trojan, Shadowsocks and HY2. It is no longer a HY2
+option. IP-only tunnels and direct/reject nodes cannot enable it.
+
+Rules select this node using the application's real target. The wrapper then
+opens `hybrid-quic.invalid:443` through the node's existing stream dialer without
+running rules on the marker. QUIC handshakes and fallback datagrams travel over
+that stream, with their UDP boundaries preserved. Raw short-header packets go
+directly to the endpoint returned by the terminal Xray, using the node's normal
+interface/routing-mark options. Raw never uses a dialer-proxy.
+
+For `mihomo -> Xray -> Xray`, configure the first Xray's `forwardOutbounds` and
+the terminal's `trustedForwardInbounds`, `listen` and `advertise` as described in
+[Xray's configuration guide](https://github.com/qwqgong-ui/Xray-core/blob/claude/hy2-hybrid-review-c2jv99/docs/hybrid-quic.md).
+The terminal supplies the raw endpoint and learns the original client address
+through the explicitly trusted chain. The intermediate Xray routes on the real
+UDP target, including its domain, and does not terminate the flow when forwarding.
+
+Only public UDP 443 targets beginning with a QUIC Initial use hybrid. Other UDP
+uses the node's native datagram support. Fake-IP names stay names until the
+terminal resolves them. DNS mapping/hosts mode retains a selected real IP.
+
+A successful raw reply activates raw. Probe timeout, raw socket failure, or
+15 seconds without a raw reply permanently returns both directions to the
+stream. Late raw packets cannot reactivate it, even after the network recovers.
+The timeout also applies to idle raw flows. A 30-second stream keepalive protects
+against proxy idle timeouts; closing the packet connection closes all its streams
+and the terminal releases their targets/CIDs/raw bindings immediately.
+
+This wire protocol is `HQS1` and is incompatible with the removed `HQV3` HY2
+control protocol. Upgrade both sides and explicitly enable the option. There is
+no independent flow ID, registration retry, TTL-based flow cleanup or automatic
+raw recovery. TCP-based fallback has TCP head-of-line blocking. Transparent
+proxies/NATs that give raw a different source IP from the first tunnel connection
+cannot bind raw and continue using the reliable stream.
