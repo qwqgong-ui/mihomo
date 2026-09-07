@@ -348,6 +348,12 @@ func TestProgressiveDirectRacesBothCachedWinners(t *testing.T) {
 	if elapsed >= minFastPathTimeout {
 		t.Fatalf("dial took %s; the second winner was not raced alongside the first", elapsed)
 	}
+	// The black hole is dialled by a goroutine the returning dial does not wait
+	// for: the spare winner answers immediately, so directProgressiveDialContext
+	// can return before the dead one's attempt has been recorded. Wait for both
+	// to land before asserting that each was tried exactly once.
+	waitForAttemptCount(t, dial, deadIP, 1)
+	waitForAttemptCount(t, dial, spareIP, 1)
 	if dial.count(deadIP) != 1 || dial.count(spareIP) != 1 {
 		t.Fatalf("attempt counts = dead:%d spare:%d; want 1 and 1", dial.count(deadIP), dial.count(spareIP))
 	}
