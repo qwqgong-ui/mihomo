@@ -62,7 +62,6 @@ type Hysteria2Option struct {
 	BBRProfile        string     `proxy:"bbr-profile,omitempty"`
 	UdpMTU            int        `proxy:"udp-mtu,omitempty"`
 	HandshakeTimeout  int        `proxy:"handshake-timeout,omitempty"`
-	HybridQUIC        *bool      `proxy:"hybrid-quic,omitempty"`
 
 	RealmOpts Hysteria2RealmOption `proxy:"realm-opts,omitempty"`
 
@@ -98,24 +97,6 @@ func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 	return NewConn(c, h), nil
 }
 
-func (h *Hysteria2) hybridQUICEnabled() bool {
-	// Port hopping moves the tunnel to a fresh port every hop interval, and
-	// even the first connection picks a random one out of `ports` rather than
-	// `port`. The raw relay socket is pinned to a single port for the life of
-	// the flow, so it would both miss the server the registration landed on
-	// and turn the bulk of the traffic into exactly the stable high-volume
-	// flow that `ports` exists to avoid. With only `ports` set, `port` is
-	// legitimately 0, which would silently pin the relay to port 0.
-	//
-	// A relay port other than 443 is refused for the same reason the target
-	// side is: raw QUIC to 443 is indistinguishable from ordinary traffic,
-	// raw QUIC to anything else is not.
-	if h.option.Ports != "" || h.option.Port != 443 {
-		return false
-	}
-	return h.option.HybridQUIC == nil || *h.option.HybridQUIC
-}
-
 func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
@@ -126,30 +107,6 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	}
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
-	}
-	defaultRoute := h.option.Interface == "" && h.option.RoutingMark == 0 && h.option.DialerProxy == "" && h.option.DialerForAPI == nil
-	// The destination is screened per packet in WriteTo, where the name a
-	// fake-IP flow carries is still intact; here it is enough that the port can
-	// be eligible at all.
-	if h.hybridQUICEnabled() && defaultRoute && metadata.DstPort == 443 {
-		relay, resolveErr := hybridRelayAddr(h.client)
-		if resolveErr == nil {
-			rawNetwork := "udp4"
-			if relay.Addr().Is6() {
-				rawNetwork = "udp6"
-			}
-			pc = newHybridQUICPacketConn(N.NewThreadSafePacketConn(pc), relay, func() (net.PacketConn, error) {
-				return h.dialer.ListenPacket(context.Background(), rawNetwork, "", relay)
-			}, func() (net.PacketConn, error) {
-				fallback, fallbackErr := h.client.ListenPacket(context.Background())
-				if fallbackErr != nil {
-					return nil, fallbackErr
-				}
-				return N.NewThreadSafePacketConn(fallback), nil
-			})
-			return NewPacketConn(pc, h), nil
-		}
-		log.Debugln("hysteria2 hybrid QUIC unavailable, using HY2: %v", resolveErr)
 	}
 	return NewPacketConn(N.NewThreadSafePacketConn(pc), h), nil
 }

@@ -238,6 +238,15 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		}
 	}
 
+	if enabled, _ := mapping["hybrid-quic"].(bool); enabled {
+		switch proxyType {
+		case "ss", "ssr", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic", "socks5", "http", "ssh", "anytls":
+			proxy = outbound.NewHybrid(proxy)
+		default:
+			return nil, fmt.Errorf("hybrid-quic requires a domain-preserving proxy stream, got: %s", proxyType)
+		}
+	}
+
 	proxy = outbound.NewAutoCloseProxyAdapter(proxy)
 	return NewProxy(proxy), nil
 }
