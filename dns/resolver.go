@@ -37,6 +37,7 @@ type result struct {
 }
 
 type Resolver struct {
+	domainClient          *domainClient
 	ipv6                  bool
 	ipv6Timeout           time.Duration
 	main                  []dnsClient
@@ -160,6 +161,9 @@ func (r *Resolver) ResolveECH(ctx context.Context, host string) ([]byte, error) 
 func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	if len(m.Question) == 0 {
 		return nil, errors.New("should have one question at least")
+	}
+	if r.domainClient != nil {
+		return r.domainClient.ExchangeContext(ctx, m)
 	}
 	continueFetch := false
 	defer func() {
@@ -408,6 +412,9 @@ func (r *Resolver) ClearCache() {
 }
 
 func (r *Resolver) ClearVolatileCache() {
+	if r != nil && r.domainClient != nil {
+		r.domainClient.cache.Clear()
+	}
 	if r != nil && r.cache != nil {
 		r.cache.Clear()
 	}
@@ -551,8 +558,8 @@ func NewResolverFromClient(client dnsClient) *Resolver {
 }
 
 // NewFakeIPServiceResolver returns the built-in resolver used only for
-// SVCB/HTTPS queries that are synthesized by fake-IP mode. Address queries
-// never reach this resolver.
+// address and SVCB/HTTPS queries in fake-IP mode. One node/domain bundle
+// is fetched before allocating a fake IP.
 //
 // The record is asked of the proxy server the queried domain's own traffic
 // goes through, over the reserved tunnel destination. Only that server's view
@@ -575,7 +582,8 @@ func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string
 
 	return &Resolver{
 		ipv6:            true,
-		main:            []dnsClient{newTunnelFirstClient(newTunnelClient(), public[0])},
+		main:            []dnsClient{public[0]},
+		domainClient:    newDomainClient(public[0], cacheMaxSize),
 		cache:           config.newCache(),
 		defaultResolver: bootstrap,
 	}

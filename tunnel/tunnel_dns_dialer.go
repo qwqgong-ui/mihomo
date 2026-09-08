@@ -29,37 +29,45 @@ var ErrTunnelDNSUnsupported = errors.New("the selected node does not serve tunne
 // instead would pick a second, unrelated node and answer with a record nothing
 // is ever built on -- and would resolve a name that has no address anywhere.
 func DialTunnelDNS(ctx context.Context, queryDomain string) (net.Conn, string, error) {
+	node, dial, err := PrepareTunnelDNS(queryDomain)
+	if err != nil {
+		return nil, node, err
+	}
+	conn, err := dial(ctx)
+	return conn, node, err
+}
+
+// PrepareTunnelDNS pins the selected leaf before cache lookup and dialing.
+// Reusing the group for dialing could select a different node for the reserved name.
+func PrepareTunnelDNS(queryDomain string) (string, func(context.Context) (net.Conn, error), error) {
 	match, err := tunnelDNSMatchTarget(queryDomain)
 	if err != nil {
-		return nil, "", err
+		return "", nil, err
 	}
 	proxy, rule, err := resolveMetadata(match)
 	if err != nil {
-		return nil, "", err
+		return "", nil, err
 	}
-
 	if proxy == nil {
-		// No rule placed this domain anywhere, so there is no node to ask.
-		return nil, "", fmt.Errorf("%w: %s matched no proxy", ErrTunnelDNSUnsupported, queryDomain)
+		return "", nil, fmt.Errorf("%w: %s matched no proxy", ErrTunnelDNSUnsupported, queryDomain)
 	}
-
 	node := leafProxy(proxy, match)
 	if err := tunnelDNSNodeUsable(node); err != nil {
-		return nil, node.Name(), err
+		return node.Name(), nil, err
 	}
-
-	metadata := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
-	if err := metadata.SetRemoteAddress(C.TunnelDNSAddress); err != nil {
-		return nil, node.Name(), err
-	}
-	conn, err := proxy.DialContext(ctx, metadata)
-	if err != nil {
-		logMetadataErr(metadata, rule, proxy, err)
-		return nil, node.Name(), err
-	}
-	logMetadata(metadata, rule, conn.Chains())
-
-	return statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, rule, 0, 0, false), node.Name(), nil
+	return node.Name(), func(ctx context.Context) (net.Conn, error) {
+		metadata := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
+		if err := metadata.SetRemoteAddress(C.TunnelDNSAddress); err != nil {
+			return nil, err
+		}
+		conn, err := node.DialContext(ctx, metadata)
+		if err != nil {
+			logMetadataErr(metadata, rule, node, err)
+			return nil, err
+		}
+		logMetadata(metadata, rule, conn.Chains())
+		return statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, rule, 0, 0, false), nil
+	}, nil
 }
 
 // tunnelDNSMatchTarget is the destination node selection runs against: the one

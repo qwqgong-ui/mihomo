@@ -160,6 +160,25 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 				return handleMsgWithNameError(r), nil
 			}
 
+			// The built-in resolver warms one complete node/domain bundle before
+			// the application can use the fake address. Third-party resolvers
+			// retain their previous behavior.
+			bundleTTL := uint32(fakeIPTTL)
+			if sr, ok := serviceResolver.(*Resolver); ok && sr != nil && sr.domainClient != nil &&
+				(q.Qtype == D.TypeA && fakePool != nil || q.Qtype == D.TypeAAAA && fakePool6 != nil) {
+				if answer, err := sr.ExchangeContext(ctx, r); err == nil {
+					for _, records := range [][]D.RR{answer.Answer, answer.Extra} {
+						for _, rr := range records {
+							if rr.Header().Rrtype != D.TypeOPT {
+								bundleTTL = min(bundleTTL, rr.Header().Ttl)
+							}
+						}
+					}
+				} else {
+					log.Debugln("[DNS] domain bundle unavailable for %s: %v", host, err)
+				}
+			}
+
 			var rr D.RR
 			switch q.Qtype {
 			case D.TypeA:
@@ -201,8 +220,19 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 				}
 				msg = msg.Copy()
 				msg.SetRcode(r, msg.Rcode)
-				if rewriteFakeIPServiceBindings(msg, fakePool, fakePool6, fakeIPTTL) {
+				serviceTTL := fakeIPTTL
+				if sr, ok := serviceResolver.(*Resolver); ok && sr != nil && sr.domainClient != nil {
+					for _, record := range msg.Answer {
+						serviceTTL = min(serviceTTL, int(record.Header().Ttl))
+					}
+				}
+				if rewriteFakeIPServiceBindings(msg, fakePool, fakePool6, serviceTTL) {
 					ctx.SetType(icontext.DNSTypeFakeIP)
+				}
+				if sr, ok := serviceResolver.(*Resolver); ok && sr != nil && sr.domainClient != nil {
+					for _, record := range msg.Answer {
+						record.Header().Ttl = min(record.Header().Ttl, uint32(max(serviceTTL, 0)))
+					}
 				}
 				return msg, nil
 			default:
@@ -213,7 +243,7 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			msg.Answer = []D.RR{rr}
 
 			ctx.SetType(icontext.DNSTypeFakeIP)
-			setMsgTTL(msg, uint32(fakeIPTTL))
+			setMsgTTL(msg, bundleTTL)
 			msg.SetRcode(r, D.RcodeSuccess)
 			msg.Authoritative = true
 			msg.RecursionAvailable = true
