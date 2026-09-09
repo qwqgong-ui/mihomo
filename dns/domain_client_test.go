@@ -144,11 +144,13 @@ func TestFakeIPv6UsesBundleTTLWhenServerOnlyHasIPv4(t *testing.T) {
 // directOnlyClient records what the `direct-nameserver` list is asked.
 type directOnlyClient struct {
 	calls    []uint16
+	request  *D.Msg
 	response *D.Msg
 }
 
 func (c *directOnlyClient) ExchangeContext(_ context.Context, request *D.Msg) (*D.Msg, error) {
 	c.calls = append(c.calls, request.Question[0].Qtype)
+	c.request = request.Copy()
 	response := c.response.Copy()
 	response.SetReply(request)
 	response.Answer = c.response.Answer
@@ -160,7 +162,7 @@ func localNodeClient(t *testing.T, direct directExchanger) (*domainClient, *reco
 	public := &recordingServiceClient{response: &D.Msg{}}
 	client := newDomainClient(public, direct, 10)
 	client.prepare = func(host string) (string, func(context.Context) (net.Conn, error), error) {
-		return "DIRECT", nil, fmt.Errorf("%w: DIRECT", tunnel.ErrTunnelDNSLocalNode)
+		return "DIRECT", nil, fmt.Errorf("%w: DIRECT", tunnel.ErrTunnelDNSDirectNode)
 	}
 	return client, public
 }
@@ -196,6 +198,8 @@ func TestLocalDomainServiceQueryDropsBundleOption(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, request.IsEdns0(), "the caller's own message must not be modified")
 	require.Len(t, request.IsEdns0().Option, 1)
+	require.NotNil(t, direct.request.IsEdns0())
+	require.Empty(t, direct.request.IsEdns0().Option, "the direct nameserver must not receive the tunnel-only option")
 }
 
 func TestLocalDomainWithoutDirectNameServerFallsThrough(t *testing.T) {

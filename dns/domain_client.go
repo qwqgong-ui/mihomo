@@ -65,7 +65,7 @@ func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.
 		// connection will be built on. Asking a public resolver through a
 		// proxy would answer with a different network's view of the domain,
 		// and would send every direct domain's name out through that proxy.
-		if errors.Is(err, tunnel.ErrTunnelDNSLocalNode) {
+		if errors.Is(err, tunnel.ErrTunnelDNSDirectNode) {
 			return c.directExchange(ctx, request)
 		}
 		return c.publicExchange(ctx, request)

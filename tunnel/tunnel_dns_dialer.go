@@ -18,15 +18,15 @@ import (
 // serve the reserved destination.
 var ErrTunnelDNSUnsupported = errors.New("the selected node does not serve tunnel DNS")
 
-// ErrTunnelDNSLocalNode reports the first of those cases specifically: the
-// leaf keeps the traffic on this machine, so there is no proxy server whose
-// view could differ from ours. It is worth telling apart from a node that
-// merely did not answer, because such a domain's records belong on the direct
-// name server rather than on a public resolver carried out through a proxy.
+// ErrTunnelDNSDirectNode reports the DIRECT case specifically: there is no
+// proxy server whose view could differ from ours. It is worth telling apart
+// from a node that merely did not answer, because such a domain's records
+// belong on the direct name server rather than on a public resolver carried
+// out through a proxy.
 //
 // It wraps ErrTunnelDNSUnsupported, so callers that only care whether the
 // tunnel can be used at all keep matching it.
-var ErrTunnelDNSLocalNode = fmt.Errorf("%w, it is local", ErrTunnelDNSUnsupported)
+var ErrTunnelDNSDirectNode = fmt.Errorf("%w, it is direct", ErrTunnelDNSUnsupported)
 
 // DialTunnelDNS opens a connection to the reserved tunnel DNS destination
 // through the proxy that queryDomain itself would use, and reports the name of
@@ -108,8 +108,11 @@ type tunnelDNSNode interface {
 // proxy server behind it, and it must not already have been found not to serve
 // the reserved destination.
 func tunnelDNSNodeUsable(node tunnelDNSNode) error {
+	if node.Type() == C.Direct {
+		return fmt.Errorf("%w: %s", ErrTunnelDNSDirectNode, node.Name())
+	}
 	if !node.Type().CanServeTunnelDNS() {
-		return fmt.Errorf("%w: %s", ErrTunnelDNSLocalNode, node.Name())
+		return fmt.Errorf("%w: %s is local", ErrTunnelDNSUnsupported, node.Name())
 	}
 	if !tunneldns.Supported(node.Name()) {
 		return fmt.Errorf("%w: %s did not answer recently", ErrTunnelDNSUnsupported, node.Name())
