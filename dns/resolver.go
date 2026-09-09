@@ -571,7 +571,11 @@ func NewResolverFromClient(client dnsClient) *Resolver {
 // resolver -- sequentially, not as a race, and remembered per node, so it
 // costs one attempt per node instead of one per query and a domain only
 // reaches the public resolver when no server could answer for it.
-func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string, cacheMaxSize int) *Resolver {
+//
+// A domain that routes to a local leaf never reaches that public resolver at
+// all: it has no proxy server, and its service records are the ones a direct
+// connection will use, so direct is the resolver asked for it.
+func NewFakeIPServiceResolver(defaultServers []NameServer, direct *Resolver, cacheAlgorithm string, cacheMaxSize int) *Resolver {
 	config := fakeIPServiceConfig(defaultServers, cacheAlgorithm, cacheMaxSize)
 
 	bootstrap := &Resolver{
@@ -580,10 +584,17 @@ func NewFakeIPServiceResolver(defaultServers []NameServer, cacheAlgorithm string
 	}
 	public := transform(config.Main, bootstrap)
 
+	// Invalid reports that a resolver has servers behind it. One without any
+	// must stay a nil interface so the local path can tell it apart.
+	var directExchange directExchanger
+	if direct.Invalid() {
+		directExchange = direct
+	}
+
 	return &Resolver{
 		ipv6:            true,
 		main:            []dnsClient{public[0]},
-		domainClient:    newDomainClient(public[0], cacheMaxSize),
+		domainClient:    newDomainClient(public[0], directExchange, cacheMaxSize),
 		cache:           config.newCache(),
 		defaultResolver: bootstrap,
 	}

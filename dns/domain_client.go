@@ -19,20 +19,33 @@ import (
 // option acknowledges a complete bundle, including an empty address family.
 const domainBundleOption = 65001
 
+// ErrNoDirectNameServer reports that a domain whose own traffic stays on this
+// machine had no direct name server to ask. The caller is expected to fall
+// through to the ordinary resolution path, which is still local, rather than
+// to carry the question out through a proxy.
+var ErrNoDirectNameServer = errors.New("no direct nameserver for a local domain")
+
+// directExchanger is the `direct-nameserver` list, as much of it as this
+// client needs.
+type directExchanger interface {
+	ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error)
+}
+
 type domainKey struct{ node, host string }
 type domainClient struct {
 	public  dnsClient
+	direct  directExchanger
 	bundles *tunneldns.Registry
 	cache   *lru.LruCache[domainKey, *D.Msg]
 	group   singleflight.Group[*D.Msg]
 	prepare func(string) (string, func(context.Context) (net.Conn, error), error)
 }
 
-func newDomainClient(public dnsClient, size int) *domainClient {
+func newDomainClient(public dnsClient, direct directExchanger, size int) *domainClient {
 	if size <= 0 {
 		size = 1024
 	}
-	return &domainClient{public: public, bundles: tunneldns.NewRegistry(), cache: lru.New(lru.WithSize[domainKey, *D.Msg](size)), prepare: tunnel.PrepareTunnelDNS}
+	return &domainClient{public: public, direct: direct, bundles: tunneldns.NewRegistry(), cache: lru.New(lru.WithSize[domainKey, *D.Msg](size)), prepare: tunnel.PrepareTunnelDNS}
 }
 
 func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.Msg, error) {
@@ -46,6 +59,14 @@ func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.
 	if err != nil {
 		if addressQuery {
 			return nil, err
+		}
+		// A domain whose own traffic never leaves this machine has no proxy
+		// server to ask, and its service records are the ones a direct
+		// connection will be built on. Asking a public resolver through a
+		// proxy would answer with a different network's view of the domain,
+		// and would send every direct domain's name out through that proxy.
+		if errors.Is(err, tunnel.ErrTunnelDNSDirectNode) {
+			return c.directExchange(ctx, request)
 		}
 		return c.publicExchange(ctx, request)
 	}
@@ -182,6 +203,22 @@ func (c *domainClient) exchange(ctx context.Context, node, host string, dial fun
 }
 
 func (c *domainClient) publicExchange(ctx context.Context, request *D.Msg) (*D.Msg, error) {
+	return c.public.ExchangeContext(ctx, withoutBundleOption(request))
+}
+
+// directExchange answers from `direct-nameserver`. Without one configured
+// there is nothing better to ask here: the ordinary resolution path the caller
+// falls back to is local too, and it already knows this domain's policy.
+func (c *domainClient) directExchange(ctx context.Context, request *D.Msg) (*D.Msg, error) {
+	if c.direct == nil {
+		return nil, ErrNoDirectNameServer
+	}
+	return c.direct.ExchangeContext(ctx, withoutBundleOption(request))
+}
+
+// withoutBundleOption returns a copy of request that no longer advertises the
+// extension, which only the reserved tunnel destination understands.
+func withoutBundleOption(request *D.Msg) *D.Msg {
 	request = request.Copy()
 	if opt := request.IsEdns0(); opt != nil {
 		options := opt.Option[:0]
@@ -192,5 +229,5 @@ func (c *domainClient) publicExchange(ctx context.Context, request *D.Msg) (*D.M
 		}
 		opt.Option = options
 	}
-	return c.public.ExchangeContext(ctx, request)
+	return request
 }

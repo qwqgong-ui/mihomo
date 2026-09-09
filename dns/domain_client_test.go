@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/fakeip"
 	icontext "github.com/metacubex/mihomo/context"
+	"github.com/metacubex/mihomo/tunnel"
 	D "github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
@@ -16,7 +18,7 @@ import (
 func testBundleClient(t *testing.T) (*domainClient, *atomic.Int32, *string) {
 	t.Helper()
 	public := &recordingServiceClient{response: &D.Msg{}}
-	client := newDomainClient(public, 10)
+	client := newDomainClient(public, nil, 10)
 	calls := new(atomic.Int32)
 	node := "JP"
 	client.prepare = func(host string) (string, func(context.Context) (net.Conn, error), error) {
@@ -98,7 +100,7 @@ func TestFakeIPFirstAddressWarmsServiceBundle(t *testing.T) {
 
 func TestOldServerDoesNotCausePublicAddressQueries(t *testing.T) {
 	public := &recordingServiceClient{response: &D.Msg{}}
-	client := newDomainClient(public, 10)
+	client := newDomainClient(public, nil, 10)
 	var calls atomic.Int32
 	client.prepare = func(string) (string, func(context.Context) (net.Conn, error), error) {
 		return "old", func(context.Context) (net.Conn, error) {
@@ -137,4 +139,102 @@ func TestFakeIPv6UsesBundleTTLWhenServerOnlyHasIPv4(t *testing.T) {
 	require.Len(t, answer.Answer, 1)
 	require.Equal(t, uint32(20), answer.Answer[0].Header().Ttl)
 	require.Empty(t, answer.Extra)
+}
+
+// directOnlyClient records what the `direct-nameserver` list is asked.
+type directOnlyClient struct {
+	calls    []uint16
+	request  *D.Msg
+	response *D.Msg
+}
+
+func (c *directOnlyClient) ExchangeContext(_ context.Context, request *D.Msg) (*D.Msg, error) {
+	c.calls = append(c.calls, request.Question[0].Qtype)
+	c.request = request.Copy()
+	response := c.response.Copy()
+	response.SetReply(request)
+	response.Answer = c.response.Answer
+	return response, nil
+}
+
+func localNodeClient(t *testing.T, direct directExchanger) (*domainClient, *recordingServiceClient) {
+	t.Helper()
+	public := &recordingServiceClient{response: &D.Msg{}}
+	client := newDomainClient(public, direct, 10)
+	client.prepare = func(host string) (string, func(context.Context) (net.Conn, error), error) {
+		return "DIRECT", nil, fmt.Errorf("%w: DIRECT", tunnel.ErrTunnelDNSDirectNode)
+	}
+	return client, public
+}
+
+func TestLocalDomainServiceQueryUsesDirectNameServer(t *testing.T) {
+	direct := &directOnlyClient{response: &D.Msg{Answer: []D.RR{testServiceRecord(D.TypeHTTPS, "example.cn.")}}}
+	client, public := localNodeClient(t, direct)
+
+	answer, err := client.ExchangeContext(t.Context(), httpsQuery("example.cn"))
+	require.NoError(t, err)
+	require.Contains(t, serviceRecordValues(answer.Answer[0]), D.SVCB_ECHCONFIG)
+	require.Equal(t, []uint16{D.TypeHTTPS}, direct.calls)
+	require.Empty(t, public.calls, "a direct domain must not be asked of a public resolver through a proxy")
+
+	// An address query still fails so the caller allocates a fake IP locally,
+	// exactly as before, and still asks nobody.
+	request := new(D.Msg)
+	request.SetQuestion("example.cn.", D.TypeA)
+	_, err = client.ExchangeContext(t.Context(), request)
+	require.ErrorIs(t, err, tunnel.ErrTunnelDNSUnsupported)
+	require.Equal(t, []uint16{D.TypeHTTPS}, direct.calls)
+	require.Empty(t, public.calls)
+}
+
+func TestLocalDomainServiceQueryDropsBundleOption(t *testing.T) {
+	direct := &directOnlyClient{response: &D.Msg{}}
+	client, _ := localNodeClient(t, direct)
+	request := httpsQuery("example.cn")
+	request.SetEdns0(1232, false)
+	request.IsEdns0().Option = append(request.IsEdns0().Option, &D.EDNS0_LOCAL{Code: domainBundleOption, Data: []byte{1}})
+
+	_, err := client.ExchangeContext(t.Context(), request)
+	require.NoError(t, err)
+	require.NotNil(t, request.IsEdns0(), "the caller's own message must not be modified")
+	require.Len(t, request.IsEdns0().Option, 1)
+	require.NotNil(t, direct.request.IsEdns0())
+	require.Empty(t, direct.request.IsEdns0().Option, "the direct nameserver must not receive the tunnel-only option")
+}
+
+func TestLocalDomainWithoutDirectNameServerFallsThrough(t *testing.T) {
+	client, public := localNodeClient(t, nil)
+	_, err := client.ExchangeContext(t.Context(), httpsQuery("example.cn"))
+	require.ErrorIs(t, err, ErrNoDirectNameServer)
+	require.Empty(t, public.calls)
+
+	// withFakeIP turns that into the ordinary resolution path, which is local
+	// too, rather than into a public query carried by a proxy.
+	fallbacks := 0
+	pool := newTestFakeIPPool(t, "198.18.0.0/16")
+	handler := withFakeIP(&fakeip.Skipper{}, pool, nil, 60, &Resolver{domainClient: client})(func(_ *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
+		fallbacks++
+		response := new(D.Msg)
+		response.SetReply(r)
+		response.Answer = []D.RR{testServiceRecord(D.TypeHTTPS, "example.cn.")}
+		return response, nil
+	})
+	answer, err := handler(icontext.NewDNSContext(t.Context()), httpsQuery("example.cn"))
+	require.NoError(t, err)
+	require.Equal(t, 1, fallbacks)
+	require.NotEmpty(t, answer.Answer)
+	require.Empty(t, public.calls)
+}
+
+func TestProxiedNodeThatCannotAnswerStillUsesPublicResolver(t *testing.T) {
+	direct := &directOnlyClient{response: &D.Msg{}}
+	public := &recordingServiceClient{response: &D.Msg{}}
+	client := newDomainClient(public, direct, 10)
+	client.prepare = func(string) (string, func(context.Context) (net.Conn, error), error) {
+		return "JP", nil, fmt.Errorf("%w: JP did not answer recently", tunnel.ErrTunnelDNSUnsupported)
+	}
+	_, err := client.ExchangeContext(t.Context(), httpsQuery("example.com"))
+	require.NoError(t, err)
+	require.Equal(t, []uint16{D.TypeHTTPS}, public.calls)
+	require.Empty(t, direct.calls, "only a local leaf belongs on the direct nameserver")
 }

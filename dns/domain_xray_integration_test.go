@@ -157,7 +157,7 @@ func TestDomainBundleXrayIntegration(t *testing.T) {
 		success = true
 		return conn, nil
 	}
-	client := newDomainClient(&recordingServiceClient{response: &D.Msg{}}, 10)
+	client := newDomainClient(&recordingServiceClient{response: &D.Msg{}}, nil, 10)
 	client.prepare = func(domain string) (string, func(context.Context) (net.Conn, error), error) {
 		if domain != host {
 			return "", nil, fmt.Errorf("unexpected host %s", domain)
