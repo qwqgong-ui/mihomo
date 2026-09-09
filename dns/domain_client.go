@@ -68,6 +68,13 @@ func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.
 		if errors.Is(err, tunnel.ErrTunnelDNSDirectNode) {
 			return c.directExchange(ctx, request)
 		}
+		// A leaf with no server that is not direct either -- reject above all
+		// -- is one nothing ever connects through. Whatever its service
+		// records say would be discarded with the connection, so answer here
+		// instead of spending a query, and a proxied one at that, on them.
+		if errors.Is(err, tunnel.ErrTunnelDNSNoServerNode) {
+			return handleMsgWithEmptyAnswer(request), nil
+		}
 		return c.publicExchange(ctx, request)
 	}
 	key := domainKey{node, host}

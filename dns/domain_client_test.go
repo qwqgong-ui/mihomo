@@ -238,3 +238,30 @@ func TestProxiedNodeThatCannotAnswerStillUsesPublicResolver(t *testing.T) {
 	require.Equal(t, []uint16{D.TypeHTTPS}, public.calls)
 	require.Empty(t, direct.calls, "only a local leaf belongs on the direct nameserver")
 }
+
+func TestRejectedDomainServiceQueryIsAnsweredLocally(t *testing.T) {
+	direct := &directOnlyClient{response: &D.Msg{}}
+	public := &recordingServiceClient{response: &D.Msg{}}
+	client := newDomainClient(public, direct, 10)
+	client.prepare = func(string) (string, func(context.Context) (net.Conn, error), error) {
+		return "REJECT-DROP", nil, fmt.Errorf("%w: REJECT-DROP", tunnel.ErrTunnelDNSNoServerNode)
+	}
+
+	request := httpsQuery("ads.example")
+	answer, err := client.ExchangeContext(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, D.RcodeSuccess, answer.Rcode)
+	require.Empty(t, answer.Answer)
+	require.Equal(t, request.Id, answer.Id)
+	require.Equal(t, request.Question, answer.Question)
+	require.Empty(t, public.calls, "nothing ever connects through a rejecting leaf")
+	require.Empty(t, direct.calls, "and its records are not worth a local query either")
+
+	// Address queries keep failing so fake IP is still allocated locally.
+	address := new(D.Msg)
+	address.SetQuestion("ads.example.", D.TypeA)
+	_, err = client.ExchangeContext(t.Context(), address)
+	require.ErrorIs(t, err, tunnel.ErrTunnelDNSUnsupported)
+	require.Empty(t, public.calls)
+	require.Empty(t, direct.calls)
+}

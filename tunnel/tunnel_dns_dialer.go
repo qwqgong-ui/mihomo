@@ -28,6 +28,15 @@ var ErrTunnelDNSUnsupported = errors.New("the selected node does not serve tunne
 // tunnel can be used at all keep matching it.
 var ErrTunnelDNSDirectNode = fmt.Errorf("%w, it is direct", ErrTunnelDNSUnsupported)
 
+// ErrTunnelDNSNoServerNode reports a leaf that has no proxy server behind it
+// and is not direct either: reject, an empty group, and the pass-through
+// types. Nothing is ever connected through such a leaf, so records for its
+// domains would only be discarded -- they are not worth asking anyone for,
+// least of all a public resolver reached through a proxy.
+//
+// It wraps ErrTunnelDNSUnsupported for the same reason as the direct case.
+var ErrTunnelDNSNoServerNode = fmt.Errorf("%w, it has no server", ErrTunnelDNSUnsupported)
+
 // DialTunnelDNS opens a connection to the reserved tunnel DNS destination
 // through the proxy that queryDomain itself would use, and reports the name of
 // the node it went through.
@@ -112,7 +121,7 @@ func tunnelDNSNodeUsable(node tunnelDNSNode) error {
 		return fmt.Errorf("%w: %s", ErrTunnelDNSDirectNode, node.Name())
 	}
 	if !node.Type().CanServeTunnelDNS() {
-		return fmt.Errorf("%w: %s is local", ErrTunnelDNSUnsupported, node.Name())
+		return fmt.Errorf("%w: %s", ErrTunnelDNSNoServerNode, node.Name())
 	}
 	if !tunneldns.Supported(node.Name()) {
 		return fmt.Errorf("%w: %s did not answer recently", ErrTunnelDNSUnsupported, node.Name())
