@@ -30,6 +30,16 @@ in AsIs mode, before its normal final-destination rules. Domain routing still
 sees the FQDN. Internal record lookups use a fresh DNS session so a user's raw
 socket/splice state cannot bypass the DNS tunnel framing.
 
+A domain whose rule selects a local leaf (direct, reject and the other
+adapter types that keep traffic on this machine) has no proxy server to ask.
+Its address query fails as before, so fake-IP still allocates locally, and its
+HTTPS query goes to `direct-nameserver`. It never reaches the public resolver:
+that resolver follows routing rules, so asking it would both answer with
+another network's view of a domain a direct connection is built on, and carry
+every direct domain's name out through a proxy. Without `direct-nameserver`
+configured the query falls through to the ordinary resolution path, which is
+local as well.
+
 Older nodes fall back to ordinary HTTPS queries; lack of bundle support is
 remembered for five minutes. Failed address warmups still permit local fake-IP
 allocation and do not trigger public A/AAAA resolution. Incomplete results and

@@ -290,7 +290,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	var serviceResolver resolver.Resolver
 	if m.FakeIPEnabled() {
-		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, c.CacheAlgorithm, c.CacheMaxSize)
+		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, r.DirectResolver.Resolver, c.CacheAlgorithm, c.CacheMaxSize)
 	}
 	s := dns.NewService(r, serviceResolver, m)
 
