@@ -38,8 +38,8 @@ const (
 	discoverTimeout = 15 * time.Second
 
 	// minInterval coalesces the burst of default-interface events a single
-	// network switch produces into one discovery round. It only applies once
-	// something has been discovered: before that there is nothing to thrash.
+	// network switch produces into one discovery round. Updates inside the
+	// interval remain queued, with old prefixes invalidated immediately.
 	minInterval = 5 * time.Second
 )
 
@@ -48,9 +48,11 @@ const (
 var retryDelays = []time.Duration{5 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
 
 var (
-	mu      sync.Mutex
-	enabled bool
-	lastRun time.Time
+	mu          sync.Mutex
+	enabled     bool
+	lastRun     time.Time
+	generation  uint64
+	cancelRound context.CancelFunc
 
 	running atomic.Bool
 	// wake carries a trigger that arrived while a round was in flight or
@@ -85,101 +87,127 @@ func Prefix(ipv4 bool) netip.Prefix {
 func Setup(enable bool) {
 	mu.Lock()
 	enabled = enable
-	lastRun = time.Time{} // a reload always re-discovers, ignoring the debounce
-	mu.Unlock()
-
+	lastRun = time.Time{}
 	if !enable {
+		generation++
 		prefix4.Store(netip.Prefix{})
 		prefix6.Store(netip.Prefix{})
-		signal() // let a waiting round notice it is disabled and stop
-		return
+		if cancelRound != nil {
+			cancelRound()
+		}
+		signal()
 	}
-	trigger("startup")
+	mu.Unlock()
+	if enable {
+		trigger("startup")
+	}
 }
 
-// Refresh re-runs discovery after a network change. It is debounced and
-// never blocks the caller, so it is safe to call from a network monitor
-// callback.
+// Refresh invalidates the previous network's prefixes immediately. The worker
+// coalesces rapid changes without discarding the last notification.
 func Refresh() {
-	if !isEnabled() {
-		return
-	}
 	trigger("network changed")
-}
-
-func isEnabled() bool {
-	mu.Lock()
-	defer mu.Unlock()
-	return enabled
 }
 
 func signal() {
 	select {
 	case wake <- struct{}{}:
-	default: // one queued wake-up is enough
+	default:
 	}
 }
 
 func trigger(reason string) {
-	if discovered() {
-		mu.Lock()
-		recent := !lastRun.IsZero() && time.Since(lastRun) < minInterval
-		mu.Unlock()
-		if recent {
-			return
-		}
-	}
-
-	if !running.CompareAndSwap(false, true) {
-		signal() // a round is in flight or waiting to retry; make it re-run
+	mu.Lock()
+	defer mu.Unlock()
+	if !enabled {
 		return
 	}
-	go func() {
-		defer running.Store(false)
+	generation++
+	prefix4.Store(netip.Prefix{})
+	prefix6.Store(netip.Prefix{})
+	if cancelRound != nil {
+		cancelRound()
+	}
+	if running.Load() {
+		signal()
+		return
+	}
+	running.Store(true)
+	go discoverLoop(reason)
+}
+
+func discoverLoop(reason string) {
+	var currentGeneration uint64
+	attempt := 0
+	for {
+		mu.Lock()
+		if !enabled {
+			running.Store(false)
+			mu.Unlock()
+			return
+		}
+		if currentGeneration != generation {
+			currentGeneration = generation
+			attempt = 0
+		}
+		delay := time.Duration(0)
+		if attempt == 0 && !lastRun.IsZero() {
+			delay = time.Until(lastRun.Add(minInterval))
+		}
 		select {
-		case <-wake: // drop a wake-up queued while nothing was running
+		case <-wake:
 		default:
 		}
-		attempt := 0
-		for {
-			func() {
-				ctx, cancel := context.WithTimeout(context.Background(), discoverTimeout)
-				defer cancel()
-				discover(ctx, reason)
-			}()
-
-			mu.Lock()
-			lastRun = time.Now()
-			mu.Unlock()
-
-			delay := time.Duration(0)
-			if !discovered() && attempt < len(retryDelays) {
-				delay = retryDelays[attempt]
-				attempt++
-			}
-			if delay == 0 {
-				select {
-				case <-wake: // a network change raced with this round
-					attempt, reason = 0, "network changed"
-					continue
-				default:
-					return
-				}
-			}
-
+		mu.Unlock()
+		if delay > 0 {
 			timer := time.NewTimer(delay)
 			select {
 			case <-wake:
 				timer.Stop()
-				attempt, reason = 0, "network changed"
+				reason = "network changed"
+				continue
 			case <-timer.C:
-				reason = "retry"
-			}
-			if !isEnabled() {
-				return
 			}
 		}
-	}()
+
+		mu.Lock()
+		if !enabled || currentGeneration != generation {
+			mu.Unlock()
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), discoverTimeout)
+		cancelRound = cancel
+		mu.Unlock()
+		discover(ctx, reason, currentGeneration)
+		cancel()
+
+		mu.Lock()
+		cancelRound = nil
+		if currentGeneration != generation {
+			mu.Unlock()
+			reason = "network changed"
+			continue
+		}
+		lastRun = time.Now()
+		if !enabled || discovered() || attempt >= len(retryDelays) {
+			// Serialize stopping with trigger so a final network event cannot
+			// land between checking the queue and releasing worker ownership.
+			running.Store(false)
+			mu.Unlock()
+			return
+		}
+		delay = retryDelays[attempt]
+		attempt++
+		mu.Unlock()
+		timer := time.NewTimer(delay)
+		select {
+		case <-wake:
+			timer.Stop()
+			reason = "network changed"
+		case <-timer.C:
+			reason = "retry"
+		}
+	}
 }
 
 func discovered() bool {
@@ -189,7 +217,7 @@ func discovered() bool {
 // discover probes both families in parallel: an A query wants an IPv4 subnet
 // and an AAAA query an IPv6 one, and a failure of one family must not hold up
 // or hide the other.
-func discover(ctx context.Context, reason string) {
+func discover(ctx context.Context, reason string, generation uint64) {
 	var wg sync.WaitGroup
 	families := []bool{true}
 	if !resolver.DisableIPv6.Load() {
@@ -197,22 +225,26 @@ func discover(ctx context.Context, reason string) {
 	}
 	for _, ipv4 := range families {
 		wg.Go(func() {
-			store(ctx, ipv4, reason)
+			store(ctx, ipv4, reason, generation)
 		})
 	}
 	wg.Wait()
 }
 
-func store(ctx context.Context, ipv4 bool, reason string) {
+func store(ctx context.Context, ipv4 bool, reason string, roundGeneration uint64) {
 	name, target := "IPv4", &prefix4
 	if !ipv4 {
 		name, target = "IPv6", &prefix6
 	}
 	found, err := discoverPrefix(ctx, ipv4)
 	if err != nil {
-		// keep the last known prefix: a single failed round (a STUN server
-		// blip) should not drop ECS from every query until the next event
+		// The worker retries an empty round; never restore a previous network's prefix.
 		log.Warnln("[ECS] discover %s client subnet failed (%s): %s", name, reason, err.Error())
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !enabled || generation != roundGeneration || ctx.Err() != nil {
 		return
 	}
 	if old := target.Swap(found); old == found {

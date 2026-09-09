@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	R "github.com/metacubex/mihomo/component/resolver"
@@ -51,37 +50,24 @@ func directProgressiveDialContext(ctx context.Context, network, address string, 
 	}
 
 	workCtx, cancelWork := context.WithTimeout(context.Background(), R.DefaultDNSTimeout+DefaultTCPTimeout)
-	detached := make(chan struct{})
-	finished := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			cancelWork()
-		case <-detached:
-		case <-finished:
-		}
-	}()
-
-	resultCh := make(chan dialResult, 1)
-	go runProgressiveDirectRace(workCtx, cancelWork, finished, detached, resultCh, network, host, port, scope, opt, progressive, cacheKey)
+	// An unbuffered handoff transfers ownership only while the caller is here.
+	// A successful dial arriving after cancellation must close its connection.
+	resultCh := make(chan dialResult)
+	go runProgressiveDirectRace(workCtx, cancelWork, resultCh, network, host, port, scope, opt, progressive, cacheKey)
 	select {
 	case result := <-resultCh:
 		return result.Conn, result.error
 	case <-ctx.Done():
-		select {
-		case result := <-resultCh:
-			return result.Conn, result.error
-		default:
-			return nil, ctx.Err()
-		}
+		cancelWork()
+		return nil, ctx.Err()
+	case <-workCtx.Done():
+		return nil, workCtx.Err()
 	}
 }
 
 func runProgressiveDirectRace(
 	ctx context.Context,
 	cancel context.CancelFunc,
-	finished chan struct{},
-	detached chan struct{},
 	resultCh chan<- dialResult,
 	network, host, port, scope string,
 	opt option,
@@ -89,7 +75,16 @@ func runProgressiveDirectRace(
 	cacheKey string,
 ) {
 	defer cancel()
-	defer close(finished)
+
+	sendResult := func(result dialResult) {
+		select {
+		case resultCh <- result:
+		case <-ctx.Done():
+			if result.Conn != nil {
+				_ = result.Conn.Close()
+			}
+		}
+	}
 
 	events := make(chan progressiveCandidateEvent, 8)
 	feed := func(ipv6 bool) {
@@ -119,10 +114,10 @@ func runProgressiveDirectRace(
 		go feed(true)
 	}
 	if families == 0 {
-		resultCh <- dialResult{error: ErrorNoIpAddress}
+		sendResult(dialResult{error: ErrorNoIpAddress})
 		return
 	}
-	connects := make(chan progressiveConnectResult, 32)
+	connects := make(chan progressiveConnectResult)
 	seen := make(map[netip.Addr]struct{})
 	pending := 0
 	var pendingFamily [2]int
@@ -131,7 +126,6 @@ func runProgressiveDirectRace(
 	var errs []error
 	var bestRTT time.Duration
 	var delivered bool
-	var detachOnce sync.Once
 	var heldFallback net.Conn
 	preferredIPv6 := opt.prefer == 6
 	preferenceEnabled := opt.prefer == 4 || opt.prefer == 6
@@ -182,8 +176,7 @@ func runProgressiveDirectRace(
 			return
 		}
 		delivered = true
-		detachOnce.Do(func() { close(detached) })
-		resultCh <- dialResult{ip: ip, Conn: conn}
+		sendResult(dialResult{ip: ip, Conn: conn})
 	}
 	promote := func(result progressiveConnectResult) {
 		if result.rtt <= 0 {
@@ -339,7 +332,7 @@ func runProgressiveDirectRace(
 					if err == nil {
 						err = ErrorNoIpAddress
 					}
-					resultCh <- dialResult{error: err}
+					sendResult(dialResult{error: err})
 				}
 			}
 			return
@@ -350,7 +343,7 @@ func runProgressiveDirectRace(
 				_ = heldFallback.Close()
 			}
 			if !delivered {
-				resultCh <- dialResult{error: ctx.Err()}
+				sendResult(dialResult{error: ctx.Err()})
 			}
 			return
 		case event := <-events:

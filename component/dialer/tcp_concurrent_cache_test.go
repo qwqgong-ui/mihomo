@@ -565,8 +565,7 @@ func TestParallelDialContextRacesWithoutTFOAndMeasuresRTT(t *testing.T) {
 	time.AfterFunc(20*time.Millisecond, func() { close(slow) })
 
 	// Racing more than one candidate must ignore opt.tfo and still produce a
-	// real, positive RTT sample: TFO is only safe to honor once there is a
-	// single surviving candidate left (see tfoDialIsAsynchronous).
+	// real, positive RTT sample, just like the single-candidate fast path.
 	result := parallelDialContext(context.Background(), "tcp", []netip.Addr{ipA, ipB}, "443", option{netDialer: dialer, tfo: true})
 	if result.error != nil || result.ip != ipA {
 		t.Fatalf("result = %s, %v; want %s, nil", result.ip, result.error, ipA)
@@ -580,7 +579,7 @@ func TestParallelDialContextRacesWithoutTFOAndMeasuresRTT(t *testing.T) {
 	}
 }
 
-func TestParallelDialContextSingleIPSkipsRTTWhenTFO(t *testing.T) {
+func TestParallelDialContextSingleIPDisablesTFO(t *testing.T) {
 	ip := netip.MustParseAddr("192.0.2.1")
 	slow := make(chan struct{})
 	time.AfterFunc(20*time.Millisecond, func() { close(slow) })
@@ -593,8 +592,8 @@ func TestParallelDialContextSingleIPSkipsRTTWhenTFO(t *testing.T) {
 		t.Fatalf("result error = %v", result.error)
 	}
 	_ = result.Conn.Close()
-	if result.dialDuration != 0 {
-		t.Fatalf("dialDuration = %s; want 0 when opt.tfo is set", result.dialDuration)
+	if result.dialDuration < 15*time.Millisecond {
+		t.Fatalf("dialDuration = %s; want real handshake timing despite opt.tfo", result.dialDuration)
 	}
 }
 
@@ -625,7 +624,7 @@ func TestTCPConcurrentDialContextRacesWithoutTFOAndRecordsRTT(t *testing.T) {
 	}
 }
 
-func TestTCPConcurrentFastPathSkipsRTTSampleWhenTFO(t *testing.T) {
+func TestTCPConcurrentFastPathDisablesTFO(t *testing.T) {
 	cache := installTestTCPConcurrentCache(t)
 	ipA := netip.MustParseAddr("192.0.2.1")
 	ipB := netip.MustParseAddr("192.0.2.2")
@@ -641,8 +640,8 @@ func TestTCPConcurrentFastPathSkipsRTTSampleWhenTFO(t *testing.T) {
 		t.Fatalf("fast-path result = %s, %v; want %s, nil", result.ip, result.error, ipB)
 	}
 	_ = result.Conn.Close()
-	if _, loaded := cache.RTT(key); loaded {
-		t.Fatal("RTT sample should not be recorded for a fast-path hit when opt.tfo is set")
+	if rtt, loaded := cache.RTT(key); !loaded || rtt <= 0 {
+		t.Fatal("fast-path must record a real RTT despite opt.tfo")
 	}
 }
 

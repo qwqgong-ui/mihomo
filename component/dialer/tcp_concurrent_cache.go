@@ -314,6 +314,8 @@ func containsTCPConcurrentCandidate(candidates []netip.Addr, winner netip.Addr) 
 }
 
 func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []netip.Addr, port string, opt option, fallback dialFunc) dialResult {
+	// Cached and single-candidate paths still require a real TCP handshake.
+	opt.tfo = false
 	key, cacheable := tcpConcurrentCacheKey(host, port, network)
 	if !cacheable {
 		return fallback(ctx, network, ips, port, opt)
@@ -373,14 +375,7 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 				if result.error == nil {
 					stopFastTimer()
 					cancelFast()
-					if tfoDialIsAsynchronous(opt) {
-						// The fast-path dial handed back a stub instantly;
-						// keep the winner but don't record a bogus near-zero
-						// RTT sample from it.
-						tcpConcurrentCache.Set(key, result.ip)
-					} else {
-						tcpConcurrentCache.SetWithRTT(key, result.ip, measuredDialDuration(fastStart))
-					}
+					tcpConcurrentCache.SetWithRTT(key, result.ip, measuredDialDuration(fastStart))
 					return result
 				}
 				if ctx.Err() != nil {

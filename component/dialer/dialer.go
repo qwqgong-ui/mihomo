@@ -226,7 +226,7 @@ func startDirectConnects(ctx context.Context, network, port string, opt option, 
 	// dialer (tfo.go) reports success before any network I/O happens, which
 	// would make "first done" just reflect goroutine scheduling and silently
 	// drop the ability to skip a dead/blocked candidate. See the identical
-	// rationale in parallelDialContext's multi-candidate branch.
+	// rationale in parallelDialContext.
 	opt.tfo = false
 	for _, ip := range ips {
 		go func(ip netip.Addr) {
@@ -782,31 +782,19 @@ loop:
 }
 
 func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult {
+	// Concurrent dialing requires a completed handshake even if DNS currently
+	// names only one candidate. Lazy TFO success cannot supply a winner or RTT.
+	opt.tfo = false
 	if len(ips) == 0 {
 		return dialResult{error: ErrorNoIpAddress}
 	}
 	if len(ips) == 1 {
-		// Only one candidate: nothing to race, so the configured TFO
-		// setting is safe to honor as-is (see tfoDialIsAsynchronous).
-		measureLatency := !tfoDialIsAsynchronous(opt)
 		start := time.Now()
 		result := dialResult{ip: ips[0]}
 		result.Conn, result.error = dialContext(ctx, network, ips[0], port, opt)
-		if measureLatency {
-			result.dialDuration = measuredDialDuration(start)
-		}
+		result.dialDuration = measuredDialDuration(start)
 		return result
 	}
-
-	// Racing more than one candidate needs a real, synchronous connect to
-	// know which one actually wins: the lazy TFO dialer (tfo.go) reports
-	// success before any network I/O happens, so racing it would just pick
-	// whichever goroutine the scheduler ran first instead of the fastest
-	// reachable address, and silently lose the ability to skip a
-	// dead/blocked candidate. Force TFO off for the race itself; this also
-	// makes the connect time genuinely measurable for the RTT cache.
-	racingOpt := opt
-	racingOpt.tfo = false
 
 	results := make(chan dialResult)
 	returned := make(chan struct{})
@@ -823,7 +811,7 @@ func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, 
 				}
 			}
 		}()
-		result.Conn, result.error = dialContext(ctx, network, ip, port, racingOpt)
+		result.Conn, result.error = dialContext(ctx, network, ip, port, opt)
 		result.dialDuration = measuredDialDuration(start)
 	}
 
