@@ -303,7 +303,6 @@ func (s *Sudoku) dialAndHandshake(ctx context.Context, cfg *sudoku.ProtocolConfi
 					PathRoot:     cfg.HTTPMaskPathRoot,
 					AuthKey:      sudoku.ClientAEADSeed(cfg.Key),
 					Upgrade:      upgrade,
-					Multiplex:    muxMode,
 					DialContext:  s.dialer.DialContext,
 				})
 				if err != nil {
@@ -353,6 +352,9 @@ func (s *Sudoku) resetHTTPMaskClient() {
 	s.httpMaskMu.Lock()
 	defer s.httpMaskMu.Unlock()
 	if s.httpMaskClient != nil {
+		// A failed session must not tear down the shared transport used by
+		// concurrent sessions. Close only idle connections here; the adapter's
+		// final Close owns the permanent client shutdown.
 		s.httpMaskClient.CloseIdleConnections()
 		s.httpMaskClient = nil
 		s.httpMaskKey = ""

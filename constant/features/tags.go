@@ -28,6 +28,9 @@ func Tags() (tags []string) {
 	if NoSudoku {
 		tags = append(tags, "no_sudoku")
 	}
+	if NoEasyTier {
+		tags = append(tags, "no_easytier")
+	}
 	if WithGVisor {
 		tags = append(tags, "with_gvisor")
 	}
